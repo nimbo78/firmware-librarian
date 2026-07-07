@@ -79,6 +79,9 @@ async def answer_question(question: str) -> str:
         link = _msg_link(h.chat_id, h.msg_first)
         if link:
             links.append(f'[{i}] {link}')
+        elif h.chat_id > 0:
+            # PDF-чанк: синтетический положительный chat_id (см. kb_pdf.py)
+            links.append(f'[{i}] файл «{h.topic_name}», стр. {h.msg_first}')
     # temperature/max_tokens не передаём: модели класса gpt-5 их не принимают
     resp = await oa.chat.completions.create(
         model=ANSWER_MODEL,

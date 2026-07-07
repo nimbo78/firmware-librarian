@@ -1,13 +1,22 @@
-"""Чанкинг сообщений Telegram и эмбеддинги OpenAI.
+"""Чанкинг сообщений Telegram, обогащение медиа и эмбеддинги OpenAI.
 
 Используется ночным джобом качалки (download_telegram_files.py) и kb_backfill.py.
 НЕ импортирует download_telegram_files — у того side-effects на импорте
 (валидация env, создание клиента).
+
+Обогащение медиа (опционально, флаги в .env):
+- KB_VISION=1 — картинки через vision-модель (описание + OCR текста на них);
+- KB_VOICE=1  — голосовые через Whisper (транскрипция).
+Видео сознательно не обрабатываются. Результаты кэшируются в media_cache —
+повторные прогоны (ретрай бэкфилла после пополнения бюджета) не платят дважды.
 """
 from __future__ import annotations
 
+import base64
+import io
 import logging
 import os
+from dataclasses import dataclass
 
 from telethon import errors
 from telethon.tl.functions.channels import GetForumTopicsRequest
@@ -20,6 +29,21 @@ GAP_SECONDS = 30 * 60    # пауза, разрывающая беседу на 
 CHUNK_MAX_CHARS = 4000   # ~1200 токенов для русского текста
 EMBED_BATCH = 96
 
+# Оценки стоимости для расчёта бюджета (реальные цены OpenAI могут меняться)
+EMBED_PRICE_PER_MTOK = 0.02     # $ / 1M токенов, text-embedding-3-small
+VISION_COST_PER_IMAGE = 0.004   # $ / изображение (усреднённо)
+WHISPER_PRICE_PER_MIN = 0.006   # $ / минута, whisper-1
+
+MAX_IMAGE_BYTES = 6 * 1024 * 1024
+MAX_VOICE_SECONDS = 15 * 60
+
+VISION_PROMPT = (
+    'Изображение из технического чата про сетевое оборудование Huawei. '
+    'Опиши его одним-двумя предложениями по-русски. Если на изображении есть '
+    'текст (вывод консоли, конфиг, шильдик с моделью, схема) — распознай и '
+    'приведи его полностью.'
+)
+
 _openai = None
 
 
@@ -29,6 +53,35 @@ def openai_client():
         from openai import AsyncOpenAI
         _openai = AsyncOpenAI()
     return _openai
+
+
+def vision_enabled() -> bool:
+    return os.getenv('KB_VISION', '0') == '1'
+
+
+def voice_enabled() -> bool:
+    return os.getenv('KB_VOICE', '0') == '1'
+
+
+def pdf_enabled() -> bool:
+    return os.getenv('KB_PDF', '0') == '1'
+
+
+@dataclass
+class IngestStats:
+    messages: int = 0
+    new_chunks: int = 0
+    media_items: int = 0   # обработано медиа в этом прогоне (кэш не считается)
+    cost: float = 0.0      # оценка потраченного, $
+
+
+class BudgetExceeded(Exception):
+    """Достигнут --max-cost. Всё обработанное уже в базе/кэше — повторный
+    запуск после пополнения бюджета продолжит с места остановки."""
+
+    def __init__(self, cost: float):
+        super().__init__(f'достигнут лимит бюджета: ~${cost:.2f}')
+        self.cost = cost
 
 
 async def embed_texts(texts: list[str], client=None) -> list[list[float]]:
@@ -44,6 +97,111 @@ async def embed_texts(texts: list[str], client=None) -> list[list[float]]:
         resp = await client.embeddings.create(model=model, input=batch, dimensions=dim)
         out.extend(d.embedding for d in resp.data)
     return out
+
+
+def embed_cost(texts: list[str]) -> float:
+    return sum(len(t) for t in texts) / 3 / 1e6 * EMBED_PRICE_PER_MTOK
+
+
+async def describe_image(data: bytes, mime: str = 'image/jpeg') -> str:
+    oa = openai_client()
+    b64 = base64.b64encode(data).decode('ascii')
+    model = os.getenv('KB_VISION_MODEL', 'gpt-5-mini')
+    resp = await oa.chat.completions.create(
+        model=model,
+        messages=[{
+            'role': 'user',
+            'content': [
+                {'type': 'text', 'text': VISION_PROMPT},
+                {'type': 'image_url',
+                 'image_url': {'url': f'data:{mime};base64,{b64}'}},
+            ],
+        }])
+    return (resp.choices[0].message.content or '').strip()[:1500]
+
+
+async def transcribe_voice(data: bytes) -> str:
+    oa = openai_client()
+    resp = await oa.audio.transcriptions.create(
+        model='whisper-1', file=('voice.ogg', io.BytesIO(data)))
+    return (resp.text or '').strip()[:3000]
+
+
+def _is_image(msg) -> bool:
+    if getattr(msg, 'sticker', None) is not None:
+        return False
+    if getattr(msg, 'photo', None) is not None:
+        return True
+    if getattr(msg, 'gif', None) is not None:
+        return False
+    mime = getattr(msg.file, 'mime_type', '') if msg.file else ''
+    return bool(mime and mime.startswith('image/'))
+
+
+def _voice_duration(msg) -> int:
+    if getattr(msg, 'voice', None) is None:
+        return 0
+    return int(getattr(msg.file, 'duration', 0) or 0)
+
+
+async def enrich_message(store, msg) -> tuple[str, float]:
+    """Vision/Whisper-обогащение одного сообщения. Возвращает (текст, стоимость).
+
+    Успешные результаты кэшируются; ошибки НЕ кэшируются, чтобы следующий
+    прогон повторил попытку.
+    """
+    parts: list[str] = []
+    cost = 0.0
+
+    if vision_enabled() and _is_image(msg):
+        key = f'img:{msg.chat_id}:{msg.id}'
+        text = store.get_media_text(key)
+        if text is None:
+            try:
+                data = await msg.download_media(file=bytes)
+                if data and len(data) <= MAX_IMAGE_BYTES:
+                    mime = (getattr(msg.file, 'mime_type', None) or 'image/jpeg'
+                            if msg.file else 'image/jpeg')
+                    if not mime.startswith('image/'):
+                        mime = 'image/jpeg'
+                    text = await describe_image(data, mime)
+                    cost += VISION_COST_PER_IMAGE
+                    store.put_media_text(key, text, VISION_COST_PER_IMAGE)
+                else:
+                    text = ''  # слишком большое — фиксируем пропуск в кэше
+                    store.put_media_text(key, text, 0.0)
+            except Exception as e:
+                logger.warning('vision failed for %s/%s: %s', msg.chat_id, msg.id, e)
+                text = ''
+        if text:
+            parts.append(f'[изображение: {text}]')
+
+    duration = _voice_duration(msg) if voice_enabled() else 0
+    if duration > 0:
+        key = f'voice:{msg.chat_id}:{msg.id}'
+        text = store.get_media_text(key)
+        if text is None:
+            if duration > MAX_VOICE_SECONDS:
+                text = ''
+                store.put_media_text(key, text, 0.0)
+            else:
+                try:
+                    data = await msg.download_media(file=bytes)
+                    if data:
+                        text = await transcribe_voice(data)
+                        c = duration / 60.0 * WHISPER_PRICE_PER_MIN
+                        cost += c
+                        store.put_media_text(key, text, c)
+                    else:
+                        text = ''
+                except Exception as e:
+                    logger.warning('whisper failed for %s/%s: %s',
+                                   msg.chat_id, msg.id, e)
+                    text = ''
+        if text:
+            parts.append(f'[голосовое: {text}]')
+
+    return ' '.join(parts), cost
 
 
 async def fetch_topic_names(tg_client, chat_id: int) -> dict[int, str]:
@@ -123,13 +281,15 @@ def build_chunks(chat_id: int, records: list, topic_names: dict[int, str]) -> li
 
 
 async def ingest_chat(tg_client, store, chat_id: int, min_id: int | None = None,
-                      progress=None) -> tuple[int, int]:
+                      progress=None, max_cost: float | None = None) -> IngestStats:
     """Инжест сообщений chat_id от last_seen_id (или явного min_id) до конца.
 
-    Возвращает (обработано сообщений, добавлено новых чанков). State двигается
-    только после успешной записи — упавший прогон повторится без потерь, а уже
-    записанные чанки не переэмбеддятся (детерминированные id).
+    progress(stage, done, total, cost) — колбэк прогресса ('media' | 'embed').
+    max_cost — потолок бюджета в $, при достижении кидает BudgetExceeded;
+    state при этом не двигается, а кэш медиа и записанные чанки сохраняются,
+    так что повторный запуск продолжает, не тратя деньги повторно.
     """
+    stats = IngestStats()
     state_key = f'last_seen_id:{chat_id}'
     if min_id is None:
         min_id = int(store.get_state(state_key, '0'))
@@ -140,10 +300,21 @@ async def ingest_chat(tg_client, store, chat_id: int, min_id: int | None = None,
         if msg.id > max_id:
             max_id = msg.id
         text = (msg.raw_text or '').strip()
-        if not text:
-            continue  # сервисные и пустые медиа-сообщения
-        line = f'[{msg.date:%Y-%m-%d %H:%M}] {_sender_name(msg)}: {text}'
-        records.append((msg.id, message_topic_id(msg), msg.date, _sender_name(msg), line))
+        extra, cost = await enrich_message(store, msg)
+        if cost > 0:
+            stats.media_items += 1
+            stats.cost += cost
+            if progress and stats.media_items % 20 == 0:
+                progress('media', stats.media_items, 0, stats.cost)
+            if max_cost is not None and stats.cost >= max_cost:
+                raise BudgetExceeded(stats.cost)
+        full = f'{text} {extra}'.strip()
+        if not full:
+            continue  # сервисные и пустые сообщения без обогащения
+        line = f'[{msg.date:%Y-%m-%d %H:%M}] {_sender_name(msg)}: {full}'
+        records.append((msg.id, message_topic_id(msg), msg.date,
+                        _sender_name(msg), line))
+    stats.messages = len(records)
     chunks = build_chunks(chat_id, records, topic_names)
     known = store.existing_ids([c.id for c in chunks])
     new_chunks = [c for c in chunks if c.id not in known]
@@ -154,18 +325,33 @@ async def ingest_chat(tg_client, store, chat_id: int, min_id: int | None = None,
         for c, v in zip(part, vectors):
             c.embedding = v
         store.upsert_chunks(part)
+        stats.cost += embed_cost([c.text for c in part])
+        stats.new_chunks += len(part)
         if progress:
-            progress(min(i + EMBED_BATCH, len(new_chunks)), len(new_chunks))
+            progress('embed', min(i + EMBED_BATCH, len(new_chunks)),
+                     len(new_chunks), stats.cost)
+        if max_cost is not None and stats.cost >= max_cost:
+            raise BudgetExceeded(stats.cost)
     if max_id > min_id:
         store.set_state(state_key, str(max_id))
-    return len(records), len(new_chunks)
+    return stats
 
 
-async def scan_chat(tg_client, chat_id: int) -> tuple[int, int]:
-    """Для dry-run бэкфилла: (сообщений, символов текста) без API-вызовов."""
-    n = 0
-    chars = 0
+@dataclass
+class ScanStats:
+    messages: int = 0
+    chars: int = 0
+    images: int = 0
+    voice_seconds: int = 0
+
+
+async def scan_chat(tg_client, chat_id: int) -> ScanStats:
+    """Для dry-run бэкфилла: объёмы по категориям без API-вызовов."""
+    st = ScanStats()
     async for msg in tg_client.iter_messages(chat_id, reverse=True):
-        n += 1
-        chars += len(msg.raw_text or '')
-    return n, chars
+        st.messages += 1
+        st.chars += len(msg.raw_text or '')
+        if _is_image(msg):
+            st.images += 1
+        st.voice_seconds += _voice_duration(msg)
+    return st

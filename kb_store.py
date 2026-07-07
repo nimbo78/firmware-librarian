@@ -87,6 +87,14 @@ class SqliteVecStore:
                 "USING fts5(text, tokenize='unicode61 remove_diacritics 2')")
             self.db.execute(
                 'CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+            # Кэш vision/whisper-обработки медиа: ретрай бэкфилла не платит дважды
+            self.db.execute('''
+                CREATE TABLE IF NOT EXISTS media_cache(
+                    key TEXT PRIMARY KEY,
+                    text TEXT NOT NULL,
+                    cost REAL NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )''')
 
     def upsert_chunks(self, chunks: list[Chunk]) -> None:
         with self.db:
@@ -171,6 +179,22 @@ class SqliteVecStore:
                 'INSERT INTO state(key, value) VALUES(?,?) '
                 'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, value))
 
+    def get_media_text(self, key: str) -> str | None:
+        row = self.db.execute(
+            'SELECT text FROM media_cache WHERE key=?', (key,)).fetchone()
+        return row[0] if row else None
+
+    def put_media_text(self, key: str, text: str, cost: float = 0.0) -> None:
+        with self.db:
+            self.db.execute(
+                'INSERT INTO media_cache(key, text, cost) VALUES(?,?,?) '
+                'ON CONFLICT(key) DO UPDATE SET text=excluded.text, cost=excluded.cost',
+                (key, text, cost))
+
+    def media_cost_total(self) -> float:
+        return self.db.execute(
+            'SELECT COALESCE(SUM(cost), 0) FROM media_cache').fetchone()[0]
+
     def count(self) -> int:
         return self.db.execute('SELECT count(*) FROM chunks').fetchone()[0]
 
@@ -229,6 +253,11 @@ def _selftest() -> None:
         store.set_state('last_seen_id:-1001234', '35')
         assert store.get_state('last_seen_id:-1001234') == '35'
         assert store.get_state('nope', 'def') == 'def'
+
+        assert store.get_media_text('img:-1001234:10') is None
+        store.put_media_text('img:-1001234:10', 'скриншот display board 0', 0.004)
+        assert store.get_media_text('img:-1001234:10') == 'скриншот display board 0'
+        assert abs(store.media_cost_total() - 0.004) < 1e-9
 
         bak = os.path.join(tmp, 'kb.bak')
         store.backup(bak)

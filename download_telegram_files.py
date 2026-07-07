@@ -160,7 +160,7 @@ async def kb_ingest_loop() -> None:
         logger.warning('KB_CHAT_IDS задан, но OPENAI_API_KEY отсутствует — '
                        'ночной ingest выключен')
         return
-    from kb_ingest import ingest_chat
+    from kb_ingest import ingest_chat, pdf_enabled
     from kb_store import open_store
     store = open_store()
     logger.info('KB ingest scheduled daily at %02d:00 for chats %s',
@@ -169,11 +169,21 @@ async def kb_ingest_loop() -> None:
         await asyncio.sleep(_seconds_until_hour(INGEST_HOUR))
         for chat_id in KB_CHAT_IDS:
             try:
-                msgs, chunks = await ingest_chat(client, store, chat_id)
-                logger.info('KB ingest %s: %d messages -> %d new chunks',
-                            chat_id, msgs, chunks)
+                stats = await ingest_chat(client, store, chat_id)
+                logger.info('KB ingest %s: %d messages -> %d new chunks, '
+                            'media %d, ~$%.2f', chat_id, stats.messages,
+                            stats.new_chunks, stats.media_items, stats.cost)
             except Exception as e:
                 logger.warning('KB ingest failed for %s: %s', chat_id, e)
+        if pdf_enabled():
+            try:
+                from kb_pdf import ingest_pdfs
+                files, chunks, cost = await ingest_pdfs(store, DOWNLOAD_FOLDER)
+                if files:
+                    logger.info('KB PDF ingest: %d files -> %d chunks, ~$%.2f',
+                                files, chunks, cost)
+            except Exception as e:
+                logger.warning('KB PDF ingest failed: %s', e)
         try:
             store.backup()
         except Exception as e:

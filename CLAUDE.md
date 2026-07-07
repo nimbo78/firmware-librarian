@@ -36,7 +36,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `KB_CHAT_IDS` — CSV чатов-источников знаний (ночной инжест).
 - `KB_BOT_TOKEN`, `KB_ANSWER_CHAT_IDS` — токен BotFather и чаты, где бот отвечает.
 - `TZ` — часовой пояс контейнера; от него зависит `INGEST_HOUR` (по умолчанию 5).
-- `EMBED_MODEL`/`EMBED_DIM` (`text-embedding-3-small`/512), `ANSWER_MODEL` (`gpt-5-mini`), `KB_DB_PATH` (`/app/kb/kb.sqlite`), `KB_BACKEND` (`sqlite`).
+- `KB_VISION`/`KB_VOICE`/`KB_PDF` — флаги обогащения (`1` включает; по умолчанию `0`): картинки через vision, голосовые через Whisper, текстовый слой скачанных PDF.
+- `EMBED_MODEL`/`EMBED_DIM` (`text-embedding-3-small`/512), `ANSWER_MODEL`/`KB_VISION_MODEL` (`gpt-5-mini`), `KB_DB_PATH` (`/app/kb/kb.sqlite`), `KB_BACKEND` (`sqlite`).
 
 ## Архитектура и неочевидные детали
 
@@ -55,15 +56,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Хранилище — один файл SQLite** (`/volume1/docker/tg-kb/kb.sqlite`): таблица `chunks` + векторная `chunks_vec` (sqlite-vec) + полнотекстовая `chunks_fts` (FTS5) + `state`. Гибридный поиск: KNN + FTS, слияние через Reciprocal Rank Fusion ([kb_store.py](kb_store.py)).
 - **Весь доступ к базе — только через `kb_store.open_store()`.** Это точка будущего переезда на Qdrant (`KB_BACKEND`): новый класс с тем же интерфейсом + переливка чанков с готовыми векторами. Вектора хранятся в базе именно ради миграции без переэмбеддинга; state всегда остаётся в SQLite.
 - **rowid-связка таблиц.** `chunks_vec` и `chunks_fts` привязаны к `chunks.rowid`. В `chunks` нельзя писать через `INSERT OR REPLACE` — REPLACE меняет rowid и отвязывает вектор/FTS ([kb_store.py:91-120](kb_store.py#L91-L120)).
-- **ID чанка детерминирован**: `sha1(chat_id:msg_first:msg_last)`. Повторный инжест идемпотентен, ретрай бэкфилла не переэмбеддит уже записанное ([kb_ingest.py:148-149](kb_ingest.py#L148-L149)).
-- **Чанк — это фрагмент беседы**, не сообщение: сообщения топика группируются до паузы >30 минут или ~4000 символов ([kb_ingest.py:85-124](kb_ingest.py#L85-L124)). Названия топиков форума берутся через `GetForumTopicsRequest`.
-- **Инжест идёт от `last_seen_id`** (state в базе), а не «за сутки»: пропущенные запуски догоняются сами; state двигается только после успешной записи ([kb_ingest.py:125-166](kb_ingest.py#L125-L166)).
+- **ID чанка детерминирован**: `sha1(chat_id:msg_first:msg_last)`. Повторный инжест идемпотентен, ретрай бэкфилла не переэмбеддит уже записанное ([kb_ingest.py:319-320](kb_ingest.py#L319-L320)).
+- **Чанк — это фрагмент беседы**, не сообщение: сообщения топика группируются до паузы >30 минут или ~4000 символов ([kb_ingest.py:243](kb_ingest.py#L243)). Названия топиков форума берутся через `GetForumTopicsRequest`.
+- **Инжест идёт от `last_seen_id`** (state в базе), а не «за сутки»: пропущенные запуски догоняются сами; state двигается только после успешной записи ([kb_ingest.py:283](kb_ingest.py#L283)).
+- **Обогащение медиа — опционально, по умолчанию выключено**: `KB_VISION=1` (картинки через vision: описание + OCR), `KB_VOICE=1` (голосовые через Whisper), `KB_PDF=1` (текстовый слой скачанных PDF, [kb_pdf.py](kb_pdf.py)). Видео сознательно не обрабатываются. Результаты vision/whisper кэшируются в `media_cache` ([kb_ingest.py:147](kb_ingest.py#L147)) — ретраи не платят дважды; ошибки НЕ кэшируются (retry). PDF учитываются по MD5 (state `pdf_ingested:<md5>`).
+- **PDF-чанки имеют синтетический положительный `chat_id`** (из MD5 файла) — у Telegram-чатов id отрицательные, поэтому бот показывает «файл, стр. N» вместо ссылки t.me ([kb_pdf.py](kb_pdf.py), [kb_bot.py](kb_bot.py)).
+- **Бюджет под контролем**: `kb_backfill.py --dry-run` печатает разбивку стоимости по категориям с учётом флагов; `--max-cost N` останавливает прогон через `BudgetExceeded` ([kb_ingest.py:78](kb_ingest.py#L78)) — state не двигается, кэш и записанные чанки сохраняются, повторный запуск продолжает без двойной оплаты. Оценки цен — константы в [kb_ingest.py](kb_ingest.py) (`EMBED_PRICE_PER_MTOK`, `VISION_COST_PER_IMAGE`, `WHISPER_PRICE_PER_MIN`).
 - **Ночной джоб** — `kb_ingest_loop()` в качалке ([download_telegram_files.py:154-180](download_telegram_files.py#L154-L180)), срабатывает в `INGEST_HOUR` локального времени (tzdata ставится в Dockerfile ради `TZ`). После инжеста — бэкап через `VACUUM INTO` (горячее копирование файла с WAL небезопасно).
 - **Бэкфилл** (`kb_backfill.py`) запускать только при остановленной качалке (общая сессия!) и **до** включения ночного инжеста:
   `docker compose stop telegram-file-downloader` → `docker compose run --rm telegram-file-downloader python kb_backfill.py --dry-run` (оценка объёма/стоимости) → без `--dry-run` → `docker compose start telegram-file-downloader`.
 - **kb-bot не падает без конфига**: без `KB_BOT_TOKEN`/`KB_ANSWER_CHAT_IDS` уходит в вечный sleep с ошибкой в логе (чтобы не крутить crash-loop под `restart: unless-stopped`). Для упоминаний боту нужен выключенный privacy mode (`/setprivacy` → Disable в BotFather).
 - **Запросы FTS санитизируются** ([kb_store.py:136-148](kb_store.py#L136-L148)) — сырой пользовательский текст в `MATCH` роняет FTS5-синтаксис.
-- **Для моделей класса gpt-5 не передавать `temperature`/`max_tokens`** ([kb_bot.py:82-91](kb_bot.py#L82-L91)).
+- **Для моделей класса gpt-5 не передавать `temperature`/`max_tokens`** ([kb_bot.py:85-94](kb_bot.py#L85-L94)).
 
 ## Устойчивость к сетевым сбоям
 
