@@ -112,6 +112,12 @@ async def _backfill(client, chat_ids: list[int], download_folder: str,
         print('ЛИМИТ БЮДЖЕТА ДОСТИГНУТ. Обработанное закэшировано — пополни '
               'баланс API и запусти бэкфилл повторно, он продолжит с места '
               'остановки без двойной оплаты.')
+        store.add_event('backfill',
+                        f'Бэкфилл ОСТАНОВЛЕН по лимиту бюджета, чанков: {store.count()}',
+                        spent)
+    else:
+        store.add_event('backfill',
+                        f'Бэкфилл завершён, чанков в базе: {store.count()}', spent)
 
 
 async def main() -> None:

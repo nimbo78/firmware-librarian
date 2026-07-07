@@ -19,6 +19,7 @@ services:
       KB_VOICE: ${KB_VOICE:-0}
       KB_PDF: ${KB_PDF:-0}
       KB_VISION_MODEL: ${KB_VISION_MODEL:-gpt-5-mini}
+      KB_ADMIN_IDS: ${KB_ADMIN_IDS:-}
     volumes:
       - /volume1/public/Repository/Hardware/Huawei/fromChat:/app/downloads
       - /volume1/docker/tg-kb:/app/kb
@@ -39,6 +40,7 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       KB_BOT_TOKEN: ${KB_BOT_TOKEN:-}
       KB_ANSWER_CHAT_IDS: ${KB_ANSWER_CHAT_IDS:-}
+      KB_ADMIN_IDS: ${KB_ADMIN_IDS:-}
       KB_DB_PATH: /app/kb/kb.sqlite
       KB_BOT_SESSION: /app/kb/kb_bot
       EMBED_MODEL: ${EMBED_MODEL:-text-embedding-3-small}

@@ -95,6 +95,17 @@ class SqliteVecStore:
                     cost REAL NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT (datetime('now'))
                 )''')
+            # Очередь событий для админ-уведомлений: качалка пишет, kb-bot
+            # раз в минуту забирает непрочитанные и шлёт админам в личку
+            self.db.execute('''
+                CREATE TABLE IF NOT EXISTS events(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                    kind TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    cost REAL NOT NULL DEFAULT 0,
+                    notified INTEGER NOT NULL DEFAULT 0
+                )''')
 
     def upsert_chunks(self, chunks: list[Chunk]) -> None:
         with self.db:
@@ -195,6 +206,52 @@ class SqliteVecStore:
         return self.db.execute(
             'SELECT COALESCE(SUM(cost), 0) FROM media_cache').fetchone()[0]
 
+    def add_event(self, kind: str, text: str, cost: float = 0.0) -> None:
+        with self.db:
+            self.db.execute('INSERT INTO events(kind, text, cost) VALUES(?,?,?)',
+                            (kind, text[:300], cost))
+
+    def unnotified_events(self, limit: int = 20) -> list[tuple]:
+        return self.db.execute(
+            'SELECT id, ts, kind, text, cost FROM events WHERE notified=0 '
+            'ORDER BY id LIMIT ?', (limit,)).fetchall()
+
+    def mark_events_notified(self, ids: list[int]) -> None:
+        if not ids:
+            return
+        with self.db:
+            marks = ','.join('?' * len(ids))
+            self.db.execute(
+                f'UPDATE events SET notified=1 WHERE id IN ({marks})', ids)
+
+    def recent_events(self, limit: int = 20) -> list[tuple]:
+        return self.db.execute(
+            'SELECT id, ts, kind, text, cost FROM events '
+            'ORDER BY id DESC LIMIT ?', (limit,)).fetchall()
+
+    def state_items(self, prefix: str) -> list[tuple]:
+        return self.db.execute(
+            'SELECT key, value FROM state WHERE key LIKE ? ORDER BY key',
+            (prefix + '%',)).fetchall()
+
+    def kb_stats(self) -> dict:
+        """Сводка для /status. events_cost уже включает медиа-затраты
+        инжест-прогонов (media_cost — деталь, не слагаемое)."""
+        pdf_chunks = self.db.execute(
+            'SELECT count(*) FROM chunks WHERE chat_id > 0').fetchone()[0]
+        media = self.db.execute(
+            'SELECT count(*), COALESCE(SUM(cost),0) FROM media_cache').fetchone()
+        events_cost = self.db.execute(
+            'SELECT COALESCE(SUM(cost),0) FROM events').fetchone()[0]
+        downloads_24h = self.db.execute(
+            "SELECT count(*) FROM events WHERE kind='download' "
+            "AND ts >= datetime('now', 'localtime', '-1 day')").fetchone()[0]
+        return {
+            'chunks': self.count(), 'pdf_chunks': pdf_chunks,
+            'media_items': media[0], 'media_cost': media[1],
+            'events_cost': events_cost, 'downloads_24h': downloads_24h,
+        }
+
     def count(self) -> int:
         return self.db.execute('SELECT count(*) FROM chunks').fetchone()[0]
 
@@ -258,6 +315,16 @@ def _selftest() -> None:
         store.put_media_text('img:-1001234:10', 'скриншот display board 0', 0.004)
         assert store.get_media_text('img:-1001234:10') == 'скриншот display board 0'
         assert abs(store.media_cost_total() - 0.004) < 1e-9
+
+        store.add_event('download', 'Скачан test.pdf (1.0 МБ)')
+        store.add_event('ingest', 'Ночной инжест -1001234', 0.12)
+        rows = store.unnotified_events()
+        assert len(rows) == 2
+        store.mark_events_notified([rows[0][0]])
+        assert len(store.unnotified_events()) == 1
+        s = store.kb_stats()
+        assert s['chunks'] == 3 and s['downloads_24h'] == 1
+        assert abs(s['events_cost'] - 0.12) < 1e-9
 
         bak = os.path.join(tmp, 'kb.bak')
         store.backup(bak)

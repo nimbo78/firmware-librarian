@@ -29,6 +29,24 @@ DOWNLOAD_FOLDER = os.getenv('DOWNLOAD_FOLDER', './downloads')
 # База знаний: чаты для ночного инжеста (пусто — подсистема выключена)
 KB_CHAT_IDS = {int(x) for x in os.getenv('KB_CHAT_IDS', '').split(',') if x.strip()}
 INGEST_HOUR = int(os.getenv('INGEST_HOUR', '5'))
+KB_ADMIN_IDS = {int(x) for x in os.getenv('KB_ADMIN_IDS', '').split(',') if x.strip()}
+
+_kb_event_store = None
+
+
+def _kb_event(kind: str, text: str, cost: float = 0.0) -> None:
+    """Событие в очередь админ-уведомлений (kb-bot разошлёт в личку).
+    Любая ошибка KB-подсистемы не должна ломать скачивание файлов."""
+    global _kb_event_store
+    if not (KB_CHAT_IDS or KB_ADMIN_IDS):
+        return
+    try:
+        if _kb_event_store is None:
+            from kb_store import open_store
+            _kb_event_store = open_store()
+        _kb_event_store.add_event(kind, text, cost)
+    except Exception as e:
+        logger.debug('kb event skipped: %s', e)
 
 if not CHAT_IDS:
     raise ValueError('CHAT_IDS must contain at least one chat id')
@@ -131,6 +149,7 @@ async def handler(event):
         await event.message.download_media(file=file_path)
     except (OSError, asyncio.TimeoutError, errors.RPCError) as e:
         logger.warning('Download failed for %s: %s', file_name, e)
+        _kb_event('error', f'Ошибка скачивания {file_name}: {e}')
         if os.path.exists(file_path):
             try:
                 os.remove(file_path)
@@ -141,6 +160,8 @@ async def handler(event):
     file_md5 = calculate_md5(file_path)
     save_downloaded_file(file_name, file_md5)
     logger.info('Downloaded %s to %s', file_name, file_path)
+    size_mb = os.path.getsize(file_path) / 1e6
+    _kb_event('download', f'Скачан {file_name} ({size_mb:.1f} МБ)')
 
 
 def _seconds_until_hour(hour: int) -> float:
@@ -173,8 +194,13 @@ async def kb_ingest_loop() -> None:
                 logger.info('KB ingest %s: %d messages -> %d new chunks, '
                             'media %d, ~$%.2f', chat_id, stats.messages,
                             stats.new_chunks, stats.media_items, stats.cost)
+                store.add_event('ingest',
+                                f'Ночной инжест {chat_id}: {stats.messages} сообщ. '
+                                f'-> {stats.new_chunks} чанков, медиа {stats.media_items}',
+                                stats.cost)
             except Exception as e:
                 logger.warning('KB ingest failed for %s: %s', chat_id, e)
+                store.add_event('error', f'Инжест {chat_id} упал: {e}')
         if pdf_enabled():
             try:
                 from kb_pdf import ingest_pdfs
@@ -182,12 +208,17 @@ async def kb_ingest_loop() -> None:
                 if files:
                     logger.info('KB PDF ingest: %d files -> %d chunks, ~$%.2f',
                                 files, chunks, cost)
+                    store.add_event('pdf',
+                                    f'PDF-инжест: {files} файлов -> {chunks} чанков',
+                                    cost)
             except Exception as e:
                 logger.warning('KB PDF ingest failed: %s', e)
+                store.add_event('error', f'PDF-инжест упал: {e}')
         try:
             store.backup()
         except Exception as e:
             logger.warning('KB backup failed: %s', e)
+            store.add_event('error', f'Бэкап базы знаний упал: {e}')
 
 
 async def run() -> None:

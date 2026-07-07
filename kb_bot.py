@@ -22,10 +22,23 @@ API_HASH = os.environ['TELEGRAM_API_HASH']
 BOT_TOKEN = os.getenv('KB_BOT_TOKEN', '')
 ANSWER_CHAT_IDS = {int(x) for x in os.getenv('KB_ANSWER_CHAT_IDS', '').split(',')
                    if x.strip()}
+# Whitelist админов: telegram user id через запятую. Только им доступны
+# команды в личке и уведомления. Бот не может написать первым — админ
+# должен один раз нажать Start.
+ADMIN_IDS = {int(x) for x in os.getenv('KB_ADMIN_IDS', '').split(',') if x.strip()}
 ANSWER_MODEL = os.getenv('ANSWER_MODEL', 'gpt-5-mini')
 SESSION = os.getenv('KB_BOT_SESSION', 'kb_bot')
 COOLDOWN_SECONDS = 30
 TOP_K = 8
+NOTIFY_POLL_SECONDS = 60
+
+ADMIN_HELP = (
+    'Команды администратора:\n'
+    '/status — база, стоимость, курсоры инжеста\n'
+    '/events — последние 20 событий\n'
+    '/notify on|off — уведомления о событиях в личку\n'
+    'Любой другой текст в личке — вопрос к базе знаний.'
+)
 
 SYSTEM_PROMPT = (
     'Ты — ассистент чата по оборудованию Huawei. Отвечай кратко и по-русски, '
@@ -96,8 +109,108 @@ async def answer_question(question: str) -> str:
     return answer[:4000]  # лимит сообщения Telegram — 4096
 
 
+def _fmt_event(ts: str, kind: str, text: str, cost: float) -> str:
+    line = f'{ts[5:16]} [{kind}] {text}'
+    if cost:
+        line += f' ~${cost:.2f}'
+    return line
+
+
+async def handle_admin(event) -> None:
+    text = (event.raw_text or '').strip()
+    low = text.lower()
+    if low.startswith('/start') or low.startswith('/help'):
+        await event.reply(ADMIN_HELP)
+    elif low.startswith('/status'):
+        s = store.kb_stats()
+        notify = 'вкл' if store.get_state('admin_notify', '1') == '1' else 'выкл'
+        lines = [
+            f'Чанков в базе: {s["chunks"]} (из них PDF: {s["pdf_chunks"]})',
+            f'Медиа обработано: {s["media_items"]} (~${s["media_cost"]:.2f})',
+            f'Потрачено суммарно: ~${s["events_cost"]:.2f}',
+            f'Скачано файлов за 24 ч: {s["downloads_24h"]}',
+            f'Уведомления: {notify}',
+        ]
+        cursors = store.state_items('last_seen_id:')
+        if cursors:
+            lines.append('Курсоры инжеста (chat: msg_id):')
+            lines += [f'  {k.split(":", 1)[1]}: {v}' for k, v in cursors]
+        await event.reply('\n'.join(lines))
+    elif low.startswith('/events'):
+        rows = store.recent_events(20)
+        if not rows:
+            await event.reply('Событий пока нет.')
+        else:
+            body = '\n'.join(_fmt_event(ts, kind, tx, cost)
+                             for _, ts, kind, tx, cost in reversed(rows))
+            await event.reply(body[:4000], link_preview=False)
+    elif low.startswith('/notify'):
+        parts = text.split(maxsplit=1)
+        arg = parts[1].strip().lower() if len(parts) > 1 else ''
+        if arg in ('on', 'off'):
+            store.set_state('admin_notify', '1' if arg == 'on' else '0')
+            await event.reply(
+                'Уведомления включены.' if arg == 'on' else 'Уведомления выключены.')
+        else:
+            cur = 'on' if store.get_state('admin_notify', '1') == '1' else 'off'
+            await event.reply(f'Сейчас: {cur}. Используй /notify on или /notify off.')
+    elif text.startswith('/') and not low.startswith('/ask'):
+        await event.reply(ADMIN_HELP)
+    else:
+        question = _extract_question(text)
+        if question is None:
+            question = text  # в личке админа любой текст — вопрос к базе
+        if not question:
+            await event.reply(ADMIN_HELP)
+            return
+        logger.info('Admin question from %s: %s', event.sender_id, question[:100])
+        try:
+            answer = await answer_question(question)
+        except Exception as e:
+            logger.warning('Answer failed: %s', e)
+            answer = 'Не получилось получить ответ, попробуй позже.'
+        await event.reply(answer, link_preview=False)
+
+
+async def notifier_loop() -> None:
+    """Раз в минуту рассылает админам непрочитанные события из очереди.
+    События помечаются доставленными только после успешной отправки —
+    при выключенных уведомлениях копятся и видны через /events."""
+    if not ADMIN_IDS:
+        return
+    while True:
+        await asyncio.sleep(NOTIFY_POLL_SECONDS)
+        try:
+            if store.get_state('admin_notify', '1') != '1':
+                continue
+            if not client.is_connected():
+                continue
+            rows = store.unnotified_events(20)
+            if not rows:
+                continue
+            msg = 'События:\n' + '\n'.join(
+                _fmt_event(ts, kind, tx, cost) for _, ts, kind, tx, cost in rows)
+            sent = False
+            for admin_id in ADMIN_IDS:
+                try:
+                    await client.send_message(admin_id, msg[:4000],
+                                              link_preview=False)
+                    sent = True
+                except Exception as e:
+                    # обычно: админ ещё не нажал Start у бота
+                    logger.warning('notify to %s failed: %s', admin_id, e)
+            if sent:
+                store.mark_events_notified([r[0] for r in rows])
+        except Exception as e:
+            logger.warning('notifier failed: %s', e)
+
+
 @client.on(events.NewMessage)
 async def handler(event):
+    if event.is_private:
+        if event.sender_id in ADMIN_IDS:
+            await handle_admin(event)
+        return  # личка не-админов игнорируется
     if event.chat_id not in ANSWER_CHAT_IDS:
         return
     question = _extract_question(event.raw_text or '')
@@ -134,6 +247,7 @@ async def run() -> None:
     initial_backoff = 300
     max_backoff = 1800
     backoff = initial_backoff
+    notifier_task = asyncio.create_task(notifier_loop())  # живёт поверх реконнектов
     while True:
         try:
             await client.start(bot_token=BOT_TOKEN)

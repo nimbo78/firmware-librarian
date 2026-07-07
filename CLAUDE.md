@@ -37,6 +37,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `KB_BOT_TOKEN`, `KB_ANSWER_CHAT_IDS` — токен BotFather и чаты, где бот отвечает.
 - `TZ` — часовой пояс контейнера; от него зависит `INGEST_HOUR` (по умолчанию 5).
 - `KB_VISION`/`KB_VOICE`/`KB_PDF` — флаги обогащения (`1` включает; по умолчанию `0`): картинки через vision, голосовые через Whisper, текстовый слой скачанных PDF.
+- `KB_ADMIN_IDS` — CSV telegram user id админов: команды в личке бота (`/status`, `/events`, `/notify on|off`) и уведомления о событиях.
 - `EMBED_MODEL`/`EMBED_DIM` (`text-embedding-3-small`/512), `ANSWER_MODEL`/`KB_VISION_MODEL` (`gpt-5-mini`), `KB_DB_PATH` (`/app/kb/kb.sqlite`), `KB_BACKEND` (`sqlite`).
 
 ## Архитектура и неочевидные детали
@@ -62,6 +63,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Обогащение медиа — опционально, по умолчанию выключено**: `KB_VISION=1` (картинки через vision: описание + OCR), `KB_VOICE=1` (голосовые через Whisper), `KB_PDF=1` (текстовый слой скачанных PDF, [kb_pdf.py](kb_pdf.py)). Видео сознательно не обрабатываются. Результаты vision/whisper кэшируются в `media_cache` ([kb_ingest.py:147](kb_ingest.py#L147)) — ретраи не платят дважды; ошибки НЕ кэшируются (retry). PDF учитываются по MD5 (state `pdf_ingested:<md5>`).
 - **PDF-чанки имеют синтетический положительный `chat_id`** (из MD5 файла) — у Telegram-чатов id отрицательные, поэтому бот показывает «файл, стр. N» вместо ссылки t.me ([kb_pdf.py](kb_pdf.py), [kb_bot.py](kb_bot.py)).
 - **Бюджет под контролем**: `kb_backfill.py --dry-run` печатает разбивку стоимости по категориям с учётом флагов; `--max-cost N` останавливает прогон через `BudgetExceeded` ([kb_ingest.py:78](kb_ingest.py#L78)) — state не двигается, кэш и записанные чанки сохраняются, повторный запуск продолжает без двойной оплаты. Оценки цен — константы в [kb_ingest.py](kb_ingest.py) (`EMBED_PRICE_PER_MTOK`, `VISION_COST_PER_IMAGE`, `WHISPER_PRICE_PER_MIN`).
+- **Админ-канал через очередь `events` в базе.** Качалка пишет события (скачивания, инжест, ошибки — через `_kb_event()`, ошибки KB не ломают скачивание), kb-bot раз в минуту рассылает непрочитанные админам из `KB_ADMIN_IDS` в личку. События помечаются доставленными только после успешной отправки; при `/notify off` копятся и видны через `/events`. Личка не-админов игнорируется; любой текст админа в личке без команды — вопрос к RAG. Бот не может написать первым: админ должен один раз нажать Start.
+- **`events_cost` в `/status` уже включает медиа-затраты** инжест-прогонов — `media_cost` из `media_cache` это деталь, а не слагаемое (иначе двойной счёт).
 - **Ночной джоб** — `kb_ingest_loop()` в качалке ([download_telegram_files.py:154-180](download_telegram_files.py#L154-L180)), срабатывает в `INGEST_HOUR` локального времени (tzdata ставится в Dockerfile ради `TZ`). После инжеста — бэкап через `VACUUM INTO` (горячее копирование файла с WAL небезопасно).
 - **Бэкфилл** (`kb_backfill.py`) запускать только при остановленной качалке (общая сессия!) и **до** включения ночного инжеста:
   `docker compose stop telegram-file-downloader` → `docker compose run --rm telegram-file-downloader python kb_backfill.py --dry-run` (оценка объёма/стоимости) → без `--dry-run` → `docker compose start telegram-file-downloader`.
