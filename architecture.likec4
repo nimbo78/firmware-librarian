@@ -1,4 +1,4 @@
-// Архитектура telegram-file-downloader + база знаний (RAG).
+// Архитектура telegram-file-downloader + база знаний (RAG) + каталог прошивок.
 // Просмотр: расширение LikeC4 для VS Code или `npx likec4 start` в этой папке.
 
 specification {
@@ -19,57 +19,58 @@ specification {
 
 model {
   member = actor 'Участник чата' {
-    description 'Шлёт файлы в чаты, задаёт вопросы боту'
+    description 'Шлёт файлы в чаты, задаёт вопросы (/ask, @упоминание, /fw), ставит оценки 👍/👎'
   }
 
-  owner = actor 'Владелец' {
-    description 'Деплоит на NAS, запускает бэкфилл'
+  admin = actor 'Админ (KB_ADMIN_IDS)' {
+    description 'Личка бота: /status, /events, /gaps, /fw, /review, /notify. Получает уведомления о событиях. Деплоит и запускает бэкфилл на NAS.'
   }
 
   telegram = system 'Telegram' {
     #external
-    description 'MTProto API (api.telegram.org), чаты с топиками'
+    description 'MTProto API (api.telegram.org), чаты с топиками форума'
   }
 
   openai = system 'OpenAI API' {
     #external
-    description 'Эмбеддинги text-embedding-3-small (512 dim) и ответы gpt-5-mini'
+    description 'Эмбеддинги text-embedding-3-small (512 dim), ответы/vision/экстракция gpt-5-mini, Whisper для голосовых'
   }
 
   nas = system 'Synology DS720+ · Docker Compose' {
 
     downloader = container 'telegram-file-downloader' {
-      technology 'Python 3.12 · Telethon · user-сессия bot.session'
-      description 'Слушает CHAT_IDS, скачивает документы, дедуплицирует по имени+MD5. Ночной ingest базы знаний в INGEST_HOUR — живёт здесь, потому что одна Telethon-сессия = один процесс.'
+      technology 'Python 3.13 · Telethon · user-сессия bot.session'
+      description 'Скачивает документы из CHAT_IDS (дедуп имя+MD5), каталогизирует ВСЕ документы наблюдаемых чатов. Ночной пайплайн в INGEST_HOUR: инжест чатов → PDF → LLM-экстракция каталога → бэкап. Одна сессия = один процесс, поэтому всё здесь.'
     }
 
     kbbot = container 'kb-bot' {
-      technology 'Python 3.12 · Telethon · bot-токен BotFather'
-      description 'Отвечает на /ask и @упоминания в KB_ANSWER_CHAT_IDS: гибридный поиск + chat completion, цитаты t.me/c/…, кулдаун 30 с.'
+      technology 'Python 3.13 · Telethon · bot-токен BotFather'
+      description 'RAG-ответы (/ask, @mention) с оценками 👍/👎, каталог прошивок (/fw c сериями), админ-канал (уведомления + команды), /review для LLM-связок, петля gaps: недельный пост «помогите сообществу» и авто-ответ авторам после инжеста.'
     }
 
     kbdb = datastore 'kb.sqlite' {
       technology 'SQLite · sqlite-vec (KNN) · FTS5 · WAL'
-      description 'Чанки бесед с метаданными топиков, вектора, полнотекстовый индекс, state инжеста. Доступ только через kb_store.open_store() — точка переезда на Qdrant.'
+      description 'Чанки бесед + вектора; каталог files/firmware/devices (серии); очередь events (админ-канал); qa_log с оценками и петлёй gaps; media_cache (vision/whisper, ретраи не платят дважды); state. Доступ только через kb_store.open_store() — точка переезда на Qdrant.'
     }
 
     downloads = datastore 'Том загрузок' {
       technology '/volume1/public/Repository/Hardware/Huawei/fromChat'
-      description 'Скачанные файлы + downloaded_files.txt (журнал дедупликации)'
+      description 'Скачанные файлы + downloaded_files.txt (журнал дедупликации). PDF отсюда индексируются в базу при KB_PDF=1.'
     }
   }
 
-  member -> telegram 'файлы в чат, /ask, @упоминания'
-  owner -> nas './redeploy.sh, kb_backfill.py'
+  member -> telegram 'файлы, /ask, @упоминания, /fw, оценки'
+  admin -> telegram 'команды в личке бота, подтверждения /review'
+  admin -> nas './redeploy.sh, kb_backfill.py (--dry-run, --max-cost)'
 
-  downloader -> telegram 'MTProto: слушает чаты, качает документы, читает историю'
+  downloader -> telegram 'MTProto: слушает чаты, качает документы, читает историю и топики'
   downloader -> downloads 'сохраняет файлы, ведёт журнал дедупликации'
-  downloader -> openai 'эмбеддинги новых чанков (ночью, батчами)'
-  downloader -> kbdb 'upsert чанков и векторов, state, backup (VACUUM INTO)'
+  downloader -> openai 'ночью: эмбеддинги, vision/whisper (по флагам), LLM-экстракция каталога'
+  downloader -> kbdb 'чанки+вектора, каталог, события, state, backup (VACUUM INTO)'
 
-  kbbot -> telegram 'MTProto: получает вопросы, отвечает в топик'
+  kbbot -> telegram 'ответы в топики, уведомления админам, недельный пост gaps'
   kbbot -> openai 'эмбеддинг вопроса, генерация ответа'
-  kbbot -> kbdb 'гибридный поиск: KNN + FTS5 → RRF → top-8'
+  kbbot -> kbdb 'гибридный поиск (KNN+FTS5, RRF), каталог /fw, события, qa-лог, подтверждения'
 }
 
 views {
@@ -82,23 +83,26 @@ views {
 
   view nas_containers of nas {
     title 'Контейнеры на NAS'
-    include *, telegram, openai, member
+    include *, telegram, openai, member, admin
     autoLayout TopBottom
   }
 
   dynamic view flow_download {
-    title 'Сценарий: скачивание файла'
-    member -> telegram 'шлёт документ в чат из CHAT_IDS'
+    title 'Сценарий: файл в чате'
+    member -> telegram 'шлёт документ в чат'
     telegram -> downloader 'событие NewMessage'
-    downloader -> downloads 'фильтр расширений, дедуп имя+MD5, сохранение, запись в журнал'
+    downloader -> kbdb 'каталогизация: files + разбор имени Huawei (модель, версия) — для ВСЕХ документов'
+    downloader -> downloads 'если чат в CHAT_IDS и расширение подходит: дедуп имя+MD5, скачивание'
   }
 
   dynamic view flow_ingest {
-    title 'Сценарий: ночной ingest (INGEST_HOUR)'
+    title 'Сценарий: ночной пайплайн (INGEST_HOUR)'
     downloader -> kbdb 'читает last_seen_id:<chat_id>'
-    downloader -> telegram 'iter_messages от last_seen_id, названия топиков форума'
-    downloader -> openai 'эмбеддинги только новых чанков (детерминированные id)'
-    downloader -> kbdb 'upsert, сдвиг state, backup'
+    downloader -> telegram 'iter_messages от last_seen_id, названия топиков'
+    downloader -> openai 'vision/whisper для медиа (по флагам, с кэшем), эмбеддинги новых чанков'
+    downloader -> kbdb 'upsert чанков, сдвиг state'
+    downloader -> openai 'LLM-экстракция: подписи файлов без связок, таксономия серий'
+    downloader -> kbdb 'firmware (medium) + devices; событие «N записей ждут /review»; backup'
   }
 
   dynamic view flow_ask {
@@ -106,8 +110,28 @@ views {
     member -> telegram '/ask как прошить ONT'
     telegram -> kbbot 'событие NewMessage'
     kbbot -> openai 'эмбеддинг вопроса'
-    kbbot -> kbdb 'KNN + FTS5, RRF, top-8 чанков'
+    kbbot -> kbdb 'KNN + FTS5, RRF, top-8 чанков; лог в qa_log'
     kbbot -> openai 'chat completion: system-промпт + контекст + вопрос'
-    kbbot -> telegram 'ответ в тот же топик + источники t.me/c/…'
+    kbbot -> telegram 'ответ в топик + источники t.me/c/… + кнопки 👍/👎'
+    member -> telegram '👎 (если ответ плохой)'
+    telegram -> kbbot 'CallbackQuery: rating=-1 → событие feedback админу'
+  }
+
+  dynamic view flow_gaps {
+    title 'Сценарий: петля «вопросы без ответа»'
+    kbbot -> telegram 'пн 10:00: пост «помогите сообществу» — топ-3 вопросов без ответа'
+    member -> telegram 'обсуждение в чате'
+    downloader -> telegram 'ночной инжест забирает обсуждение в базу'
+    kbbot -> kbdb 'INGEST_HOUR+1: повторный поиск по открытым пробелам'
+    kbbot -> telegram 'найдено → авто-ответ реплаем автору вопроса, пробел закрыт'
+  }
+
+  dynamic view flow_admin {
+    title 'Сценарий: админ-канал'
+    downloader -> kbdb 'события: скачивания, инжест со стоимостью, ошибки'
+    kbbot -> kbdb 'раз в минуту: выборка непрочитанных событий'
+    kbbot -> telegram 'рассылка админам в личку (после Start), пометка доставленных'
+    admin -> telegram '/review: кнопки ✅/❌ по LLM-связкам каталога'
+    telegram -> kbbot 'CallbackQuery: confidence=high или отклонение'
   }
 }
