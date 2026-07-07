@@ -1,0 +1,32 @@
+# НЕ исключаем bot.session — его копирует Dockerfile при сборке образа.
+
+.git/
+.gitignore
+.dockerignore
+
+# Секреты и локальное окружение
+.env
+.env.example
+.venv/
+venv/
+
+# Данные
+downloads/
+kb/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.bak
+downloaded_files.txt
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Локальное состояние и документация (в образе не нужны)
+.remember/
+*.md
+README.html
+README_files/
+architecture.likec4
+redeploy.sh

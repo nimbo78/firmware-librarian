@@ -1,0 +1,30 @@
+# --- Секреты: НИКОГДА не коммитить ---
+# Telethon-сессии = полный доступ к Telegram-аккаунту / боту
+*.session
+*.session-journal
+bot.session
+# Переменные окружения с ключами и токенами
+.env
+
+# --- Данные (живут на томах NAS, не в репозитории) ---
+downloads/
+kb/
+downloaded_files.txt
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.bak
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# --- Локальное состояние инструментов ---
+.remember/
+
+# --- Сгенерированный экспорт README (правим только README.md) ---
+README.html
+README_files/

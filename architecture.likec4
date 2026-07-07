@@ -1,0 +1,113 @@
+// Архитектура telegram-file-downloader + база знаний (RAG).
+// Просмотр: расширение LikeC4 для VS Code или `npx likec4 start` в этой папке.
+
+specification {
+  element actor {
+    style {
+      shape person
+    }
+  }
+  element system
+  element container
+  element datastore {
+    style {
+      shape storage
+    }
+  }
+  tag external
+}
+
+model {
+  member = actor 'Участник чата' {
+    description 'Шлёт файлы в чаты, задаёт вопросы боту'
+  }
+
+  owner = actor 'Владелец' {
+    description 'Деплоит на NAS, запускает бэкфилл'
+  }
+
+  telegram = system 'Telegram' {
+    #external
+    description 'MTProto API (api.telegram.org), чаты с топиками'
+  }
+
+  openai = system 'OpenAI API' {
+    #external
+    description 'Эмбеддинги text-embedding-3-small (512 dim) и ответы gpt-5-mini'
+  }
+
+  nas = system 'Synology DS720+ · Docker Compose' {
+
+    downloader = container 'telegram-file-downloader' {
+      technology 'Python 3.12 · Telethon · user-сессия bot.session'
+      description 'Слушает CHAT_IDS, скачивает документы, дедуплицирует по имени+MD5. Ночной ingest базы знаний в INGEST_HOUR — живёт здесь, потому что одна Telethon-сессия = один процесс.'
+    }
+
+    kbbot = container 'kb-bot' {
+      technology 'Python 3.12 · Telethon · bot-токен BotFather'
+      description 'Отвечает на /ask и @упоминания в KB_ANSWER_CHAT_IDS: гибридный поиск + chat completion, цитаты t.me/c/…, кулдаун 30 с.'
+    }
+
+    kbdb = datastore 'kb.sqlite' {
+      technology 'SQLite · sqlite-vec (KNN) · FTS5 · WAL'
+      description 'Чанки бесед с метаданными топиков, вектора, полнотекстовый индекс, state инжеста. Доступ только через kb_store.open_store() — точка переезда на Qdrant.'
+    }
+
+    downloads = datastore 'Том загрузок' {
+      technology '/volume1/public/Repository/Hardware/Huawei/fromChat'
+      description 'Скачанные файлы + downloaded_files.txt (журнал дедупликации)'
+    }
+  }
+
+  member -> telegram 'файлы в чат, /ask, @упоминания'
+  owner -> nas './redeploy.sh, kb_backfill.py'
+
+  downloader -> telegram 'MTProto: слушает чаты, качает документы, читает историю'
+  downloader -> downloads 'сохраняет файлы, ведёт журнал дедупликации'
+  downloader -> openai 'эмбеддинги новых чанков (ночью, батчами)'
+  downloader -> kbdb 'upsert чанков и векторов, state, backup (VACUUM INTO)'
+
+  kbbot -> telegram 'MTProto: получает вопросы, отвечает в топик'
+  kbbot -> openai 'эмбеддинг вопроса, генерация ответа'
+  kbbot -> kbdb 'гибридный поиск: KNN + FTS5 → RRF → top-8'
+}
+
+views {
+
+  view index {
+    title 'Ландшафт: качалка файлов + хранитель знаний'
+    include *
+    autoLayout TopBottom
+  }
+
+  view nas_containers of nas {
+    title 'Контейнеры на NAS'
+    include *, telegram, openai, member
+    autoLayout TopBottom
+  }
+
+  dynamic view flow_download {
+    title 'Сценарий: скачивание файла'
+    member -> telegram 'шлёт документ в чат из CHAT_IDS'
+    telegram -> downloader 'событие NewMessage'
+    downloader -> downloads 'фильтр расширений, дедуп имя+MD5, сохранение, запись в журнал'
+  }
+
+  dynamic view flow_ingest {
+    title 'Сценарий: ночной ingest (INGEST_HOUR)'
+    downloader -> kbdb 'читает last_seen_id:<chat_id>'
+    downloader -> telegram 'iter_messages от last_seen_id, названия топиков форума'
+    downloader -> openai 'эмбеддинги только новых чанков (детерминированные id)'
+    downloader -> kbdb 'upsert, сдвиг state, backup'
+  }
+
+  dynamic view flow_ask {
+    title 'Сценарий: вопрос боту'
+    member -> telegram '/ask как прошить ONT'
+    telegram -> kbbot 'событие NewMessage'
+    kbbot -> openai 'эмбеддинг вопроса'
+    kbbot -> kbdb 'KNN + FTS5, RRF, top-8 чанков'
+    kbbot -> openai 'chat completion: system-промпт + контекст + вопрос'
+    kbbot -> telegram 'ответ в тот же топик + источники t.me/c/…'
+  }
+}

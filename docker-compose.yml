@@ -1,0 +1,45 @@
+services:
+  telegram-file-downloader:
+    build: .
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      CHAT_IDS: ${CHAT_IDS}
+      FILE_EXTENSIONS: ${FILE_EXTENSIONS}
+      DOWNLOAD_FOLDER: /app/downloads
+      TZ: ${TZ:-UTC}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      KB_CHAT_IDS: ${KB_CHAT_IDS:-}
+      KB_DB_PATH: /app/kb/kb.sqlite
+      EMBED_MODEL: ${EMBED_MODEL:-text-embedding-3-small}
+      EMBED_DIM: ${EMBED_DIM:-512}
+      INGEST_HOUR: ${INGEST_HOUR:-5}
+    volumes:
+      - /volume1/public/Repository/Hardware/Huawei/fromChat:/app/downloads
+      - /volume1/docker/tg-kb:/app/kb
+    logging: &default-logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  kb-bot:
+    build: .
+    command: ["python", "kb_bot.py"]
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TZ: ${TZ:-UTC}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      KB_BOT_TOKEN: ${KB_BOT_TOKEN:-}
+      KB_ANSWER_CHAT_IDS: ${KB_ANSWER_CHAT_IDS:-}
+      KB_DB_PATH: /app/kb/kb.sqlite
+      KB_BOT_SESSION: /app/kb/kb_bot
+      EMBED_MODEL: ${EMBED_MODEL:-text-embedding-3-small}
+      EMBED_DIM: ${EMBED_DIM:-512}
+      ANSWER_MODEL: ${ANSWER_MODEL:-gpt-5-mini}
+    volumes:
+      - /volume1/docker/tg-kb:/app/kb
+    logging: *default-logging
