@@ -146,7 +146,9 @@ class SqliteVecStore:
                     PRIMARY KEY (doc_id, device_model, version)
                 )''')
             # Лог вопрос-ответ с оценками: 👎 -> событие админу,
-            # found=0 -> копилка вопросов без ответа (/gaps)
+            # found=0 -> копилка вопросов без ответа (/gaps).
+            # msg_id — сообщение с вопросом (для авто-ответа реплаем),
+            # gap_posted/gap_closed — петля «помогите сообществу».
             self.db.execute('''
                 CREATE TABLE IF NOT EXISTS qa_log(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,11 +158,17 @@ class SqliteVecStore:
                     question TEXT NOT NULL,
                     answer TEXT NOT NULL DEFAULT '',
                     found INTEGER NOT NULL DEFAULT 1,
-                    rating INTEGER NOT NULL DEFAULT 0
+                    rating INTEGER NOT NULL DEFAULT 0,
+                    msg_id INTEGER NOT NULL DEFAULT 0,
+                    gap_posted INTEGER NOT NULL DEFAULT 0,
+                    gap_closed INTEGER NOT NULL DEFAULT 0
                 )''')
-        # Миграции баз, созданных до фазы B (ALTER падает, если колонка есть)
+        # Миграции старых баз (ALTER падает, если колонка есть)
         for stmt in (
             "ALTER TABLE files ADD COLUMN llm_done INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE qa_log ADD COLUMN msg_id INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE qa_log ADD COLUMN gap_posted INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE qa_log ADD COLUMN gap_closed INTEGER NOT NULL DEFAULT 0",
         ):
             try:
                 with self.db:
@@ -430,13 +438,13 @@ class SqliteVecStore:
                     (model,))
 
     def log_qa(self, chat_id: int, user_id: int, question: str,
-               answer: str, found: bool) -> int:
+               answer: str, found: bool, msg_id: int = 0) -> int:
         with self.db:
             cur = self.db.execute(
-                'INSERT INTO qa_log(chat_id, user_id, question, answer, found) '
-                'VALUES(?,?,?,?,?)',
+                'INSERT INTO qa_log(chat_id, user_id, question, answer, found, msg_id) '
+                'VALUES(?,?,?,?,?,?)',
                 (chat_id, user_id, question[:500], answer[:1000],
-                 1 if found else 0))
+                 1 if found else 0, msg_id))
             return cur.lastrowid
 
     def set_qa_rating(self, qa_id: int, rating: int) -> str | None:
@@ -451,8 +459,37 @@ class SqliteVecStore:
     def gaps(self, limit: int = 15) -> list[tuple]:
         """Вопросы без ответа или с минусом — карта дыр в базе знаний."""
         return self.db.execute(
-            'SELECT ts, question FROM qa_log WHERE found=0 OR rating<0 '
+            'SELECT ts, question FROM qa_log '
+            'WHERE (found=0 OR rating<0) AND gap_closed=0 '
             'ORDER BY id DESC LIMIT ?', (limit,)).fetchall()
+
+    def open_nohit_gaps(self, limit: int = 10) -> list[tuple]:
+        """Вопросы, на которые поиск ничего не нашёл, — кандидаты на
+        авто-ответ после ночного инжеста (👎-вопросы не ретраим автоматом:
+        повторный плохой ответ хуже молчания)."""
+        return self.db.execute(
+            'SELECT id, chat_id, msg_id, question FROM qa_log '
+            'WHERE found=0 AND gap_closed=0 '
+            'ORDER BY id DESC LIMIT ?', (limit,)).fetchall()
+
+    def unposted_gaps(self, limit: int = 3) -> list[tuple]:
+        """Открытые пробелы, ещё не публиковавшиеся в чате."""
+        return self.db.execute(
+            'SELECT id, question FROM qa_log '
+            'WHERE (found=0 OR rating<0) AND gap_closed=0 AND gap_posted=0 '
+            'ORDER BY id DESC LIMIT ?', (limit,)).fetchall()
+
+    def mark_gaps_posted(self, ids: list[int]) -> None:
+        if not ids:
+            return
+        with self.db:
+            marks = ','.join('?' * len(ids))
+            self.db.execute(
+                f'UPDATE qa_log SET gap_posted=1 WHERE id IN ({marks})', ids)
+
+    def mark_gap_closed(self, qa_id: int) -> None:
+        with self.db:
+            self.db.execute('UPDATE qa_log SET gap_closed=1 WHERE id=?', (qa_id,))
 
     def kb_stats(self) -> dict:
         """Сводка для /status. events_cost уже включает медиа-затраты
@@ -612,10 +649,23 @@ def _selftest() -> None:
         assert store.models_without_device(limit=50) == ['MA5608T', 'MA5800']
 
         # лог вопрос-ответ и оценки
-        qa_id = store.log_qa(-1001234, 777, 'как прошить ONT?', 'вот так', True)
+        qa_id = store.log_qa(-1001234, 777, 'как прошить ONT?', 'вот так', True,
+                             msg_id=100)
         assert store.set_qa_rating(qa_id, -1) == 'как прошить ONT?'
-        store.log_qa(-1001234, 778, 'про что-то неизвестное', '', False)
+        store.log_qa(-1001234, 778, 'про что-то неизвестное', '', False,
+                     msg_id=101)
         assert len(store.gaps()) == 2
+
+        # петля gaps: авто-ответ только для found=0, недельный пост — для всех
+        nohit = store.open_nohit_gaps()
+        assert len(nohit) == 1 and nohit[0][2] == 101, nohit
+        unposted = store.unposted_gaps()
+        assert len(unposted) == 2
+        store.mark_gaps_posted([unposted[0][0]])
+        assert len(store.unposted_gaps()) == 1
+        store.mark_gap_closed(nohit[0][0])
+        assert store.open_nohit_gaps() == []
+        assert len(store.gaps()) == 1  # закрытый пробел ушёл из /gaps
 
         s = store.kb_stats()
         assert s['chunks'] == 3 and s['downloads_24h'] == 1

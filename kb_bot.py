@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timedelta
 
 from telethon import Button, TelegramClient, events
 
@@ -31,6 +32,14 @@ SESSION = os.getenv('KB_BOT_SESSION', 'kb_bot')
 COOLDOWN_SECONDS = 30
 TOP_K = 8
 NOTIFY_POLL_SECONDS = 60
+
+# Петля «вопросы без ответа»: авто-ответ через час после ночного инжеста
+# (свежие знания уже в базе) и еженедельный пост «помогите сообществу».
+GAP_CHECK_HOUR = int(os.getenv('INGEST_HOUR', '5')) + 1
+GAPS_CHAT_ID = int(os.getenv('KB_GAPS_CHAT_ID', '0') or 0)   # 0 = пост выключен
+GAPS_TOPIC_ID = int(os.getenv('KB_GAPS_TOPIC_ID', '0') or 0)  # топик форума
+GAPS_POST_WEEKDAY = 0   # понедельник
+GAPS_POST_HOUR = 10
 
 ADMIN_HELP = (
     'Команды администратора:\n'
@@ -124,7 +133,8 @@ async def _send_answer(event, question: str) -> None:
         await event.reply('Не получилось получить ответ, попробуй позже.')
         return
     qa_id = store.log_qa(event.chat_id or 0, event.sender_id or 0,
-                         question, answer, found)
+                         question, answer, found,
+                         msg_id=event.message.id)  # для авто-ответа реплаем
     buttons = [[Button.inline('👍', f'r:{qa_id}:1'.encode()),
                 Button.inline('👎', f'r:{qa_id}:-1'.encode())]]
     await event.reply(answer, link_preview=False, buttons=buttons)
@@ -288,6 +298,86 @@ async def notifier_loop() -> None:
             logger.warning('notifier failed: %s', e)
 
 
+async def auto_answer_gaps() -> int:
+    """Повторно отвечает на вопросы, где раньше не было данных: ночной инжест
+    мог принести ответ из обсуждения. Ответ уходит реплаем на исходный вопрос."""
+    answered = 0
+    for qa_id, chat_id, msg_id, question in store.open_nohit_gaps(10):
+        if chat_id not in ANSWER_CHAT_IDS and chat_id not in ADMIN_IDS:
+            store.mark_gap_closed(qa_id)  # чат больше не обслуживается
+            continue
+        try:
+            answer, found = await answer_question(question)
+        except Exception as e:
+            logger.warning('gap re-answer failed for %s: %s', qa_id, e)
+            continue
+        if not found:
+            continue  # знаний всё ещё нет — оставляем пробел открытым
+        new_qa = store.log_qa(chat_id, 0, question, answer, True)
+        buttons = [[Button.inline('👍', f'r:{new_qa}:1'.encode()),
+                    Button.inline('👎', f'r:{new_qa}:-1'.encode())]]
+        text = 'Появился ответ на вопрос выше:\n\n' + answer
+        try:
+            await client.send_message(chat_id, text[:4000], reply_to=msg_id,
+                                      buttons=buttons, link_preview=False)
+        except Exception:
+            # исходное сообщение могли удалить — отвечаем без реплая, с цитатой
+            text = f'По вопросу «{question[:200]}»:\n\n{answer}'
+            await client.send_message(chat_id, text[:4000],
+                                      buttons=buttons, link_preview=False)
+        store.mark_gap_closed(qa_id)
+        answered += 1
+    if answered:
+        store.add_event('gaps', f'Авто-ответы на закрытые пробелы: {answered}')
+    return answered
+
+
+async def post_gaps() -> None:
+    """Еженедельный пост «помогите сообществу» — топ вопросов без ответа.
+    Обсуждение подберёт ночной инжест, авто-ответ закроет петлю."""
+    rows = store.unposted_gaps(3)
+    if not rows:
+        return
+    lines = [f'{i}. {q}' for i, (_, q) in enumerate(rows, 1)]
+    text = ('Помогите сообществу! Я не смог ответить на эти вопросы:\n\n'
+            + '\n'.join(lines)
+            + '\n\nОбсудите в чате — ночью я прочитаю обсуждение и отвечу '
+              'авторам вопросов.')
+    await client.send_message(GAPS_CHAT_ID, text[:4000],
+                              reply_to=GAPS_TOPIC_ID or None)
+    store.mark_gaps_posted([gid for gid, _ in rows])
+    store.add_event('gaps', f'Опубликовано вопросов без ответа: {len(rows)}')
+
+
+def _seconds_to_next_hour() -> float:
+    now = datetime.now()
+    nxt = now.replace(minute=0, second=30, microsecond=0) + timedelta(hours=1)
+    return (nxt - now).total_seconds()
+
+
+async def gaps_loop() -> None:
+    """Тик раз в час; сделанность фиксируется в state — рестарты не дублируют."""
+    while True:
+        await asyncio.sleep(_seconds_to_next_hour())
+        if not client.is_connected():
+            continue
+        now = datetime.now()
+        today = now.strftime('%Y-%m-%d')
+        week = '{}-{}'.format(*now.isocalendar()[:2])
+        try:
+            if (now.hour == GAP_CHECK_HOUR
+                    and store.get_state('gaps_check_date') != today):
+                await auto_answer_gaps()
+                store.set_state('gaps_check_date', today)
+            if (GAPS_CHAT_ID and now.weekday() == GAPS_POST_WEEKDAY
+                    and now.hour == GAPS_POST_HOUR
+                    and store.get_state('gaps_post_week') != week):
+                await post_gaps()
+                store.set_state('gaps_post_week', week)
+        except Exception as e:
+            logger.warning('gaps loop failed: %s', e)
+
+
 @client.on(events.NewMessage)
 async def handler(event):
     if event.is_private:
@@ -369,7 +459,8 @@ async def run() -> None:
     initial_backoff = 300
     max_backoff = 1800
     backoff = initial_backoff
-    notifier_task = asyncio.create_task(notifier_loop())  # живёт поверх реконнектов
+    notifier_task = asyncio.create_task(notifier_loop())  # живут поверх реконнектов
+    gaps_task = asyncio.create_task(gaps_loop())
     while True:
         try:
             await client.start(bot_token=BOT_TOKEN)
