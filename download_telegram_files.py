@@ -34,19 +34,44 @@ KB_ADMIN_IDS = {int(x) for x in os.getenv('KB_ADMIN_IDS', '').split(',') if x.st
 _kb_event_store = None
 
 
+def _kb_store_lazy():
+    global _kb_event_store
+    if _kb_event_store is None:
+        from kb_store import open_store
+        _kb_event_store = open_store()
+    return _kb_event_store
+
+
 def _kb_event(kind: str, text: str, cost: float = 0.0) -> None:
     """Событие в очередь админ-уведомлений (kb-bot разошлёт в личку).
     Любая ошибка KB-подсистемы не должна ломать скачивание файлов."""
-    global _kb_event_store
     if not (KB_CHAT_IDS or KB_ADMIN_IDS):
         return
     try:
-        if _kb_event_store is None:
-            from kb_store import open_store
-            _kb_event_store = open_store()
-        _kb_event_store.add_event(kind, text, cost)
+        _kb_store_lazy().add_event(kind, text, cost)
     except Exception as e:
         logger.debug('kb event skipped: %s', e)
+
+
+def _kb_record_file(message, file_name: str) -> None:
+    """Каталог файлов: метаданные документа + разбор имени прошивки."""
+    if not (KB_CHAT_IDS or KB_ADMIN_IDS):
+        return
+    try:
+        from kb_firmware import record_file
+        record_file(_kb_store_lazy(), message, file_name)
+    except Exception as e:
+        logger.debug('kb file record skipped: %s', e)
+
+
+def _kb_set_file_md5(message, file_md5: str) -> None:
+    if not (KB_CHAT_IDS or KB_ADMIN_IDS):
+        return
+    try:
+        if message.document is not None:
+            _kb_store_lazy().set_file_md5(message.document.id, file_md5)
+    except Exception as e:
+        logger.debug('kb md5 update skipped: %s', e)
 
 if not CHAT_IDS:
     raise ValueError('CHAT_IDS must contain at least one chat id')
@@ -114,7 +139,8 @@ client = TelegramClient(
 
 @client.on(events.NewMessage)
 async def handler(event):
-    if event.chat_id not in CHAT_IDS:
+    in_download = event.chat_id in CHAT_IDS
+    if not (in_download or event.chat_id in KB_CHAT_IDS):
         return
 
     if not (event.message.media and hasattr(event.message.media, 'document')):
@@ -130,6 +156,13 @@ async def handler(event):
 
     file_name = os.path.basename(file_name)
     if not file_name or file_name in ('.', '..'):
+        return
+
+    # Каталог: метаданные ВСЕХ документов из наблюдаемых чатов (включая
+    # расширения, которые не скачиваем, — прошивки ищутся по /fw без файла)
+    _kb_record_file(event.message, file_name)
+
+    if not in_download:
         return
 
     if '.' not in file_name:
@@ -160,6 +193,7 @@ async def handler(event):
     file_md5 = calculate_md5(file_path)
     save_downloaded_file(file_name, file_md5)
     logger.info('Downloaded %s to %s', file_name, file_path)
+    _kb_set_file_md5(event.message, file_md5)
     size_mb = os.path.getsize(file_path) / 1e6
     _kb_event('download', f'Скачан {file_name} ({size_mb:.1f} МБ)')
 

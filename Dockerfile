@@ -10,7 +10,7 @@ WORKDIR /app
 COPY requirements.txt requirements.txt
 RUN pip install -r requirements.txt
 
-COPY download_telegram_files.py kb_store.py kb_ingest.py kb_pdf.py kb_backfill.py kb_bot.py kb_search.py ./
+COPY download_telegram_files.py kb_store.py kb_ingest.py kb_firmware.py kb_pdf.py kb_backfill.py kb_bot.py kb_search.py ./
 COPY bot.session bot.session
 
 CMD ["python", "download_telegram_files.py"]

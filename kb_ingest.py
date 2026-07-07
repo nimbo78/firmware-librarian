@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from telethon import errors
 from telethon.tl.functions.channels import GetForumTopicsRequest
 
+from kb_firmware import document_filename, record_file
 from kb_store import Chunk
 
 logger = logging.getLogger(__name__)
@@ -299,6 +300,16 @@ async def ingest_chat(tg_client, store, chat_id: int, min_id: int | None = None,
     async for msg in tg_client.iter_messages(chat_id, min_id=min_id, reverse=True):
         if msg.id > max_id:
             max_id = msg.id
+        # Каталог файлов: все документы чата попадают в files/firmware
+        if msg.document is not None:
+            fname = document_filename(msg)
+            if fname:
+                try:
+                    record_file(store, msg, fname,
+                                topic_names.get(message_topic_id(msg), ''))
+                except Exception as e:
+                    logger.warning('file record failed for %s/%s: %s',
+                                   chat_id, msg.id, e)
         text = (msg.raw_text or '').strip()
         extra, cost = await enrich_message(store, msg)
         if cost > 0:

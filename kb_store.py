@@ -106,6 +106,45 @@ class SqliteVecStore:
                     cost REAL NOT NULL DEFAULT 0,
                     notified INTEGER NOT NULL DEFAULT 0
                 )''')
+            # Каталог документов из чатов: ключ — telegram document id.
+            # md5 дозаписывается после физического скачивания качалкой.
+            self.db.execute('''
+                CREATE TABLE IF NOT EXISTS files(
+                    doc_id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    size INTEGER NOT NULL DEFAULT 0,
+                    md5 TEXT NOT NULL DEFAULT '',
+                    chat_id INTEGER NOT NULL DEFAULT 0,
+                    msg_id INTEGER NOT NULL DEFAULT 0,
+                    caption TEXT NOT NULL DEFAULT '',
+                    topic_name TEXT NOT NULL DEFAULT '',
+                    date TEXT NOT NULL DEFAULT ''
+                )''')
+            # Связка файл -> модель/версия (фаза A: только из имени файла)
+            self.db.execute('''
+                CREATE TABLE IF NOT EXISTS firmware(
+                    doc_id INTEGER NOT NULL,
+                    device_model TEXT NOT NULL,
+                    model_norm TEXT NOT NULL,
+                    version TEXT NOT NULL DEFAULT '',
+                    version_key TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT 'filename',
+                    confidence TEXT NOT NULL DEFAULT 'high',
+                    PRIMARY KEY (doc_id, device_model, version)
+                )''')
+            # Лог вопрос-ответ с оценками: 👎 -> событие админу,
+            # found=0 -> копилка вопросов без ответа (/gaps)
+            self.db.execute('''
+                CREATE TABLE IF NOT EXISTS qa_log(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                    chat_id INTEGER NOT NULL DEFAULT 0,
+                    user_id INTEGER NOT NULL DEFAULT 0,
+                    question TEXT NOT NULL,
+                    answer TEXT NOT NULL DEFAULT '',
+                    found INTEGER NOT NULL DEFAULT 1,
+                    rating INTEGER NOT NULL DEFAULT 0
+                )''')
 
     def upsert_chunks(self, chunks: list[Chunk]) -> None:
         with self.db:
@@ -234,6 +273,78 @@ class SqliteVecStore:
             'SELECT key, value FROM state WHERE key LIKE ? ORDER BY key',
             (prefix + '%',)).fetchall()
 
+    def upsert_file(self, doc_id: int, name: str, size: int, md5: str,
+                    chat_id: int, msg_id: int, caption: str,
+                    topic_name: str, date: str) -> None:
+        with self.db:
+            self.db.execute('''
+                INSERT INTO files(doc_id, name, size, md5, chat_id, msg_id,
+                                  caption, topic_name, date)
+                VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(doc_id) DO UPDATE SET
+                    md5 = CASE WHEN excluded.md5 != ''
+                               THEN excluded.md5 ELSE files.md5 END,
+                    caption = CASE WHEN excluded.caption != ''
+                                   THEN excluded.caption ELSE files.caption END,
+                    topic_name = CASE WHEN excluded.topic_name != ''
+                                      THEN excluded.topic_name ELSE files.topic_name END
+                ''', (doc_id, name, size, md5, chat_id, msg_id,
+                      caption, topic_name, date))
+
+    def set_file_md5(self, doc_id: int, md5: str) -> None:
+        with self.db:
+            self.db.execute('UPDATE files SET md5=? WHERE doc_id=?', (md5, doc_id))
+
+    def upsert_firmware(self, doc_id: int, device_model: str, version: str,
+                        version_key: str, source: str = 'filename',
+                        confidence: str = 'high') -> None:
+        model_norm = re.sub(r'[^A-Z0-9]', '', device_model.upper())
+        with self.db:
+            self.db.execute('''
+                INSERT INTO firmware(doc_id, device_model, model_norm,
+                                     version, version_key, source, confidence)
+                VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(doc_id, device_model, version) DO NOTHING
+                ''', (doc_id, device_model, model_norm, version, version_key,
+                      source, confidence))
+
+    def find_firmware(self, query: str, limit: int = 30) -> list[tuple]:
+        """Поиск по модели: '5735' матчит 'S5735-L'. Свежие версии первыми."""
+        norm = re.sub(r'[^A-Z0-9]', '', query.upper())
+        if not norm:
+            return []
+        return self.db.execute('''
+            SELECT fw.device_model, fw.version, f.name, f.chat_id, f.msg_id, f.date
+            FROM firmware fw JOIN files f ON f.doc_id = fw.doc_id
+            WHERE fw.model_norm LIKE ?
+            ORDER BY fw.device_model, fw.version_key DESC, f.date DESC
+            LIMIT ?''', (f'%{norm}%', limit)).fetchall()
+
+    def log_qa(self, chat_id: int, user_id: int, question: str,
+               answer: str, found: bool) -> int:
+        with self.db:
+            cur = self.db.execute(
+                'INSERT INTO qa_log(chat_id, user_id, question, answer, found) '
+                'VALUES(?,?,?,?,?)',
+                (chat_id, user_id, question[:500], answer[:1000],
+                 1 if found else 0))
+            return cur.lastrowid
+
+    def set_qa_rating(self, qa_id: int, rating: int) -> str | None:
+        """Ставит оценку, возвращает текст вопроса (для события админу)."""
+        with self.db:
+            self.db.execute('UPDATE qa_log SET rating=? WHERE id=?',
+                            (rating, qa_id))
+        row = self.db.execute(
+            'SELECT question FROM qa_log WHERE id=?', (qa_id,)).fetchone()
+        return row[0] if row else None
+
+    def gaps(self, limit: int = 15) -> list[tuple]:
+        """Вопросы без ответа или с минусом — карта дыр в базе знаний."""
+        return self.db.execute(
+            'SELECT ts, question FROM qa_log WHERE found=0 OR rating<0 '
+            'ORDER BY id DESC LIMIT ?', (limit,)).fetchall()
+
     def kb_stats(self) -> dict:
         """Сводка для /status. events_cost уже включает медиа-затраты
         инжест-прогонов (media_cost — деталь, не слагаемое)."""
@@ -246,10 +357,19 @@ class SqliteVecStore:
         downloads_24h = self.db.execute(
             "SELECT count(*) FROM events WHERE kind='download' "
             "AND ts >= datetime('now', 'localtime', '-1 day')").fetchone()[0]
+        files_total = self.db.execute('SELECT count(*) FROM files').fetchone()[0]
+        fw_models = self.db.execute(
+            'SELECT count(DISTINCT device_model) FROM firmware').fetchone()[0]
+        qa7 = self.db.execute(
+            "SELECT count(*), COALESCE(SUM(rating<0),0), COALESCE(SUM(found=0),0) "
+            "FROM qa_log WHERE ts >= datetime('now', 'localtime', '-7 day')"
+        ).fetchone()
         return {
             'chunks': self.count(), 'pdf_chunks': pdf_chunks,
             'media_items': media[0], 'media_cost': media[1],
             'events_cost': events_cost, 'downloads_24h': downloads_24h,
+            'files': files_total, 'fw_models': fw_models,
+            'qa_7d': qa7[0], 'qa_bad_7d': qa7[1], 'qa_nohit_7d': qa7[2],
         }
 
     def count(self) -> int:
@@ -322,9 +442,38 @@ def _selftest() -> None:
         assert len(rows) == 2
         store.mark_events_notified([rows[0][0]])
         assert len(store.unnotified_events()) == 1
+
+        # каталог файлов и прошивок
+        store.upsert_file(doc_id=111, name='MA5608T_V800R017C10SPC200.zip',
+                          size=100, md5='', chat_id=-1001234, msg_id=40,
+                          caption='старая', topic_name='Прошивки',
+                          date='2025-11-02')
+        store.upsert_file(doc_id=222, name='MA5608T_V800R018C10SPC500.zip',
+                          size=100, md5='', chat_id=-1001234, msg_id=50,
+                          caption='новая', topic_name='Прошивки',
+                          date='2026-03-12')
+        store.upsert_firmware(111, 'MA5608T', 'V800R017C10SPC200',
+                              '0800.0017.0010.0200')
+        store.upsert_firmware(222, 'MA5608T', 'V800R018C10SPC500',
+                              '0800.0018.0010.0500')
+        store.set_file_md5(222, 'a' * 32)
+        fw = store.find_firmware('5608')
+        assert len(fw) == 2 and fw[0][1] == 'V800R018C10SPC500', fw  # свежая первой
+        assert store.find_firmware('S9999') == []
+        store.upsert_firmware(222, 'MA5608T', 'V800R018C10SPC500', 'x')  # идемпотентно
+        assert len(store.find_firmware('5608')) == 2
+
+        # лог вопрос-ответ и оценки
+        qa_id = store.log_qa(-1001234, 777, 'как прошить ONT?', 'вот так', True)
+        assert store.set_qa_rating(qa_id, -1) == 'как прошить ONT?'
+        store.log_qa(-1001234, 778, 'про что-то неизвестное', '', False)
+        assert len(store.gaps()) == 2
+
         s = store.kb_stats()
         assert s['chunks'] == 3 and s['downloads_24h'] == 1
         assert abs(s['events_cost'] - 0.12) < 1e-9
+        assert s['files'] == 2 and s['fw_models'] == 1
+        assert s['qa_7d'] == 2 and s['qa_bad_7d'] == 1 and s['qa_nohit_7d'] == 1
 
         bak = os.path.join(tmp, 'kb.bak')
         store.backup(bak)

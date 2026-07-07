@@ -12,7 +12,7 @@ import os
 import re
 import time
 
-from telethon import TelegramClient, events
+from telethon import Button, TelegramClient, events
 
 from kb_ingest import embed_texts, openai_client
 from kb_store import open_store
@@ -36,6 +36,8 @@ ADMIN_HELP = (
     'Команды администратора:\n'
     '/status — база, стоимость, курсоры инжеста\n'
     '/events — последние 20 событий\n'
+    '/gaps — вопросы без ответа или с 👎\n'
+    '/fw <модель> — прошивки из каталога\n'
     '/notify on|off — уведомления о событиях в личку\n'
     'Любой другой текст в личке — вопрос к базе знаний.'
 )
@@ -78,12 +80,13 @@ def _extract_question(text: str) -> str | None:
     return None
 
 
-async def answer_question(question: str) -> str:
+async def answer_question(question: str) -> tuple[str, bool]:
+    """(текст ответа, нашлось ли что-то в базе) — found=False копится в /gaps."""
     oa = openai_client()
     qvec = (await embed_texts([question], client=oa))[0]
     hits = store.search(question, qvec, top_k=TOP_K)
     if not hits:
-        return 'В базе знаний пока ничего не нашлось по этому вопросу.'
+        return 'В базе знаний пока ничего не нашлось по этому вопросу.', False
     ctx_parts = []
     links = []
     for i, h in enumerate(hits, 1):
@@ -106,7 +109,59 @@ async def answer_question(question: str) -> str:
     answer = (resp.choices[0].message.content or '').strip()
     if links:
         answer += '\n\nИсточники:\n' + '\n'.join(links[:5])
-    return answer[:4000]  # лимит сообщения Telegram — 4096
+    return answer[:4000], True  # лимит сообщения Telegram — 4096
+
+
+async def _send_answer(event, question: str) -> None:
+    """Общий путь ответа (группа и личка): лог Q&A + кнопки оценки."""
+    logger.info('Question from %s in %s: %s',
+                event.sender_id, event.chat_id, question[:100])
+    try:
+        answer, found = await answer_question(question)
+    except Exception as e:
+        logger.warning('Answer failed: %s', e)
+        await event.reply('Не получилось получить ответ, попробуй позже.')
+        return
+    qa_id = store.log_qa(event.chat_id or 0, event.sender_id or 0,
+                         question, answer, found)
+    buttons = [[Button.inline('👍', f'r:{qa_id}:1'.encode()),
+                Button.inline('👎', f'r:{qa_id}:-1'.encode())]]
+    await event.reply(answer, link_preview=False, buttons=buttons)
+
+
+def _format_fw(rows: list, query: str) -> str:
+    if not rows:
+        return (f'Прошивок по запросу «{query}» в каталоге нет. '
+                f'Каталог наполняется из имён файлов в чатах.')
+    out = [f'Прошивки по запросу «{query}»:']
+    current_model = None
+    latest_marked = False
+    for model, version, name, chat_id, msg_id, date in rows:
+        if model != current_model:
+            out.append(f'\n{model}:')
+            current_model = model
+            latest_marked = False
+        mark = ''
+        if version and not latest_marked:
+            mark = ' — последняя'
+            latest_marked = True
+        ver = version or 'версия не распознана'
+        line = f'• {ver}{mark} · {date} · {name}'
+        link = _msg_link(chat_id, msg_id)
+        if link:
+            line += f'\n  {link}'
+        out.append(line)
+    return '\n'.join(out)[:4000]
+
+
+async def _handle_fw(event, text: str) -> None:
+    parts = text.split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ''
+    if not arg:
+        await event.reply('Укажи модель: /fw MA5608T (можно часть: /fw 5735)')
+        return
+    rows = store.find_firmware(arg)
+    await event.reply(_format_fw(rows, arg), link_preview=False)
 
 
 def _fmt_event(ts: str, kind: str, text: str, cost: float) -> str:
@@ -126,9 +181,12 @@ async def handle_admin(event) -> None:
         notify = 'вкл' if store.get_state('admin_notify', '1') == '1' else 'выкл'
         lines = [
             f'Чанков в базе: {s["chunks"]} (из них PDF: {s["pdf_chunks"]})',
+            f'Каталог: {s["files"]} файлов, {s["fw_models"]} моделей с прошивками',
             f'Медиа обработано: {s["media_items"]} (~${s["media_cost"]:.2f})',
             f'Потрачено суммарно: ~${s["events_cost"]:.2f}',
             f'Скачано файлов за 24 ч: {s["downloads_24h"]}',
+            f'Вопросов за 7 дней: {s["qa_7d"]} (👎 {s["qa_bad_7d"]}, '
+            f'без ответа {s["qa_nohit_7d"]})',
             f'Уведомления: {notify}',
         ]
         cursors = store.state_items('last_seen_id:')
@@ -154,6 +212,16 @@ async def handle_admin(event) -> None:
         else:
             cur = 'on' if store.get_state('admin_notify', '1') == '1' else 'off'
             await event.reply(f'Сейчас: {cur}. Используй /notify on или /notify off.')
+    elif low.startswith('/gaps'):
+        rows = store.gaps(15)
+        if not rows:
+            await event.reply('Вопросов без ответа нет — база справляется.')
+        else:
+            body = 'Вопросы без ответа или с 👎:\n' + '\n'.join(
+                f'• {ts[5:16]} {q}' for ts, q in rows)
+            await event.reply(body[:4000])
+    elif low.startswith('/fw'):
+        await _handle_fw(event, text)
     elif text.startswith('/') and not low.startswith('/ask'):
         await event.reply(ADMIN_HELP)
     else:
@@ -163,13 +231,7 @@ async def handle_admin(event) -> None:
         if not question:
             await event.reply(ADMIN_HELP)
             return
-        logger.info('Admin question from %s: %s', event.sender_id, question[:100])
-        try:
-            answer = await answer_question(question)
-        except Exception as e:
-            logger.warning('Answer failed: %s', e)
-            answer = 'Не получилось получить ответ, попробуй позже.'
-        await event.reply(answer, link_preview=False)
+        await _send_answer(event, question)
 
 
 async def notifier_loop() -> None:
@@ -213,7 +275,11 @@ async def handler(event):
         return  # личка не-админов игнорируется
     if event.chat_id not in ANSWER_CHAT_IDS:
         return
-    question = _extract_question(event.raw_text or '')
+    text = (event.raw_text or '').strip()
+    if text.lower().startswith('/fw'):
+        await _handle_fw(event, text)  # без кулдауна: дёшево, без LLM
+        return
+    question = _extract_question(text)
     if question is None:
         return
     if not question:
@@ -224,14 +290,25 @@ async def handler(event):
         await event.reply('Подожди немного перед следующим вопросом.')
         return
     _last_ask[event.sender_id] = now
-    logger.info('Question from %s in %s: %s',
-                event.sender_id, event.chat_id, question[:100])
+    await _send_answer(event, question)
+
+
+@client.on(events.CallbackQuery(pattern=rb'^r:'))
+async def on_rating(event):
+    """Кнопки 👍/👎 под ответами. 👎 уходит событием админу."""
     try:
-        answer = await answer_question(question)
+        _, qa_id_s, val_s = event.data.decode().split(':')
+        rating = 1 if int(val_s) > 0 else -1
+        question = store.set_qa_rating(int(qa_id_s), rating)
+        if rating < 0 and question:
+            store.add_event('feedback', f'👎 на ответ: {question}')
+        await event.answer('Учтено, спасибо!')
     except Exception as e:
-        logger.warning('Answer failed: %s', e)
-        answer = 'Не получилось получить ответ, попробуй позже.'
-    await event.reply(answer, link_preview=False)
+        logger.warning('rating callback failed: %s', e)
+        try:
+            await event.answer()
+        except Exception:
+            pass
 
 
 async def run() -> None:
