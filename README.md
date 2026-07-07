@@ -11,34 +11,31 @@
 
 ## Архитектура
 
-```
- Участники чатов                              Админ (whitelist)
-        │  файлы, /ask, @упоминания, /fw             │ /status /events /gaps
-        ▼                                            │ /fw /review /notify
-    Telegram ◀───────────────────────────────────────┘
-      ▲    ▲
-      │    └────────────────────────────────┐
-      │ MTProto (user-сессия)               │ MTProto (bot-токен)
-      ▼                                     ▼
-┌───────────────────────────┐      ┌─────────────────────────┐
-│ telegram-file-downloader  │      │         kb-bot          │
-│ · скачивание документов   │      │ · /ask, @mention — RAG  │
-│ · каталогизация файлов    │      │ · /fw — каталог прошивок│
-│ · ночной ingest (05:00):  │      │ · оценки 👍/👎, /review │
-│   чаты → PDF → экстракция │      │ · уведомления админам   │
-└────┬──────────────┬───────┘      │ · петля gaps (авто-ответ│
-     │              │              │   + недельный пост)     │
-     ▼              │              └───────┬───────────┬─────┘
- Том загрузок       │ пишет                │ читает    │
- файлы + журнал     ▼                      ▼           │
- дедупликации   kb.sqlite ─────────────────┘           │
-                · чанки + вектора (sqlite-vec + FTS5)  │
-                · каталог: files/firmware/devices      │
-                · события (админ-канал), qa-лог, state │
-                     ▲                                 │
-                     │ эмбеддинги, vision,             │ вопрос + контекст,
-                     │ whisper, экстракция             │ генерация ответа
-                     └────────── OpenAI API ◀──────────┘
+```mermaid
+flowchart TB
+    member["👥 Участники чатов"]
+    admin["🛠 Админ (whitelist)"]
+    tg["Telegram"]
+    oai["OpenAI API"]
+
+    member -->|"файлы · /ask · @упоминание · /fw · 👍/👎"| tg
+    admin -->|"/status · /events · /gaps · /review · /notify"| tg
+
+    subgraph nas["Synology DS720+ · Docker Compose"]
+        dl["telegram-file-downloader<br/>· скачивание документов<br/>· каталогизация файлов<br/>· ночной пайплайн 05:00:<br/>чаты → PDF → экстракция"]
+        bot["kb-bot<br/>· /ask, @mention — RAG<br/>· /fw — каталог прошивок<br/>· оценки 👍/👎, /review<br/>· уведомления админам<br/>· петля gaps"]
+        db[("kb.sqlite<br/>чанки + вектора: sqlite-vec + FTS5<br/>каталог files/firmware/devices<br/>события · qa-лог · state")]
+        vol[("Том загрузок<br/>файлы + журнал дедупликации")]
+    end
+
+    tg <-->|"MTProto · user-сессия"| dl
+    tg <-->|"MTProto · bot-токен"| bot
+
+    dl -->|"файлы + журнал"| vol
+    dl -->|"чанки · каталог · события"| db
+    bot -->|"поиск · qa-лог · подтверждения"| db
+    dl -->|"эмбеддинги · vision · whisper · экстракция"| oai
+    bot -->|"вопрос + контекст → ответ"| oai
 ```
 
 Диаграммы as-code — в [architecture.likec4](architecture.likec4)
