@@ -106,6 +106,15 @@ async def _backfill(client, chat_ids: list[int], download_folder: str,
         except BudgetExceeded as e:
             spent += e.cost
             stopped = True
+    if not stopped:
+        from kb_extract import run_extraction
+        fw_added, dev_added, cost = await run_extraction(store)
+        spent += cost
+        print(f'LLM-экстракция: {fw_added} связок прошивок, {dev_added} серий, '
+              f'~${cost:.2f}')
+        pending = store.pending_review_count()
+        if pending:
+            print(f'На подтверждение (/review в личке бота): {pending}')
     store.backup()
     print(f'\nЧанков в базе: {store.count()}. Потрачено в этом прогоне: ~${spent:.2f}')
     if stopped:

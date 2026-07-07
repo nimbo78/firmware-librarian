@@ -108,6 +108,7 @@ class SqliteVecStore:
                 )''')
             # Каталог документов из чатов: ключ — telegram document id.
             # md5 дозаписывается после физического скачивания качалкой.
+            # llm_done: подпись уже прогонялась через LLM-экстракцию (фаза B).
             self.db.execute('''
                 CREATE TABLE IF NOT EXISTS files(
                     doc_id INTEGER PRIMARY KEY,
@@ -118,7 +119,19 @@ class SqliteVecStore:
                     msg_id INTEGER NOT NULL DEFAULT 0,
                     caption TEXT NOT NULL DEFAULT '',
                     topic_name TEXT NOT NULL DEFAULT '',
-                    date TEXT NOT NULL DEFAULT ''
+                    date TEXT NOT NULL DEFAULT '',
+                    llm_done INTEGER NOT NULL DEFAULT 0
+                )''')
+            # Устройства и серии (фаза B): S5735-L (kind=model, parent=S5700),
+            # S5700 (kind=series). Низкоуверенные связки ждут /review.
+            self.db.execute('''
+                CREATE TABLE IF NOT EXISTS devices(
+                    model TEXT PRIMARY KEY,
+                    model_norm TEXT NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'model',
+                    parent TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT 'llm',
+                    confirmed INTEGER NOT NULL DEFAULT 0
                 )''')
             # Связка файл -> модель/версия (фаза A: только из имени файла)
             self.db.execute('''
@@ -145,6 +158,15 @@ class SqliteVecStore:
                     found INTEGER NOT NULL DEFAULT 1,
                     rating INTEGER NOT NULL DEFAULT 0
                 )''')
+        # Миграции баз, созданных до фазы B (ALTER падает, если колонка есть)
+        for stmt in (
+            "ALTER TABLE files ADD COLUMN llm_done INTEGER NOT NULL DEFAULT 0",
+        ):
+            try:
+                with self.db:
+                    self.db.execute(stmt)
+            except sqlite3.OperationalError:
+                pass
 
     def upsert_chunks(self, chunks: list[Chunk]) -> None:
         with self.db:
@@ -309,16 +331,103 @@ class SqliteVecStore:
                       source, confidence))
 
     def find_firmware(self, query: str, limit: int = 30) -> list[tuple]:
-        """Поиск по модели: '5735' матчит 'S5735-L'. Свежие версии первыми."""
+        """Поиск по модели: '5735' матчит 'S5735-L'. Свежие версии первыми.
+
+        Учитывает серии (devices): запрос-модель дополнительно возвращает
+        прошивки её серии (is_series=1 в выдаче), запрос-серия — прошивки
+        всех моделей серии.
+        """
         norm = re.sub(r'[^A-Z0-9]', '', query.upper())
         if not norm:
             return []
         return self.db.execute('''
-            SELECT fw.device_model, fw.version, f.name, f.chat_id, f.msg_id, f.date
-            FROM firmware fw JOIN files f ON f.doc_id = fw.doc_id
-            WHERE fw.model_norm LIKE ?
+            SELECT fw.device_model, fw.version, f.name, f.chat_id, f.msg_id,
+                   f.date, fw.confidence,
+                   CASE WHEN d.kind = 'series' THEN 1 ELSE 0 END AS is_series
+            FROM firmware fw
+            JOIN files f ON f.doc_id = fw.doc_id
+            LEFT JOIN devices d ON d.model = fw.device_model
+            WHERE fw.model_norm LIKE :like
+               OR fw.device_model IN (
+                    SELECT parent FROM devices
+                    WHERE model_norm LIKE :like AND parent != '')
+               OR fw.device_model IN (
+                    SELECT model FROM devices WHERE parent IN (
+                        SELECT model FROM devices
+                        WHERE kind = 'series' AND model_norm LIKE :like))
             ORDER BY fw.device_model, fw.version_key DESC, f.date DESC
-            LIMIT ?''', (f'%{norm}%', limit)).fetchall()
+            LIMIT :lim''', {'like': f'%{norm}%', 'lim': limit}).fetchall()
+
+    def upsert_device(self, model: str, kind: str = 'model', parent: str = '',
+                      source: str = 'llm', confirmed: int = 0) -> None:
+        """Первая запись побеждает: подтверждённые/отклонённые не перетираются."""
+        model_norm = re.sub(r'[^A-Z0-9]', '', model.upper())
+        with self.db:
+            self.db.execute('''
+                INSERT INTO devices(model, model_norm, kind, parent, source, confirmed)
+                VALUES(?,?,?,?,?,?)
+                ON CONFLICT(model) DO NOTHING''',
+                (model, model_norm, kind, parent, source, confirmed))
+
+    def files_for_extraction(self, limit: int = 200) -> list[tuple]:
+        """Файлы с подписью, у которых разбор имени не дал связок и LLM ещё
+        не запускался: кандидаты для kb_extract."""
+        return self.db.execute('''
+            SELECT doc_id, name, caption FROM files
+            WHERE llm_done = 0 AND caption != ''
+              AND doc_id NOT IN (SELECT doc_id FROM firmware)
+            ORDER BY doc_id LIMIT ?''', (limit,)).fetchall()
+
+    def mark_file_extracted(self, doc_id: int) -> None:
+        with self.db:
+            self.db.execute('UPDATE files SET llm_done=1 WHERE doc_id=?', (doc_id,))
+
+    def models_without_device(self, limit: int = 50) -> list[str]:
+        return [r[0] for r in self.db.execute('''
+            SELECT DISTINCT device_model FROM firmware
+            WHERE device_model NOT IN (SELECT model FROM devices)
+            ORDER BY device_model LIMIT ?''', (limit,))]
+
+    def review_items(self, limit: int = 5) -> tuple[list, list]:
+        """(прошивки confidence!=high, модели с неподтверждённой серией)."""
+        fw = self.db.execute('''
+            SELECT fw.rowid, fw.device_model, fw.version,
+                   (SELECT name FROM files WHERE doc_id = fw.doc_id), fw.source
+            FROM firmware fw WHERE fw.confidence != 'high'
+            ORDER BY fw.rowid LIMIT ?''', (limit,)).fetchall()
+        dev = self.db.execute('''
+            SELECT model, parent FROM devices
+            WHERE confirmed = 0 AND parent != ''
+            ORDER BY model LIMIT ?''', (limit,)).fetchall()
+        return fw, dev
+
+    def pending_review_count(self) -> int:
+        fw = self.db.execute(
+            "SELECT count(*) FROM firmware WHERE confidence != 'high'").fetchone()[0]
+        dev = self.db.execute(
+            "SELECT count(*) FROM devices WHERE confirmed = 0 AND parent != ''"
+        ).fetchone()[0]
+        return fw + dev
+
+    def confirm_firmware(self, rowid: int, ok: bool) -> None:
+        with self.db:
+            if ok:
+                self.db.execute(
+                    "UPDATE firmware SET confidence='high' WHERE rowid=?", (rowid,))
+            else:
+                self.db.execute('DELETE FROM firmware WHERE rowid=?', (rowid,))
+
+    def confirm_device(self, model: str, ok: bool) -> None:
+        """Отклонение не удаляет строку (иначе LLM переспросит завтра),
+        а фиксирует «серия неизвестна»."""
+        with self.db:
+            if ok:
+                self.db.execute(
+                    'UPDATE devices SET confirmed=1 WHERE model=?', (model,))
+            else:
+                self.db.execute(
+                    "UPDATE devices SET parent='', confirmed=1 WHERE model=?",
+                    (model,))
 
     def log_qa(self, chat_id: int, user_id: int, question: str,
                answer: str, found: bool) -> int:
@@ -370,6 +479,7 @@ class SqliteVecStore:
             'events_cost': events_cost, 'downloads_24h': downloads_24h,
             'files': files_total, 'fw_models': fw_models,
             'qa_7d': qa7[0], 'qa_bad_7d': qa7[1], 'qa_nohit_7d': qa7[2],
+            'pending_review': self.pending_review_count(),
         }
 
     def count(self) -> int:
@@ -463,6 +573,44 @@ def _selftest() -> None:
         store.upsert_firmware(222, 'MA5608T', 'V800R018C10SPC500', 'x')  # идемпотентно
         assert len(store.find_firmware('5608')) == 2
 
+        # серии: файл «для всей серии S5700» находится по запросу модели S5735-L
+        store.upsert_file(doc_id=333, name='S5700_bootrom_V200R010.zip',
+                          size=1, md5='', chat_id=-1001234, msg_id=60,
+                          caption='', topic_name='', date='2026-01-01')
+        store.upsert_firmware(333, 'S5700', 'V200R010', '0200.0010.0000.0000')
+        store.upsert_file(doc_id=444, name='S5735-L-V200R019C00SPC500.cc',
+                          size=1, md5='', chat_id=-1001234, msg_id=70,
+                          caption='', topic_name='', date='2026-02-01')
+        store.upsert_firmware(444, 'S5735-L', 'V200R019C00SPC500',
+                              '0200.0019.0000.0500')
+        store.upsert_device('S5735-L', kind='model', parent='S5700', confirmed=0)
+        store.upsert_device('S5700', kind='series', parent='', confirmed=1)
+        hits = store.find_firmware('5735')
+        models_found = {(h[0], h[7]) for h in hits}
+        assert ('S5735-L', 0) in models_found and ('S5700', 1) in models_found, hits
+        hits = store.find_firmware('S5700')  # запрос-серия видит модели серии
+        assert {h[0] for h in hits} == {'S5700', 'S5735-L'}, hits
+
+        # экстракция и подтверждения
+        store.upsert_file(doc_id=555, name='fw_new_final2.zip', size=1, md5='',
+                          chat_id=-1001234, msg_id=80,
+                          caption='прошивка для MA5608T', topic_name='',
+                          date='2026-03-01')
+        assert [r[0] for r in store.files_for_extraction()] == [555]
+        store.mark_file_extracted(555)
+        assert store.files_for_extraction() == []
+        assert store.models_without_device() == ['MA5608T']
+        store.upsert_firmware(555, 'MA5800', 'V100R022', '0100.0022.0000.0000',
+                              source='caption', confidence='medium')
+        fw_items, dev_items = store.review_items()
+        assert len(fw_items) == 1 and dev_items == [('S5735-L', 'S5700')]
+        assert store.pending_review_count() == 2
+        store.confirm_firmware(fw_items[0][0], ok=True)
+        store.confirm_device('S5735-L', ok=False)  # отклонение фиксируется
+        assert store.pending_review_count() == 0
+        # MA5800 добавилась подтверждённой связкой и тоже ждёт таксономию
+        assert store.models_without_device(limit=50) == ['MA5608T', 'MA5800']
+
         # лог вопрос-ответ и оценки
         qa_id = store.log_qa(-1001234, 777, 'как прошить ONT?', 'вот так', True)
         assert store.set_qa_rating(qa_id, -1) == 'как прошить ONT?'
@@ -472,7 +620,7 @@ def _selftest() -> None:
         s = store.kb_stats()
         assert s['chunks'] == 3 and s['downloads_24h'] == 1
         assert abs(s['events_cost'] - 0.12) < 1e-9
-        assert s['files'] == 2 and s['fw_models'] == 1
+        assert s['files'] == 5 and s['fw_models'] == 4, (s['files'], s['fw_models'])
         assert s['qa_7d'] == 2 and s['qa_bad_7d'] == 1 and s['qa_nohit_7d'] == 1
 
         bak = os.path.join(tmp, 'kb.bak')

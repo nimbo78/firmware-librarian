@@ -249,6 +249,21 @@ async def kb_ingest_loop() -> None:
                 logger.warning('KB PDF ingest failed: %s', e)
                 store.add_event('error', f'PDF-инжест упал: {e}')
         try:
+            from kb_extract import run_extraction
+            fw_added, dev_added, cost = await run_extraction(store)
+            if fw_added or dev_added:
+                logger.info('KB extract: %d firmware links, %d series, ~$%.2f',
+                            fw_added, dev_added, cost)
+                store.add_event('extract',
+                                f'LLM-экстракция: {fw_added} связок прошивок, '
+                                f'{dev_added} серий', cost)
+            pending = store.pending_review_count()
+            if pending:
+                store.add_event('review',
+                                f'{pending} записей каталога ждут подтверждения — /review')
+        except Exception as e:
+            logger.warning('KB extract failed: %s', e)
+        try:
             store.backup()
         except Exception as e:
             logger.warning('KB backup failed: %s', e)

@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 # tzdata: без него TZ не работает и INGEST_HOUR трактуется как UTC
 RUN apt-get update \
@@ -10,7 +10,7 @@ WORKDIR /app
 COPY requirements.txt requirements.txt
 RUN pip install -r requirements.txt
 
-COPY download_telegram_files.py kb_store.py kb_ingest.py kb_firmware.py kb_pdf.py kb_backfill.py kb_bot.py kb_search.py ./
+COPY download_telegram_files.py kb_store.py kb_ingest.py kb_firmware.py kb_extract.py kb_pdf.py kb_backfill.py kb_bot.py kb_search.py ./
 COPY bot.session bot.session
 
 CMD ["python", "download_telegram_files.py"]

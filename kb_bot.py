@@ -38,6 +38,7 @@ ADMIN_HELP = (
     '/events — последние 20 событий\n'
     '/gaps — вопросы без ответа или с 👎\n'
     '/fw <модель> — прошивки из каталога\n'
+    '/review — подтвердить связки каталога (LLM-экстракция)\n'
     '/notify on|off — уведомления о событиях в личку\n'
     'Любой другой текст в личке — вопрос к базе знаний.'
 )
@@ -136,15 +137,18 @@ def _format_fw(rows: list, query: str) -> str:
     out = [f'Прошивки по запросу «{query}»:']
     current_model = None
     latest_marked = False
-    for model, version, name, chat_id, msg_id, date in rows:
+    for model, version, name, chat_id, msg_id, date, confidence, is_series in rows:
         if model != current_model:
-            out.append(f'\n{model}:')
+            suffix = ' (вся серия — проверь совместимость!)' if is_series else ''
+            out.append(f'\n{model}{suffix}:')
             current_model = model
             latest_marked = False
         mark = ''
         if version and not latest_marked:
             mark = ' — последняя'
             latest_marked = True
+        if confidence != 'high':
+            mark += ' · не подтверждено'
         ver = version or 'версия не распознана'
         line = f'• {ver}{mark} · {date} · {name}'
         link = _msg_link(chat_id, msg_id)
@@ -187,6 +191,7 @@ async def handle_admin(event) -> None:
             f'Скачано файлов за 24 ч: {s["downloads_24h"]}',
             f'Вопросов за 7 дней: {s["qa_7d"]} (👎 {s["qa_bad_7d"]}, '
             f'без ответа {s["qa_nohit_7d"]})',
+            f'На подтверждение (/review): {s["pending_review"]}',
             f'Уведомления: {notify}',
         ]
         cursors = store.state_items('last_seen_id:')
@@ -222,6 +227,22 @@ async def handle_admin(event) -> None:
             await event.reply(body[:4000])
     elif low.startswith('/fw'):
         await _handle_fw(event, text)
+    elif low.startswith('/review'):
+        fw_items, dev_items = store.review_items(5)
+        if not fw_items and not dev_items:
+            await event.reply('Нечего подтверждать.')
+            return
+        for rowid, model, version, fname, source in fw_items:
+            btns = [[Button.inline('✅ верно', f'c:f:{rowid}:1'.encode()),
+                     Button.inline('❌ нет', f'c:f:{rowid}:0'.encode())]]
+            await event.reply(
+                f'{fname}\n→ {model} {version or "(без версии)"} '
+                f'· источник: {source}', buttons=btns)
+        for model, parent in dev_items:
+            btns = [[Button.inline('✅ верно', f'c:d:{model}:1'.encode()),
+                     Button.inline('❌ нет', f'c:d:{model}:0'.encode())]]
+            await event.reply(f'Серия: {model} принадлежит {parent}?',
+                              buttons=btns)
     elif text.startswith('/') and not low.startswith('/ask'):
         await event.reply(ADMIN_HELP)
     else:
@@ -291,6 +312,30 @@ async def handler(event):
         return
     _last_ask[event.sender_id] = now
     await _send_answer(event, question)
+
+
+@client.on(events.CallbackQuery(pattern=rb'^c:'))
+async def on_confirm(event):
+    """Кнопки /review: подтверждение связок каталога. Только админы."""
+    if event.sender_id not in ADMIN_IDS:
+        await event.answer()
+        return
+    try:
+        parts = event.data.decode().split(':')
+        kind, key, ok = parts[1], parts[2], parts[3] == '1'
+        if kind == 'f':
+            store.confirm_firmware(int(key), ok)
+        elif kind == 'd':
+            store.confirm_device(key, ok)
+        msg = await event.get_message()
+        verdict = '✅ принято' if ok else '❌ отклонено'
+        await event.edit(f'{msg.raw_text}\n{verdict}', buttons=None)
+    except Exception as e:
+        logger.warning('confirm callback failed: %s', e)
+        try:
+            await event.answer()
+        except Exception:
+            pass
 
 
 @client.on(events.CallbackQuery(pattern=rb'^r:'))
