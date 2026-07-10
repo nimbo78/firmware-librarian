@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 
 from telethon import TelegramClient
@@ -50,7 +51,10 @@ def _progress(stage: str, done: int, total: int, cost: float) -> None:
 async def _dry_run(client, chat_ids: list[int], download_folder: str) -> None:
     total = 0.0
     for chat_id in chat_ids:
-        st = await scan_chat(client, chat_id)
+        print(f'Сканирую {chat_id} — вся история, на большом чате это '
+              f'минуты/десятки минут...', flush=True)
+        st = await scan_chat(client, chat_id, progress=lambda n: print(
+            f'  просмотрено сообщений: {n}', flush=True))
         embed = st.chars / 3 / 1e6 * EMBED_PRICE_PER_MTOK
         vision = st.images * VISION_COST_PER_IMAGE if vision_enabled() else 0.0
         voice = (st.voice_seconds / 60 * WHISPER_PRICE_PER_MIN
@@ -153,7 +157,12 @@ async def main() -> None:
         # полный прогон истории: длинные FloodWait пересыпаем, а не падаем
         flood_sleep_threshold=86400,
     )
+    # телеграмные предупреждения (FloodWait, обрывы) — в stderr, а не в тишину
+    logging.basicConfig(level=logging.WARNING,
+                        format='%(asctime)s - %(levelname)s - %(message)s')
+    print('Подключаюсь к Telegram...', flush=True)
     await client.start(phone=lambda: input('Enter your phone: '))
+    print('Подключился.', flush=True)
     try:
         if args.dry_run:
             await _dry_run(client, chat_ids, download_folder)

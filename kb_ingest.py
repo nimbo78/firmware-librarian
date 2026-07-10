@@ -356,8 +356,10 @@ class ScanStats:
     voice_seconds: int = 0
 
 
-async def scan_chat(tg_client, chat_id: int) -> ScanStats:
-    """Для dry-run бэкфилла: объёмы по категориям без API-вызовов."""
+async def scan_chat(tg_client, chat_id: int, progress=None) -> ScanStats:
+    """Для dry-run бэкфилла: объёмы по категориям без API-вызовов.
+    progress(n) вызывается каждые 5000 сообщений — полная история большого
+    чата листается минуты, без прогресса это выглядит как зависание."""
     st = ScanStats()
     async for msg in tg_client.iter_messages(chat_id, reverse=True):
         st.messages += 1
@@ -365,4 +367,6 @@ async def scan_chat(tg_client, chat_id: int) -> ScanStats:
         if _is_image(msg):
             st.images += 1
         st.voice_seconds += _voice_duration(msg)
+        if progress and st.messages % 5000 == 0:
+            progress(st.messages)
     return st
