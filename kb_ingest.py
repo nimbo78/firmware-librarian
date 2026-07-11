@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import logging
 import os
@@ -76,6 +77,7 @@ class IngestStats:
     new_chunks: int = 0
     media_items: int = 0   # обработано медиа в этом прогоне (кэш не считается)
     cost: float = 0.0      # оценка потраченного, $
+    pruned: int = 0        # удалено чанков с устаревшими границами (полный прогон)
 
 
 class BudgetExceeded(Exception):
@@ -163,75 +165,98 @@ def _voice_duration(msg) -> int:
     return int(getattr(msg.file, 'duration', 0) or 0)
 
 
-async def enrich_message(store, msg) -> tuple[str, float]:
-    """Vision/Whisper-обогащение одного сообщения. Возвращает (текст, стоимость).
+async def enrich_message(store, msg, enrich_media: bool = True) -> tuple[str, float]:
+    """Текст-довесок для медиа-сообщения и стоимость обработки.
 
-    Успешные результаты кэшируются; ошибки НЕ кэшируются, чтобы следующий
-    прогон повторил попытку.
+    Медиа ВСЕГДА даёт плейсхолдер ([изображение] / [голосовое]), даже при
+    выключенных флагах: сообщение попадает в чанк, и границы чанков не зависят
+    от того, включено ли обогащение (иначе включение флага потом сдвинуло бы
+    границы и наплодило дубликатов). Если обогащение включено и vision/whisper
+    дали текст — плейсхолдер расширяется описанием: id чанка тот же, чанк
+    обновляется по хэшу текста. Успех кэшируется, ошибки — нет (ретрай).
     """
     parts: list[str] = []
     cost = 0.0
 
-    if vision_enabled() and _is_image(msg):
-        key = f'img:{msg.chat_id}:{msg.id}'
-        text = store.get_media_text(key)
-        if text is None:
-            try:
-                data = await msg.download_media(file=bytes)
-                if data and len(data) <= MAX_IMAGE_BYTES:
-                    mime = (getattr(msg.file, 'mime_type', None) or 'image/jpeg'
-                            if msg.file else 'image/jpeg')
-                    if mime not in SUPPORTED_IMAGE_MIME:
-                        converted = _to_jpeg(data)
-                        if converted is None:
-                            # формат не осилили — пропуск навсегда, не ретраим
-                            store.put_media_text(key, '', 0.0)
-                            logger.info('vision skip (unsupported format %s) '
-                                        'for %s/%s', mime, msg.chat_id, msg.id)
-                            data = None
-                        else:
-                            data, mime = converted, 'image/jpeg'
-                    if data:
-                        text = await describe_image(data, mime)
-                        cost += VISION_COST_PER_IMAGE
-                        store.put_media_text(key, text, VISION_COST_PER_IMAGE)
-                    else:
-                        text = ''
-                else:
-                    text = ''  # слишком большое — фиксируем пропуск в кэше
-                    store.put_media_text(key, text, 0.0)
-            except Exception as e:
-                logger.warning('vision failed for %s/%s: %s', msg.chat_id, msg.id, e)
-                text = ''
-        if text:
-            parts.append(f'[изображение: {text}]')
-
-    duration = _voice_duration(msg) if voice_enabled() else 0
-    if duration > 0:
-        key = f'voice:{msg.chat_id}:{msg.id}'
-        text = store.get_media_text(key)
-        if text is None:
-            if duration > MAX_VOICE_SECONDS:
-                text = ''
-                store.put_media_text(key, text, 0.0)
-            else:
+    if _is_image(msg):
+        text = ''
+        if enrich_media and vision_enabled():
+            key = f'img:{msg.chat_id}:{msg.id}'
+            cached = store.get_media_text(key)
+            if cached is None:
                 try:
                     data = await msg.download_media(file=bytes)
-                    if data:
-                        text = await transcribe_voice(data)
-                        c = duration / 60.0 * WHISPER_PRICE_PER_MIN
-                        cost += c
-                        store.put_media_text(key, text, c)
+                    if data and len(data) <= MAX_IMAGE_BYTES:
+                        mime = (getattr(msg.file, 'mime_type', None) or 'image/jpeg'
+                                if msg.file else 'image/jpeg')
+                        if mime not in SUPPORTED_IMAGE_MIME:
+                            converted = _to_jpeg(data)
+                            if converted is None:
+                                # формат не осилили — пропуск навсегда, не ретраим
+                                store.put_media_text(key, '', 0.0)
+                                logger.info('vision skip (unsupported format %s) '
+                                            'for %s/%s', mime, msg.chat_id, msg.id)
+                                data = None
+                            else:
+                                data, mime = converted, 'image/jpeg'
+                        if data:
+                            cached = await describe_image(data, mime)
+                            cost += VISION_COST_PER_IMAGE
+                            store.put_media_text(key, cached, VISION_COST_PER_IMAGE)
                     else:
-                        text = ''
+                        store.put_media_text(key, '', 0.0)  # слишком большое
                 except Exception as e:
-                    logger.warning('whisper failed for %s/%s: %s',
+                    logger.warning('vision failed for %s/%s: %s',
                                    msg.chat_id, msg.id, e)
-                    text = ''
-        if text:
-            parts.append(f'[голосовое: {text}]')
+            text = cached or ''
+        parts.append(f'[изображение: {text}]' if text else '[изображение]')
+
+    duration = _voice_duration(msg)
+    if duration > 0:
+        text = ''
+        if enrich_media and voice_enabled():
+            key = f'voice:{msg.chat_id}:{msg.id}'
+            cached = store.get_media_text(key)
+            if cached is None:
+                if duration > MAX_VOICE_SECONDS:
+                    store.put_media_text(key, '', 0.0)
+                else:
+                    try:
+                        data = await msg.download_media(file=bytes)
+                        if data:
+                            cached = await transcribe_voice(data)
+                            c = duration / 60.0 * WHISPER_PRICE_PER_MIN
+                            cost += c
+                            store.put_media_text(key, cached, c)
+                    except Exception as e:
+                        logger.warning('whisper failed for %s/%s: %s',
+                                       msg.chat_id, msg.id, e)
+            text = cached or ''
+        parts.append(f'[голосовое: {text}]' if text else '[голосовое]')
 
     return ' '.join(parts), cost
+
+
+async def enrich_chat_media(tg_client, store, chat_id: int, progress=None,
+                            max_cost: float | None = None) -> tuple[int, float]:
+    """Этап 2 бэкфилла: только наполняет media_cache (vision/whisper), чанки
+    не трогает. Возвращает (обработано в этом прогоне, стоимость $)."""
+    if not (vision_enabled() or voice_enabled()):
+        return 0, 0.0
+    done = 0
+    cost = 0.0
+    async for msg in tg_client.iter_messages(chat_id, reverse=True):
+        if not (_is_image(msg) or _voice_duration(msg) > 0):
+            continue
+        _, c = await enrich_message(store, msg)
+        if c > 0:
+            done += 1
+            cost += c
+            if progress and done % 20 == 0:
+                progress('media', done, 0, cost)
+            if max_cost is not None and cost >= max_cost:
+                raise BudgetExceeded(cost)
+    return done, cost
 
 
 async def fetch_topic_names(tg_client, chat_id: int) -> dict[int, str]:
@@ -311,18 +336,24 @@ def build_chunks(chat_id: int, records: list, topic_names: dict[int, str]) -> li
 
 
 async def ingest_chat(tg_client, store, chat_id: int, min_id: int | None = None,
-                      progress=None, max_cost: float | None = None) -> IngestStats:
+                      progress=None, max_cost: float | None = None,
+                      enrich_media: bool = True) -> IngestStats:
     """Инжест сообщений chat_id от last_seen_id (или явного min_id) до конца.
 
     progress(stage, done, total, cost) — колбэк прогресса ('media' | 'embed').
     max_cost — потолок бюджета в $, при достижении кидает BudgetExceeded;
     state при этом не двигается, а кэш медиа и записанные чанки сохраняются,
     так что повторный запуск продолжает, не тратя деньги повторно.
+    enrich_media=False — этап «сначала текст» бэкфилла: медиа идёт
+    плейсхолдерами, vision/whisper не вызываются.
+    Полный прогон (min_id=0) дополнительно удаляет чанки чата с устаревшими
+    границами (prune) — история полностью пересобрана, они больше не валидны.
     """
     stats = IngestStats()
     state_key = f'last_seen_id:{chat_id}'
     if min_id is None:
         min_id = int(store.get_state(state_key, '0'))
+    full_run = (min_id == 0)
     topic_names = await fetch_topic_names(tg_client, chat_id)
     records = []
     max_id = min_id
@@ -340,7 +371,7 @@ async def ingest_chat(tg_client, store, chat_id: int, min_id: int | None = None,
                     logger.warning('file record failed for %s/%s: %s',
                                    chat_id, msg.id, e)
         text = (msg.raw_text or '').strip()
-        extra, cost = await enrich_message(store, msg)
+        extra, cost = await enrich_message(store, msg, enrich_media)
         if cost > 0:
             stats.media_items += 1
             stats.cost += cost
@@ -356,8 +387,13 @@ async def ingest_chat(tg_client, store, chat_id: int, min_id: int | None = None,
                         _sender_name(msg), line))
     stats.messages = len(records)
     chunks = build_chunks(chat_id, records, topic_names)
-    known = store.existing_ids([c.id for c in chunks])
-    new_chunks = [c for c in chunks if c.id not in known]
+    # Переэмбеддим новое И изменившееся (обогащение медиа меняет текст
+    # чанка при том же id) — сравнение по хэшу текста
+    known_hashes = store.chunk_hashes([c.id for c in chunks])
+    new_chunks = [
+        c for c in chunks
+        if known_hashes.get(c.id) != hashlib.sha1(c.text.encode('utf-8')).hexdigest()
+    ]
     # Порциями: не держим все вектора бэкфилла в памяти разом
     for i in range(0, len(new_chunks), EMBED_BATCH):
         part = new_chunks[i:i + EMBED_BATCH]
@@ -372,6 +408,8 @@ async def ingest_chat(tg_client, store, chat_id: int, min_id: int | None = None,
                      len(new_chunks), stats.cost)
         if max_cost is not None and stats.cost >= max_cost:
             raise BudgetExceeded(stats.cost)
+    if full_run:
+        stats.pruned = store.prune_chunks(chat_id, [c.id for c in chunks])
     if max_id > min_id:
         store.set_state(state_key, str(max_id))
     return stats

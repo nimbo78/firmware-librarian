@@ -216,6 +216,33 @@ class SqliteVecStore:
             out.update(r[0] for r in rows)
         return out
 
+    def chunk_hashes(self, ids: list[str]) -> dict:
+        """id -> sha1(text) для существующих чанков: инжест переэмбеддит
+        только новое и изменившееся (обогащение медиа меняет текст при том же id)."""
+        out: dict = {}
+        for i in range(0, len(ids), 500):
+            part = ids[i:i + 500]
+            marks = ','.join('?' * len(part))
+            for cid, text in self.db.execute(
+                    f'SELECT id, text FROM chunks WHERE id IN ({marks})', part):
+                out[cid] = hashlib.sha1(text.encode('utf-8')).hexdigest()
+        return out
+
+    def prune_chunks(self, chat_id: int, keep_ids: list[str]) -> int:
+        """Удаляет чанки чата, чьих id нет в актуальном наборе (границы
+        сдвинулись). Только для полного прогона бэкфилла — история пересобрана
+        целиком, и всё вне keep_ids заведомо устарело."""
+        keep = set(keep_ids)
+        rows = self.db.execute(
+            'SELECT id, rowid FROM chunks WHERE chat_id=?', (chat_id,)).fetchall()
+        stale = [rowid for cid, rowid in rows if cid not in keep]
+        with self.db:
+            for rowid in stale:
+                self.db.execute('DELETE FROM chunks WHERE rowid=?', (rowid,))
+                self.db.execute('DELETE FROM chunks_vec WHERE rowid=?', (rowid,))
+                self.db.execute('DELETE FROM chunks_fts WHERE rowid=?', (rowid,))
+        return len(stale)
+
     def search(self, query_text: str, query_vector: list, top_k: int = 8,
                candidates: int = 24) -> list[ScoredChunk]:
         vec_ids = [r[0] for r in self.db.execute(
@@ -583,6 +610,14 @@ def _selftest() -> None:
         assert store.get_media_text('img:-1001234:10') == 'скриншот display board 0'
         assert abs(store.media_cost_total() - 0.004) < 1e-9
 
+        # пересборка: хэши текста и prune устаревших границ
+        h = store.chunk_hashes([chunks[0].id, 'нет-такого'])
+        assert chunks[0].id in h and 'нет-такого' not in h
+        assert store.prune_chunks(-1001234, [c.id for c in chunks]) == 0
+        assert store.prune_chunks(-1001234, [chunks[0].id, chunks[1].id]) == 1
+        assert store.count() == 2
+        assert store.prune_chunks(-999, ['x']) == 0  # чужой чат не трогается
+
         store.add_event('download', 'Скачан test.pdf (1.0 МБ)')
         store.add_event('ingest', 'Ночной инжест -1001234', 0.12)
         rows = store.unnotified_events()
@@ -668,7 +703,7 @@ def _selftest() -> None:
         assert len(store.gaps()) == 1  # закрытый пробел ушёл из /gaps
 
         s = store.kb_stats()
-        assert s['chunks'] == 3 and s['downloads_24h'] == 1
+        assert s['chunks'] == 2 and s['downloads_24h'] == 1  # 2: один чанк убрал prune
         assert abs(s['events_cost'] - 0.12) < 1e-9
         assert s['files'] == 5 and s['fw_models'] == 4, (s['files'], s['fw_models'])
         assert s['qa_7d'] == 2 and s['qa_bad_7d'] == 1 and s['qa_nohit_7d'] == 1

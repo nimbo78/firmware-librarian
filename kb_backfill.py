@@ -12,6 +12,11 @@
 Порядок ввода в строй: сначала полный бэкфилл, потом включать ночной ingest —
 иначе границы суточных чанков не совпадут с полными и появятся почти-дубли.
 
+Боевой прогон идёт тремя этапами: [1/3] текст (быстро и дёшево — база отвечает
+уже после него; медиа в чанках плейсхолдерами), [2/3] vision/whisper в кэш,
+[3/3] пересборка чанков с описаниями медиа (переэмбеддятся только изменённые).
+Полный прогон также удаляет чанки с устаревшими границами (prune).
+
 Бюджет: --dry-run печатает разбивку стоимости по категориям (текст, картинки,
 голосовые, PDF) с учётом включённых флагов KB_VISION/KB_VOICE/KB_PDF.
 --max-cost N останавливает боевой прогон при достижении N$; всё обработанное
@@ -27,8 +32,8 @@ import os
 from telethon import TelegramClient
 
 from kb_ingest import (BudgetExceeded, EMBED_PRICE_PER_MTOK, VISION_COST_PER_IMAGE,
-                       WHISPER_PRICE_PER_MIN, ingest_chat, pdf_enabled, scan_chat,
-                       vision_enabled, voice_enabled)
+                       WHISPER_PRICE_PER_MIN, enrich_chat_media, ingest_chat,
+                       pdf_enabled, scan_chat, vision_enabled, voice_enabled)
 from kb_store import open_store
 
 
@@ -86,25 +91,63 @@ async def _backfill(client, chat_ids: list[int], download_folder: str,
     store = open_store()
     spent = 0.0
     stopped = False
+    media_wanted = vision_enabled() or voice_enabled()
+
+    def remaining() -> float | None:
+        return None if max_cost is None else max(max_cost - spent, 0.0)
+
+    # Этап 1: только текст (быстро и дёшево) — база отвечает уже после него.
+    # Медиа входит в чанки плейсхолдерами, поэтому границы окончательные.
     for chat_id in chat_ids:
-        remaining = None if max_cost is None else max(max_cost - spent, 0.0)
-        print(f'Бэкфилл {chat_id}...', flush=True)
+        print(f'[1/3] Текст: {chat_id}...', flush=True)
         try:
             stats = await ingest_chat(client, store, chat_id, min_id=0,
-                                      progress=_progress, max_cost=remaining)
+                                      progress=_progress, max_cost=remaining(),
+                                      enrich_media=False)
         except BudgetExceeded as e:
             spent += e.cost
             stopped = True
             break
         spent += stats.cost
-        print(f'{chat_id}: {stats.messages} сообщений -> {stats.new_chunks} '
-              f'новых чанков, медиа {stats.media_items}, ~${stats.cost:.2f}')
+        extra = f', удалено устаревших чанков: {stats.pruned}' if stats.pruned else ''
+        print(f'  {stats.messages} сообщений -> {stats.new_chunks} чанков'
+              f'{extra}, ~${stats.cost:.2f}')
+
+    # Этап 2: vision/whisper — только наполнение кэша, чанки не трогаем
+    if media_wanted and not stopped:
+        for chat_id in chat_ids:
+            print(f'[2/3] Медиа: {chat_id}...', flush=True)
+            try:
+                n, cost = await enrich_chat_media(client, store, chat_id,
+                                                  progress=_progress,
+                                                  max_cost=remaining())
+            except BudgetExceeded as e:
+                spent += e.cost
+                stopped = True
+                break
+            spent += cost
+            print(f'  обработано медиа: {n}, ~${cost:.2f}')
+
+    # Этап 3: пересборка чанков с описаниями из кэша; переэмбеддятся
+    # только изменившиеся (id те же — сравнение по хэшу текста)
+    if media_wanted and not stopped:
+        for chat_id in chat_ids:
+            print(f'[3/3] Чанки с медиа: {chat_id}...', flush=True)
+            try:
+                stats = await ingest_chat(client, store, chat_id, min_id=0,
+                                          progress=_progress,
+                                          max_cost=remaining())
+            except BudgetExceeded as e:
+                spent += e.cost
+                stopped = True
+                break
+            spent += stats.cost
+            print(f'  обновлено чанков: {stats.new_chunks}, ~${stats.cost:.2f}')
     if pdf_enabled() and not stopped:
         from kb_pdf import ingest_pdfs
-        remaining = None if max_cost is None else max(max_cost - spent, 0.0)
         try:
             files, chunks, cost = await ingest_pdfs(
-                store, download_folder, progress=_progress, max_cost=remaining)
+                store, download_folder, progress=_progress, max_cost=remaining())
             spent += cost
             print(f'PDF: {files} файлов -> {chunks} чанков, ~${cost:.2f}')
         except BudgetExceeded as e:
