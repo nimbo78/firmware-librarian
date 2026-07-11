@@ -63,12 +63,12 @@ model {
   admin -> telegram 'команды в личке бота, подтверждения /review'
   admin -> nas './redeploy.sh, kb_backfill.py (--dry-run, --max-cost)'
 
-  downloader -> telegram 'MTProto: слушает чаты, качает документы, читает историю и топики'
+  downloader -> telegram 'MTProto (опц. через MTProxy): слушает чаты, качает документы, читает историю и топики'
   downloader -> downloads 'сохраняет файлы, ведёт журнал дедупликации'
   downloader -> openai 'ночью: эмбеддинги, vision/whisper (по флагам), LLM-экстракция каталога'
   downloader -> kbdb 'чанки+вектора, каталог, события, state, backup (VACUUM INTO)'
 
-  kbbot -> telegram 'ответы в топики, уведомления админам, недельный пост gaps'
+  kbbot -> telegram 'MTProto (опц. через MTProxy): ответы в топики, уведомления админам, пост gaps'
   kbbot -> openai 'эмбеддинг вопроса, генерация ответа'
   kbbot -> kbdb 'гибридный поиск (KNN+FTS5, RRF), каталог /fw, события, qa-лог, подтверждения'
 }
