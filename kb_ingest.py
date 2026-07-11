@@ -37,6 +37,8 @@ WHISPER_PRICE_PER_MIN = 0.006   # $ / минута, whisper-1
 
 MAX_IMAGE_BYTES = 6 * 1024 * 1024
 MAX_VOICE_SECONDS = 15 * 60
+# Vision API принимает только эти форматы; остальное конвертируем через Pillow
+SUPPORTED_IMAGE_MIME = {'image/png', 'image/jpeg', 'image/gif', 'image/webp'}
 
 VISION_PROMPT = (
     'Изображение из технического чата про сетевое оборудование Huawei. '
@@ -128,6 +130,22 @@ async def transcribe_voice(data: bytes) -> str:
     return (resp.text or '').strip()[:3000]
 
 
+def _to_jpeg(data: bytes) -> bytes | None:
+    """BMP/TIFF и прочая экзотика -> JPEG. None, если Pillow формат не осилил
+    (например, HEIC без pillow-heif) — такие кэшируются как пропуск."""
+    try:
+        from PIL import Image, ImageFile
+        ImageFile.LOAD_TRUNCATED_IMAGES = True  # битые хвосты — не повод падать
+        img = Image.open(io.BytesIO(data))
+        if img.mode not in ('RGB', 'L'):
+            img = img.convert('RGB')
+        out = io.BytesIO()
+        img.save(out, format='JPEG', quality=85)
+        return out.getvalue()
+    except Exception:
+        return None
+
+
 def _is_image(msg) -> bool:
     if getattr(msg, 'sticker', None) is not None:
         return False
@@ -163,11 +181,22 @@ async def enrich_message(store, msg) -> tuple[str, float]:
                 if data and len(data) <= MAX_IMAGE_BYTES:
                     mime = (getattr(msg.file, 'mime_type', None) or 'image/jpeg'
                             if msg.file else 'image/jpeg')
-                    if not mime.startswith('image/'):
-                        mime = 'image/jpeg'
-                    text = await describe_image(data, mime)
-                    cost += VISION_COST_PER_IMAGE
-                    store.put_media_text(key, text, VISION_COST_PER_IMAGE)
+                    if mime not in SUPPORTED_IMAGE_MIME:
+                        converted = _to_jpeg(data)
+                        if converted is None:
+                            # формат не осилили — пропуск навсегда, не ретраим
+                            store.put_media_text(key, '', 0.0)
+                            logger.info('vision skip (unsupported format %s) '
+                                        'for %s/%s', mime, msg.chat_id, msg.id)
+                            data = None
+                        else:
+                            data, mime = converted, 'image/jpeg'
+                    if data:
+                        text = await describe_image(data, mime)
+                        cost += VISION_COST_PER_IMAGE
+                        store.put_media_text(key, text, VISION_COST_PER_IMAGE)
+                    else:
+                        text = ''
                 else:
                     text = ''  # слишком большое — фиксируем пропуск в кэше
                     store.put_media_text(key, text, 0.0)
