@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -51,6 +52,7 @@ ADMIN_HELP = (
     '/gaps — вопросы без ответа или с 👎\n'
     '/fw <модель> — прошивки из каталога\n'
     '/review — подтвердить связки каталога (LLM-экстракция)\n'
+    '/ingest — внеплановый инжест сейчас (не ждать ночи)\n'
     '/notify on|off — уведомления о событиях в личку\n'
     'Любой другой текст в личке — вопрос к базе знаний.'
 )
@@ -179,6 +181,48 @@ def _format_fw(rows: list, query: str) -> str:
     return '\n'.join(out)[:4000]
 
 
+async def _fw_llm_match(query: str) -> tuple[list[str], list[int]]:
+    """Fallback для /fw: подстрочный поиск промахнулся — просим лёгкую модель
+    сматчить запрос к известным моделям И к именам файлов каталога напрямую.
+    Ловит новые схемы имён, серии и вольные формулировки без правки регулярок
+    (качество матчинга важнее стоимости вызова — решение владельца).
+    Возвращает (модели, doc_id подходящих файлов)."""
+    if not os.getenv('OPENAI_API_KEY'):
+        return [], []
+    known = store.all_models()
+    files = store.all_files()
+    if not known and not files:
+        return [], []
+    file_list = '\n'.join(f'{i}: {name}' for i, (_, name) in enumerate(files))
+    oa = openai_client()
+    resp = await oa.chat.completions.create(
+        model=ANSWER_MODEL,
+        response_format={'type': 'json_object'},
+        messages=[{'role': 'user', 'content':
+            'Запрос пользователя (софт/прошивка для оборудования Huawei): '
+            + query[:200] + '\n\n'
+            'Известные модели/серии: ' + (', '.join(known) or 'нет') + '\n\n'
+            'Файлы каталога (номер: имя):\n' + (file_list or 'нет') + '\n\n'
+            'Верни JSON {"models": [...], "file_numbers": [...]} — какие '
+            'модели и какие файлы соответствуют запросу (учитывай серии, '
+            'подсемейства, сокращения, опечатки). models — только значения '
+            'из списка, максимум 5; file_numbers — номера из списка файлов, '
+            'максимум 10. Ничего не подходит — пустые списки.'}])
+    try:
+        data = json.loads(resp.choices[0].message.content or '{}')
+    except Exception:
+        return [], []
+    known_set = set(known)
+    models = [str(m) for m in data.get('models', []) if str(m) in known_set][:5]
+    doc_ids: list[int] = []
+    for n in data.get('file_numbers', []):
+        try:
+            doc_ids.append(files[int(n)][0])
+        except (ValueError, IndexError, TypeError):
+            continue
+    return models, doc_ids[:10]
+
+
 async def _handle_fw(event, text: str) -> None:
     parts = text.split(maxsplit=1)
     arg = parts[1].strip() if len(parts) > 1 else ''
@@ -186,6 +230,28 @@ async def _handle_fw(event, text: str) -> None:
         await event.reply('Укажи модель: /fw MA5608T (можно часть: /fw 5735)')
         return
     rows = store.find_firmware(arg)
+    llm_note = ''
+    extra_files: list[tuple] = []
+    if not rows:
+        try:
+            models, doc_ids = await _fw_llm_match(arg)
+            seen_rows = set()
+            for model in models:
+                for r in store.find_firmware(model):
+                    key = (r[9], r[0], r[1])  # doc_id, model, version
+                    if key not in seen_rows:
+                        seen_rows.add(key)
+                        rows.append(r)
+            fw_docs = {r[9] for r in rows}
+            for doc_id in doc_ids:
+                rec = store.file_by_doc_id(doc_id)
+                if rec and doc_id not in fw_docs:
+                    extra_files.append((doc_id,) + tuple(rec))
+            if rows or extra_files:
+                llm_note = ('\n\nСоответствие подобрано LLM по запросу '
+                            f'«{arg}» — сверь модель в имени файла.')
+        except Exception as e:
+            logger.warning('fw llm fallback failed: %s', e)
     # Кнопки 📎 — для файлов, которые физически скачаны качалкой на NAS
     buttons = []
     seen: set[int] = set()
@@ -196,8 +262,27 @@ async def _handle_fw(event, text: str) -> None:
             buttons.append([Button.inline(f'📎 {name[:40]}', f'g:{doc_id}'.encode())])
         if len(buttons) >= 8:
             break
-    await event.reply(_format_fw(rows, arg), link_preview=False,
-                      buttons=buttons or None)
+    if rows:
+        text_out = _format_fw(rows, arg)
+    elif extra_files:
+        text_out = f'Точных связок «модель → прошивка» по «{arg}» нет.'
+    else:
+        text_out = _format_fw(rows, arg)  # штатное «в каталоге нет»
+    if extra_files:
+        lines = ['', 'Возможно подходящие файлы (LLM по именам):']
+        for doc_id, name, md5, chat_id, msg_id, date in extra_files:
+            line = f'• {date} · {name}'
+            link = _msg_link(chat_id, msg_id)
+            if link:
+                line += f'\n  {link}'
+            lines.append(line)
+            if md5 and doc_id not in seen and len(buttons) < 12:
+                seen.add(doc_id)
+                buttons.append(
+                    [Button.inline(f'📎 {name[:40]}', f'g:{doc_id}'.encode())])
+        text_out += '\n'.join(lines)
+    await event.reply((text_out + llm_note)[:4000],
+                      link_preview=False, buttons=buttons or None)
 
 
 def _fmt_event(ts: str, kind: str, text: str, cost: float) -> str:
@@ -230,7 +315,8 @@ async def handle_admin(event) -> None:
         if cursors:
             lines.append('Курсоры инжеста (chat: msg_id):')
             lines += [f'  {k.split(":", 1)[1]}: {v}' for k, v in cursors]
-        await event.reply('\n'.join(lines))
+        await event.reply('\n'.join(lines),
+                          buttons=[[Button.inline('▶️ Инжест сейчас', b'a:ingest')]])
     elif low.startswith('/events'):
         rows = store.recent_events(20)
         if not rows:
@@ -257,6 +343,11 @@ async def handle_admin(event) -> None:
             body = 'Вопросы без ответа или с 👎:\n' + '\n'.join(
                 f'• {ts[5:16]} {q}' for ts, q in rows)
             await event.reply(body[:4000])
+    elif low.startswith('/ingest'):
+        store.set_state('ingest_request', '1')
+        await event.reply('Запросил внеплановый инжест — качалка запустит его '
+                          'в течение минуты (чаты → PDF → экстракция → бэкап). '
+                          'События придут сюда по мере выполнения.')
     elif low.startswith('/fw'):
         await _handle_fw(event, text)
     elif low.startswith('/review'):
@@ -424,6 +515,24 @@ async def handler(event):
         return
     _last_ask[event.sender_id] = now
     await _send_answer(event, question)
+
+
+@client.on(events.CallbackQuery(pattern=rb'^a:'))
+async def on_admin_action(event):
+    """Админ-кнопки: сейчас только «▶️ Инжест сейчас» из /status."""
+    if event.sender_id not in ADMIN_IDS:
+        await event.answer()
+        return
+    try:
+        if event.data == b'a:ingest':
+            store.set_state('ingest_request', '1')
+            await event.answer('Инжест запрошен — качалка запустит в течение минуты')
+    except Exception as e:
+        logger.warning('admin action failed: %s', e)
+        try:
+            await event.answer()
+        except Exception:
+            pass
 
 
 @client.on(events.CallbackQuery(pattern=rb'^g:'))

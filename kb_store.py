@@ -371,6 +371,12 @@ class SqliteVecStore:
         """(doc_id, name) всего каталога — для reparse_files."""
         return self.db.execute('SELECT doc_id, name FROM files').fetchall()
 
+    def all_models(self) -> list[str]:
+        """Все известные модели и серии — словарь для LLM-fallback в /fw."""
+        return [r[0] for r in self.db.execute(
+            'SELECT DISTINCT device_model FROM firmware '
+            'UNION SELECT model FROM devices')]
+
     def find_firmware(self, query: str, limit: int = 30) -> list[tuple]:
         """Поиск по модели: '5735' матчит 'S5735-L'. Свежие версии первыми.
 
@@ -401,9 +407,9 @@ class SqliteVecStore:
             LIMIT :lim''', {'like': f'%{norm}%', 'lim': limit}).fetchall()
 
     def file_by_doc_id(self, doc_id: int):
-        """(name, md5, chat_id, msg_id) или None — для отправки файла ботом."""
+        """(name, md5, chat_id, msg_id, date) или None."""
         return self.db.execute(
-            'SELECT name, md5, chat_id, msg_id FROM files WHERE doc_id=?',
+            'SELECT name, md5, chat_id, msg_id, date FROM files WHERE doc_id=?',
             (doc_id,)).fetchone()
 
     def files_without_md5(self) -> list[tuple]:
@@ -424,11 +430,12 @@ class SqliteVecStore:
                 (model, model_norm, kind, parent, source, confirmed))
 
     def files_for_extraction(self, limit: int = 200) -> list[tuple]:
-        """Файлы с подписью, у которых разбор имени не дал связок и LLM ещё
-        не запускался: кандидаты для kb_extract."""
+        """Файлы, у которых разбор имени не дал связок и LLM ещё не
+        запускался: кандидаты для kb_extract (имя + подпись, подпись может
+        быть пустой — новые схемы имён ловятся и без неё)."""
         return self.db.execute('''
             SELECT doc_id, name, caption FROM files
-            WHERE llm_done = 0 AND caption != ''
+            WHERE llm_done = 0
               AND doc_id NOT IN (SELECT doc_id FROM firmware)
             ORDER BY doc_id LIMIT ?''', (limit,)).fetchall()
 
@@ -664,6 +671,10 @@ def _selftest() -> None:
         # upsert_firmware: True для новой связки, False для дубля (reparse)
         assert store.upsert_firmware(111, 'TEST1', 'V1R1', '0001.0001') is True
         assert store.upsert_firmware(111, 'TEST1', 'V1R1', '0001.0001') is False
+        assert 'TEST1' in store.all_models()
+        rec = store.file_by_doc_id(222)
+        assert rec[0].startswith('MA5608T_V800R018') and rec[4] == '2026-03-12'
+        assert store.file_by_doc_id(999999) is None
         fw = store.find_firmware('5608')
         assert len(fw) == 2 and fw[0][1] == 'V800R018C10SPC500', fw  # свежая первой
         assert store.find_firmware('S9999') == []

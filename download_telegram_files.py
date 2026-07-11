@@ -3,7 +3,7 @@ import hashlib
 import logging
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from telethon import TelegramClient, errors, events
 from telethon.tl.types import DocumentAttributeFilename
@@ -201,17 +201,11 @@ async def handler(event):
     _kb_event('download', f'Скачан {file_name} ({size_mb:.1f} МБ)')
 
 
-def _seconds_until_hour(hour: int) -> float:
-    now = datetime.now()
-    target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    return (target - now).total_seconds()
-
-
 async def kb_ingest_loop() -> None:
-    """Ночной инжест базы знаний. Живёт в этом процессе, потому что одна
-    Telethon-сессия не может использоваться двумя процессами одновременно."""
+    """Инжест базы знаний: ночью в INGEST_HOUR и по запросу админа
+    (/ingest в kb-bot ставит state ingest_request). Живёт в этом процессе,
+    потому что одна Telethon-сессия не может использоваться двумя процессами
+    одновременно. Тик раз в минуту, сделанность суток — в state."""
     if not KB_CHAT_IDS:
         return
     if not os.getenv('OPENAI_API_KEY'):
@@ -221,10 +215,24 @@ async def kb_ingest_loop() -> None:
     from kb_ingest import ingest_chat, pdf_enabled
     from kb_store import open_store
     store = open_store()
-    logger.info('KB ingest scheduled daily at %02d:00 for chats %s',
-                INGEST_HOUR, sorted(KB_CHAT_IDS))
+    logger.info('KB ingest scheduled daily at %02d:00 for chats %s '
+                '(+ /ingest по запросу)', INGEST_HOUR, sorted(KB_CHAT_IDS))
     while True:
-        await asyncio.sleep(_seconds_until_hour(INGEST_HOUR))
+        await asyncio.sleep(60)
+        now = datetime.now()
+        today = now.strftime('%Y-%m-%d')
+        due_daily = (now.hour == INGEST_HOUR
+                     and store.get_state('ingest_done_date') != today)
+        on_demand = store.get_state('ingest_request', '') == '1'
+        if not (due_daily or on_demand):
+            continue
+        if not client.is_connected():
+            continue  # флажки не сбрасываем — попробуем через минуту
+        store.set_state('ingest_request', '')
+        if due_daily:
+            store.set_state('ingest_done_date', today)
+        if on_demand:
+            logger.info('KB ingest: on-demand run requested via /ingest')
         for chat_id in KB_CHAT_IDS:
             try:
                 stats = await ingest_chat(client, store, chat_id)
