@@ -8,7 +8,10 @@
 """
 from __future__ import annotations
 
+import os
 import re
+
+_MD5_RE = re.compile(r'^[0-9a-f]{32}$')
 
 # S5735-L, MA5608T, HG8145V5, AR3260, CE6857-48S6CQ-EI, NE40E, USG6300…
 # Сегменты суффикса ограничены 6 символами и не могут начинаться с V<цифра> —
@@ -77,6 +80,44 @@ def record_file(store, msg, file_name: str, topic_name: str = '',
         store.upsert_firmware(doc.id, model, version, version_key)
 
 
+def _load_md5_journal(folder: str) -> dict:
+    """downloaded_files.txt качалки -> {имя: md5}. Формат журнала —
+    <md5>,<имя> (новый) и <имя>,<md5> (старый); парсинг продублирован из
+    download_telegram_files, который нельзя импортировать (side effects)."""
+    path = os.path.join(folder, 'downloaded_files.txt')
+    out: dict = {}
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding='utf-8') as f:
+        for line in f.read().splitlines():
+            head, sep, tail = line.partition(',')
+            if not sep:
+                continue
+            if _MD5_RE.match(head):
+                out[tail] = head
+            elif _MD5_RE.match(tail):
+                out[head] = tail
+    return out
+
+
+def link_local_files(store, folder: str) -> int:
+    """Проставляет files.md5 записям каталога, чьи файлы скачаны на NAS ещё
+    ДО появления каталога (md5 берётся из журнала дедупликации): без md5
+    кнопка 📎 в /fw не показывается. Идемпотентно — обрабатываются только
+    записи с пустым md5. Возвращает число привязанных файлов."""
+    journal = _load_md5_journal(folder)
+    if not journal:
+        return 0
+    linked = 0
+    for doc_id, name in store.files_without_md5():
+        base = os.path.basename(name)
+        md5 = journal.get(base)
+        if md5 and os.path.exists(os.path.join(folder, base)):
+            store.set_file_md5(doc_id, md5)
+            linked += 1
+    return linked
+
+
 def _selftest() -> None:
     cases = {
         'MA5608T_V800R018C10SPC500.zip': (['MA5608T'], 'V800R018C10SPC500'),
@@ -97,6 +138,19 @@ def _selftest() -> None:
     _, _, k_old = parse_firmware_name('MA5608T_V800R017C10SPC200.zip')
     _, _, k_new = parse_firmware_name('MA5608T_V800R018C10SPC500.zip')
     assert k_new > k_old, (k_old, k_new)
+
+    # журнал дедупликации: оба формата, битые строки игнорируются
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, 'downloaded_files.txt'), 'w',
+                  encoding='utf-8') as f:
+            f.write('a' * 32 + ',fw1.zip\n')          # новый формат
+            f.write('old_manual.pdf,' + 'b' * 32 + '\n')  # старый формат
+            f.write('битая строка без запятой\n')
+            f.write('имя,но-не-хэш\n')
+        j = _load_md5_journal(tmp)
+        assert j == {'fw1.zip': 'a' * 32, 'old_manual.pdf': 'b' * 32}, j
+        assert _load_md5_journal(os.path.join(tmp, 'нет-такой-папки')) == {}
     print('kb_firmware selftest: OK')
 
 

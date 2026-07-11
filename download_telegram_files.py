@@ -238,6 +238,15 @@ async def kb_ingest_loop() -> None:
             except Exception as e:
                 logger.warning('KB ingest failed for %s: %s', chat_id, e)
                 store.add_event('error', f'Инжест {chat_id} упал: {e}')
+        try:
+            from kb_firmware import link_local_files
+            linked = link_local_files(store, DOWNLOAD_FOLDER)
+            if linked:
+                logger.info('KB catalog: linked %d local files', linked)
+                store.add_event('catalog',
+                                f'Каталог: привязано уже скачанных файлов: {linked}')
+        except Exception as e:
+            logger.warning('KB link_local_files failed: %s', e)
         if pdf_enabled():
             try:
                 from kb_pdf import ingest_pdfs

@@ -113,6 +113,13 @@ async def _backfill(client, chat_ids: list[int], download_folder: str,
         extra = f', удалено устаревших чанков: {stats.pruned}' if stats.pruned else ''
         print(f'  {stats.messages} сообщений -> {stats.new_chunks} чанков'
               f'{extra}, ~${stats.cost:.2f}')
+    if not stopped:
+        # каталог: файлы, скачанные до его появления, получают md5 из журнала
+        # дедупликации — без этого у них не будет кнопки 📎 в /fw
+        from kb_firmware import link_local_files
+        linked = link_local_files(store, download_folder)
+        if linked:
+            print(f'Каталог: привязано уже скачанных файлов: {linked}')
 
     # Этап 2: vision/whisper — только наполнение кэша, чанки не трогаем
     if media_wanted and not stopped:

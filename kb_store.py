@@ -400,6 +400,12 @@ class SqliteVecStore:
             'SELECT name, md5, chat_id, msg_id FROM files WHERE doc_id=?',
             (doc_id,)).fetchone()
 
+    def files_without_md5(self) -> list[tuple]:
+        """(doc_id, name) записей без md5 — кандидаты на привязку к уже
+        скачанным файлам через журнал дедупликации (link_local_files)."""
+        return self.db.execute(
+            "SELECT doc_id, name FROM files WHERE md5 = ''").fetchall()
+
     def upsert_device(self, model: str, kind: str = 'model', parent: str = '',
                       source: str = 'llm', confirmed: int = 0) -> None:
         """Первая запись побеждает: подтверждённые/отклонённые не перетираются."""
@@ -645,7 +651,9 @@ def _selftest() -> None:
                               '0800.0017.0010.0200')
         store.upsert_firmware(222, 'MA5608T', 'V800R018C10SPC500',
                               '0800.0018.0010.0500')
+        assert (111, 'MA5608T_V800R017C10SPC200.zip') in store.files_without_md5()
         store.set_file_md5(222, 'a' * 32)
+        assert all(d != 222 for d, _ in store.files_without_md5())
         fw = store.find_firmware('5608')
         assert len(fw) == 2 and fw[0][1] == 'V800R018C10SPC500', fw  # свежая первой
         assert store.find_firmware('S9999') == []
