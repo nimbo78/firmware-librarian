@@ -226,6 +226,7 @@ Selftest хранилища (без сети вообще): `python kb_store.py`
 | `CHAT_IDS` | да | CSV чатов, откуда качать файлы |
 | `FILE_EXTENSIONS` | нет (`pdf,jpg,png`) | CSV расширений без точки |
 | `TZ` | нет (`UTC`) | часовой пояс; от него зависит `INGEST_HOUR` |
+| `MTPROXY_HOST` / `PORT` / `SECRET` | нет | MTProto-прокси для всех подключений к Telegram (секрет hex/dd, FakeTLS ee… не поддерживается) |
 | `OPENAI_API_KEY` | для KB | эмбеддинги и ответы |
 | `KB_CHAT_IDS` | для KB | CSV чатов-источников знаний |
 | `KB_BOT_TOKEN` | для KB | токен бота из BotFather |
@@ -265,6 +266,7 @@ Selftest хранилища (без сети вообще): `python kb_store.py`
 
 ```
 download_telegram_files.py  качалка + ночной kb-ingest
+tg_conn.py                  опциональный MTProto-прокси (MTPROXY_*)
 kb_store.py                 хранилище: sqlite-vec + FTS5 + RRF (+selftest)
 kb_ingest.py                чанкер, vision/whisper-обогащение, эмбеддинги
 kb_firmware.py              каталог прошивок: разбор имён Huawei (/fw)

@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 from telethon import TelegramClient, errors, events
 from telethon.tl.types import DocumentAttributeFilename
 
+from tg_conn import proxy_kwargs
+
 
 def _require(name: str) -> str:
     val = os.getenv(name)
@@ -134,6 +136,7 @@ client = TelegramClient(
     request_retries=5,
     timeout=30,
     flood_sleep_threshold=120,
+    **proxy_kwargs(),
 )
 
 

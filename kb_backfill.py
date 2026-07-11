@@ -35,6 +35,7 @@ from kb_ingest import (BudgetExceeded, EMBED_PRICE_PER_MTOK, VISION_COST_PER_IMA
                        WHISPER_PRICE_PER_MIN, enrich_chat_media, ingest_chat,
                        pdf_enabled, scan_chat, vision_enabled, voice_enabled)
 from kb_store import open_store
+from tg_conn import proxy_kwargs
 
 
 def _require(name: str) -> str:
@@ -199,6 +200,7 @@ async def main() -> None:
         timeout=30,
         # полный прогон истории: длинные FloodWait пересыпаем, а не падаем
         flood_sleep_threshold=86400,
+        **proxy_kwargs(),
     )
     # телеграмные предупреждения (FloodWait, обрывы) — в stderr, а не в тишину
     logging.basicConfig(level=logging.WARNING,

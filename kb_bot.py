@@ -17,6 +17,7 @@ from telethon import Button, TelegramClient, events
 
 from kb_ingest import embed_texts, openai_client
 from kb_store import open_store
+from tg_conn import proxy_kwargs
 
 API_ID = int(os.environ['TELEGRAM_API_ID'])
 API_HASH = os.environ['TELEGRAM_API_HASH']
@@ -66,7 +67,8 @@ logging.getLogger('telethon').setLevel(logging.WARNING)
 
 client = TelegramClient(SESSION, API_ID, API_HASH,
                         connection_retries=-1, retry_delay=300,
-                        auto_reconnect=True, request_retries=5, timeout=30)
+                        auto_reconnect=True, request_retries=5, timeout=30,
+                        **proxy_kwargs())
 store = open_store()
 _last_ask: dict[int, float] = {}
 _bot_username = ''
