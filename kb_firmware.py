@@ -13,14 +13,18 @@ import re
 
 _MD5_RE = re.compile(r'^[0-9a-f]{32}$')
 
-# S5735-L, MA5608T, HG8145V5, AR3260, CE6857-48S6CQ-EI, NE40E, USG6300…
-# Сегменты суффикса ограничены 6 символами и не могут начинаться с V<цифра> —
-# иначе жадный матч съедает версию ('S5735-L-V200R019...' → модель S5735-L).
-# Границы — lookaround вместо \b: '_' в именах файлов является словесным
-# символом, и 'MA5608T_V800…' с \b не матчится.
+# S5735-L, MA5608T, HG8145V5, AR3260, CE6857-48S6CQ-EI, NE40E, USG6300,
+# AirEngine9700-M, NetEngine8000-M8, CloudEngine16800…
+# Длинные словесные префиксы стоят в альтернативе первыми, чтобы короткие
+# (NE, AR) не перехватывали их начало. Сегменты суффикса ограничены
+# 6 символами и не могут начинаться с V<цифра> — иначе жадный матч съедает
+# версию ('S5735-L-V200R019...' → модель S5735-L). Границы — lookaround
+# вместо \b: '_' в именах файлов является словесным символом,
+# и 'MA5608T_V800…' с \b не матчится.
 MODEL_RE = re.compile(
     r'(?<![A-Z0-9])'
-    r'((?:MA|HG|EG|AR|CE|NE|USG|ATN|OLT)\d{3,5}[A-Z0-9]*(?:-(?!V\d)[A-Z0-9]{1,6})*'
+    r'((?:AIRENGINE|CLOUDENGINE|NETENGINE|OCEANSTOR|USG|ATN|OLT'
+    r'|MA|HG|EG|AR|CE|NE|AP)\d{3,5}[A-Z0-9]*(?:-(?!V\d)[A-Z0-9]{1,6})*'
     r'|S\d{4}(?:-(?!V\d)[A-Z0-9]{1,6})*)'
     r'(?![A-Z0-9])')
 
@@ -80,6 +84,20 @@ def record_file(store, msg, file_name: str, topic_name: str = '',
         store.upsert_firmware(doc.id, model, version, version_key)
 
 
+def reparse_files(store) -> int:
+    """Перепрогоняет разбор имён по ВСЕМУ каталогу. Нужен после улучшения
+    регулярок: старые записи files получают новые связки firmware без
+    повторного инжеста. Идемпотентен (PK + DO NOTHING), дёшев — регулярки
+    по нескольким тысячам имён. Возвращает число новых связок."""
+    added = 0
+    for doc_id, name in store.all_files():
+        models, version, version_key = parse_firmware_name(name)
+        for model in models:
+            if store.upsert_firmware(doc_id, model, version, version_key):
+                added += 1
+    return added
+
+
 def _load_md5_journal(folder: str) -> dict:
     """downloaded_files.txt качалки -> {имя: md5}. Формат журнала —
     <md5>,<имя> (новый) и <имя>,<md5> (старый); парсинг продублирован из
@@ -123,6 +141,11 @@ def _selftest() -> None:
         'MA5608T_V800R018C10SPC500.zip': (['MA5608T'], 'V800R018C10SPC500'),
         'S5735-L-V200R019C00SPC500.cc': (['S5735-L'], 'V200R019C00SPC500'),
         'HG8145V5-V5R019C00S100.bin': (['HG8145V5'], 'V5R019C00S100'),
+        'AirEngine9700-M_V200R021C00SPH010.pat':
+            (['AIRENGINE9700-M'], 'V200R021C00SPH010'),
+        'NetEngine8000-M8_V800R022C00SPC600.cc':
+            (['NETENGINE8000-M8'], 'V800R022C00SPC600'),
+        'AP7060DN-V200R021C00.bin': (['AP7060DN'], 'V200R021C00'),
         'SmartAX_MA5608T_V800R017C10.tar.gz': (['MA5608T'], 'V800R017C10'),
         'CE6857-48S6CQ-EI-V200R005C10SPC800.cc': (['CE6857-48S6CQ-EI'],
                                                   'V200R005C10SPC800'),

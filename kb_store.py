@@ -354,16 +354,22 @@ class SqliteVecStore:
 
     def upsert_firmware(self, doc_id: int, device_model: str, version: str,
                         version_key: str, source: str = 'filename',
-                        confidence: str = 'high') -> None:
+                        confidence: str = 'high') -> bool:
+        """True, если связка новая (для счётчика reparse_files)."""
         model_norm = re.sub(r'[^A-Z0-9]', '', device_model.upper())
         with self.db:
-            self.db.execute('''
+            cur = self.db.execute('''
                 INSERT INTO firmware(doc_id, device_model, model_norm,
                                      version, version_key, source, confidence)
                 VALUES(?,?,?,?,?,?,?)
                 ON CONFLICT(doc_id, device_model, version) DO NOTHING
                 ''', (doc_id, device_model, model_norm, version, version_key,
                       source, confidence))
+            return cur.rowcount == 1
+
+    def all_files(self) -> list[tuple]:
+        """(doc_id, name) всего каталога — для reparse_files."""
+        return self.db.execute('SELECT doc_id, name FROM files').fetchall()
 
     def find_firmware(self, query: str, limit: int = 30) -> list[tuple]:
         """Поиск по модели: '5735' матчит 'S5735-L'. Свежие версии первыми.
@@ -654,6 +660,10 @@ def _selftest() -> None:
         assert (111, 'MA5608T_V800R017C10SPC200.zip') in store.files_without_md5()
         store.set_file_md5(222, 'a' * 32)
         assert all(d != 222 for d, _ in store.files_without_md5())
+        assert len(store.all_files()) == 2
+        # upsert_firmware: True для новой связки, False для дубля (reparse)
+        assert store.upsert_firmware(111, 'TEST1', 'V1R1', '0001.0001') is True
+        assert store.upsert_firmware(111, 'TEST1', 'V1R1', '0001.0001') is False
         fw = store.find_firmware('5608')
         assert len(fw) == 2 and fw[0][1] == 'V800R018C10SPC500', fw  # свежая первой
         assert store.find_firmware('S9999') == []
@@ -686,7 +696,7 @@ def _selftest() -> None:
         assert [r[0] for r in store.files_for_extraction()] == [555]
         store.mark_file_extracted(555)
         assert store.files_for_extraction() == []
-        assert store.models_without_device() == ['MA5608T']
+        assert store.models_without_device() == ['MA5608T', 'TEST1']
         store.upsert_firmware(555, 'MA5800', 'V100R022', '0100.0022.0000.0000',
                               source='caption', confidence='medium')
         fw_items, dev_items = store.review_items()
@@ -696,7 +706,7 @@ def _selftest() -> None:
         store.confirm_device('S5735-L', ok=False)  # отклонение фиксируется
         assert store.pending_review_count() == 0
         # MA5800 добавилась подтверждённой связкой и тоже ждёт таксономию
-        assert store.models_without_device(limit=50) == ['MA5608T', 'MA5800']
+        assert store.models_without_device(limit=50) == ['MA5608T', 'MA5800', 'TEST1']
 
         # лог вопрос-ответ и оценки
         qa_id = store.log_qa(-1001234, 777, 'как прошить ONT?', 'вот так', True,
@@ -720,7 +730,8 @@ def _selftest() -> None:
         s = store.kb_stats()
         assert s['chunks'] == 2 and s['downloads_24h'] == 1  # 2: один чанк убрал prune
         assert abs(s['events_cost'] - 0.12) < 1e-9
-        assert s['files'] == 5 and s['fw_models'] == 4, (s['files'], s['fw_models'])
+        # 5 моделей: MA5608T, S5700, S5735-L, MA5800 + тестовая TEST1
+        assert s['files'] == 5 and s['fw_models'] == 5, (s['files'], s['fw_models'])
         assert s['qa_7d'] == 2 and s['qa_bad_7d'] == 1 and s['qa_nohit_7d'] == 1
 
         bak = os.path.join(tmp, 'kb.bak')

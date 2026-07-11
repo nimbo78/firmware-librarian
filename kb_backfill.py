@@ -115,11 +115,14 @@ async def _backfill(client, chat_ids: list[int], download_folder: str,
               f'{extra}, ~${stats.cost:.2f}')
     if not stopped:
         # каталог: файлы, скачанные до его появления, получают md5 из журнала
-        # дедупликации — без этого у них не будет кнопки 📎 в /fw
-        from kb_firmware import link_local_files
+        # дедупликации — без этого у них не будет кнопки 📎 в /fw;
+        # reparse добирает связки после улучшения регулярок разбора имён
+        from kb_firmware import link_local_files, reparse_files
         linked = link_local_files(store, download_folder)
-        if linked:
-            print(f'Каталог: привязано уже скачанных файлов: {linked}')
+        reparsed = reparse_files(store)
+        if linked or reparsed:
+            print(f'Каталог: привязано файлов {linked}, '
+                  f'новых связок после перепарсинга {reparsed}')
 
     # Этап 2: vision/whisper — только наполнение кэша, чанки не трогаем
     if media_wanted and not stopped:

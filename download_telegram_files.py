@@ -239,14 +239,17 @@ async def kb_ingest_loop() -> None:
                 logger.warning('KB ingest failed for %s: %s', chat_id, e)
                 store.add_event('error', f'Инжест {chat_id} упал: {e}')
         try:
-            from kb_firmware import link_local_files
+            from kb_firmware import link_local_files, reparse_files
             linked = link_local_files(store, DOWNLOAD_FOLDER)
-            if linked:
-                logger.info('KB catalog: linked %d local files', linked)
+            reparsed = reparse_files(store)  # новые регулярки -> старые файлы
+            if linked or reparsed:
+                logger.info('KB catalog: linked %d local files, reparsed %d links',
+                            linked, reparsed)
                 store.add_event('catalog',
-                                f'Каталог: привязано уже скачанных файлов: {linked}')
+                                f'Каталог: привязано файлов {linked}, '
+                                f'новых связок после перепарсинга {reparsed}')
         except Exception as e:
-            logger.warning('KB link_local_files failed: %s', e)
+            logger.warning('KB catalog maintenance failed: %s', e)
         if pdf_enabled():
             try:
                 from kb_pdf import ingest_pdfs
