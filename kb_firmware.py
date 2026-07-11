@@ -13,20 +13,46 @@ import re
 
 _MD5_RE = re.compile(r'^[0-9a-f]{32}$')
 
-# S5735-L, MA5608T, HG8145V5, AR3260, CE6857-48S6CQ-EI, NE40E, USG6300,
-# AirEngine9700-M, NetEngine8000-M8, CloudEngine16800…
+# S5735-L, S5735-V2 (поколение железа!), MA5608T, HG8145V5, AR3260,
+# CE6857-48S6CQ-EI, NE40E, USG6300, AirEngine9700-M, NetEngine8000-M8…
 # Длинные словесные префиксы стоят в альтернативе первыми, чтобы короткие
 # (NE, AR) не перехватывали их начало. Сегменты суффикса ограничены
-# 6 символами и не могут начинаться с V<цифра> — иначе жадный матч съедает
-# версию ('S5735-L-V200R019...' → модель S5735-L). Границы — lookaround
-# вместо \b: '_' в именах файлов является словесным символом,
+# 6 символами и не могут начинаться с ВЕРСИИ V<цифры>R<цифра> — иначе жадный
+# матч съедает версию ('S5735-L-V200R019...' → модель S5735-L); при этом
+# короткое '-V2' (второе поколение) — легитимная часть модели. Границы —
+# lookaround вместо \b: '_' в именах файлов является словесным символом,
 # и 'MA5608T_V800…' с \b не матчится.
 MODEL_RE = re.compile(
     r'(?<![A-Z0-9])'
     r'((?:AIRENGINE|CLOUDENGINE|NETENGINE|OCEANSTOR|USG|ATN|OLT'
-    r'|MA|HG|EG|AR|CE|NE|AP)\d{3,5}[A-Z0-9]*(?:-(?!V\d)[A-Z0-9]{1,6})*'
-    r'|S\d{4}(?:-(?!V\d)[A-Z0-9]{1,6})*)'
+    r'|MA|HG|EG|AR|CE|NE|AP)\d{3,5}[A-Z0-9]*(?:-(?!V\d{1,4}R\d)[A-Z0-9]{1,6})*'
+    r'|S\d{4}(?:-(?!V\d{1,4}R\d)[A-Z0-9]{1,6})*)'
     r'(?![A-Z0-9])')
+
+# Версионные токены в ЗАПРОСЕ пользователя ('R025', 'V600', 'SPC500'):
+# отделяются от модели и работают фильтром по версии, а не частью имени
+VERSION_TOKEN_RE = re.compile(
+    r'^(?:V\d{1,4}[A-Z0-9]*|R\d{1,4}|C\d{1,4}|SPC\d{1,4}|SPH\d{1,4})$',
+    re.IGNORECASE)
+
+
+def split_query(query: str) -> tuple[str, list[str]]:
+    """'S5735-S-V2 R025' -> ('S5735-S-V2', ['R025']).
+
+    Версионные токены, написанные ОТДЕЛЬНЫМИ словами, уходят в фильтр;
+    '-V2' внутри модели не трогается (нет пробела).
+    """
+    model_parts: list[str] = []
+    version_tokens: list[str] = []
+    for token in query.split():
+        if VERSION_TOKEN_RE.match(token):
+            version_tokens.append(token.upper())
+        else:
+            model_parts.append(token)
+    if not model_parts:
+        # запрос из одной версии — ищем как есть, фильтровать нечего
+        return query, []
+    return ' '.join(model_parts), version_tokens
 
 # V800R018C10SPC500, V5R019C00S100 (ONT), V200R019C00SPC500H01 (патч)
 VERSION_RE = re.compile(
@@ -146,6 +172,9 @@ def _selftest() -> None:
         'NetEngine8000-M8_V800R022C00SPC600.cc':
             (['NETENGINE8000-M8'], 'V800R022C00SPC600'),
         'AP7060DN-V200R021C00.bin': (['AP7060DN'], 'V200R021C00'),
+        # поколение -V2 — часть модели, а версия после '_' не заглатывается
+        'S5735-V2_V600R025C00SPC500.cc': (['S5735-V2'], 'V600R025C00SPC500'),
+        'S5735-S-V2_V600R025SPH120.PAT.asc': (['S5735-S-V2'], 'V600R025SPH120'),
         'SmartAX_MA5608T_V800R017C10.tar.gz': (['MA5608T'], 'V800R017C10'),
         'CE6857-48S6CQ-EI-V200R005C10SPC800.cc': (['CE6857-48S6CQ-EI'],
                                                   'V200R005C10SPC800'),
@@ -161,6 +190,13 @@ def _selftest() -> None:
     _, _, k_old = parse_firmware_name('MA5608T_V800R017C10SPC200.zip')
     _, _, k_new = parse_firmware_name('MA5608T_V800R018C10SPC500.zip')
     assert k_new > k_old, (k_old, k_new)
+
+    # разбор запроса: версия отдельным словом -> фильтр, -V2 внутри — модель
+    assert split_query('S5735-S-V2 R025') == ('S5735-S-V2', ['R025'])
+    assert split_query('MA5608T V800R018 SPC500') == ('MA5608T',
+                                                      ['V800R018', 'SPC500'])
+    assert split_query('5735') == ('5735', [])
+    assert split_query('R025') == ('R025', [])  # только версия — не пустим модель
 
     # журнал дедупликации: оба формата, битые строки игнорируются
     import tempfile

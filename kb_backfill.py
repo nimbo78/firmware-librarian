@@ -88,7 +88,8 @@ async def _dry_run(client, chat_ids: list[int], download_folder: str) -> None:
 
 
 async def _backfill(client, chat_ids: list[int], download_folder: str,
-                    max_cost: float | None) -> None:
+                    max_cost: float | None,
+                    extra_chat_ids: list[int]) -> None:
     store = open_store()
     spent = 0.0
     stopped = False
@@ -113,6 +114,26 @@ async def _backfill(client, chat_ids: list[int], download_folder: str,
         extra = f', удалено устаревших чанков: {stats.pruned}' if stats.pruned else ''
         print(f'  {stats.messages} сообщений -> {stats.new_chunks} чанков'
               f'{extra}, ~${stats.cost:.2f}')
+    # Каталогизация документов из чатов качалки, не входящих в KB_CHAT_IDS:
+    # без инжеста в RAG, только files/firmware — иначе файлы, скачанные из
+    # «не-KB» чатов, невидимы для /fw и кнопок 📎
+    if not stopped and extra_chat_ids:
+        from kb_firmware import document_filename, record_file
+        from kb_ingest import fetch_topic_names, message_topic_id
+        for chat_id in extra_chat_ids:
+            print(f'Каталог (без инжеста): {chat_id}...', flush=True)
+            topics = await fetch_topic_names(client, chat_id)
+            recorded = 0
+            async for msg in client.iter_messages(chat_id, reverse=True):
+                if msg.document is None:
+                    continue
+                fname = document_filename(msg)
+                if not fname:
+                    continue
+                record_file(store, msg, fname,
+                            topics.get(message_topic_id(msg), ''))
+                recorded += 1
+            print(f'  документов закаталогизировано: {recorded}')
     if not stopped:
         # каталог: файлы, скачанные до его появления, получают md5 из журнала
         # дедупликации — без этого у них не будет кнопки 📎 в /fw;
@@ -200,6 +221,9 @@ async def main() -> None:
     api_hash = _require('TELEGRAM_API_HASH')
     chat_ids = [int(x) for x in _require('KB_CHAT_IDS').split(',') if x.strip()]
     download_folder = os.getenv('DOWNLOAD_FOLDER', './downloads')
+    # чаты качалки вне KB: каталогизируем документы без инжеста в RAG
+    dl_chat_ids = {int(x) for x in os.getenv('CHAT_IDS', '').split(',') if x.strip()}
+    extra_chat_ids = sorted(dl_chat_ids - set(chat_ids))
 
     client = TelegramClient(
         'bot', api_id, api_hash,
@@ -222,7 +246,8 @@ async def main() -> None:
         if args.dry_run:
             await _dry_run(client, chat_ids, download_folder)
         else:
-            await _backfill(client, chat_ids, download_folder, args.max_cost)
+            await _backfill(client, chat_ids, download_folder, args.max_cost,
+                            extra_chat_ids)
     finally:
         await client.disconnect()
 

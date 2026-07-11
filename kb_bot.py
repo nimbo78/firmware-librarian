@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 
 from telethon import Button, TelegramClient, events
 
+from kb_firmware import split_query
 from kb_ingest import embed_texts, openai_client
 from kb_store import open_store
 from tg_conn import proxy_kwargs
@@ -229,7 +230,13 @@ async def _handle_fw(event, text: str) -> None:
     if not arg:
         await event.reply('Укажи модель: /fw MA5608T (можно часть: /fw 5735)')
         return
-    rows = store.find_firmware(arg)
+    # 'S5735-S-V2 R025': версия отдельным словом — фильтр, а не часть модели
+    model_query, version_tokens = split_query(arg)
+
+    def _ver_ok(version: str) -> bool:
+        return all(t in (version or '').upper() for t in version_tokens)
+
+    rows = [r for r in store.find_firmware(model_query) if _ver_ok(r[1])]
     llm_note = ''
     extra_files: list[tuple] = []
     if not rows:
@@ -239,7 +246,7 @@ async def _handle_fw(event, text: str) -> None:
             for model in models:
                 for r in store.find_firmware(model):
                     key = (r[9], r[0], r[1])  # doc_id, model, version
-                    if key not in seen_rows:
+                    if key not in seen_rows and _ver_ok(r[1]):
                         seen_rows.add(key)
                         rows.append(r)
             fw_docs = {r[9] for r in rows}
@@ -248,8 +255,8 @@ async def _handle_fw(event, text: str) -> None:
                 if rec and doc_id not in fw_docs:
                     extra_files.append((doc_id,) + tuple(rec))
             if rows or extra_files:
-                llm_note = ('\n\nСоответствие подобрано LLM по запросу '
-                            f'«{arg}» — сверь модель в имени файла.')
+                llm_note = (f'Подобрано LLM по запросу «{arg}» — сверь модель '
+                            'в имени файла.\n\n')
         except Exception as e:
             logger.warning('fw llm fallback failed: %s', e)
     # Кнопки 📎 — для файлов, которые физически скачаны качалкой на NAS
@@ -281,7 +288,8 @@ async def _handle_fw(event, text: str) -> None:
                 buttons.append(
                     [Button.inline(f'📎 {name[:40]}', f'g:{doc_id}'.encode())])
         text_out += '\n'.join(lines)
-    await event.reply((text_out + llm_note)[:4000],
+    # пометка LLM — в начале: хвост может обрезаться лимитом 4096
+    await event.reply((llm_note + text_out)[:4000],
                       link_preview=False, buttons=buttons or None)
 
 
