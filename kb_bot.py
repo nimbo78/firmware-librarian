@@ -30,6 +30,8 @@ ANSWER_CHAT_IDS = {int(x) for x in os.getenv('KB_ANSWER_CHAT_IDS', '').split(','
 ADMIN_IDS = {int(x) for x in os.getenv('KB_ADMIN_IDS', '').split(',') if x.strip()}
 ANSWER_MODEL = os.getenv('ANSWER_MODEL', 'gpt-5-mini')
 SESSION = os.getenv('KB_BOT_SESSION', 'kb_bot')
+# Том загрузок качалки (read-only в compose): отсюда бот шлёт файлы по кнопке 📎
+DOWNLOAD_FOLDER = os.getenv('DOWNLOAD_FOLDER', './downloads')
 COOLDOWN_SECONDS = 30
 TOP_K = 8
 NOTIFY_POLL_SECONDS = 60
@@ -100,16 +102,18 @@ async def answer_question(question: str) -> tuple[str, bool]:
     if not hits:
         return 'В базе знаний пока ничего не нашлось по этому вопросу.', False
     ctx_parts = []
-    links = []
+    src_lines = []  # выровнено с нумерацией контекста: src_lines[i-1] = [i]
     for i, h in enumerate(hits, 1):
         where = f'топик «{h.topic_name}», {h.date_from}' if h.topic_name else h.date_from
         ctx_parts.append(f'[{i}] ({where})\n{h.text}')
         link = _msg_link(h.chat_id, h.msg_first)
         if link:
-            links.append(f'[{i}] {link}')
+            src_lines.append(f'[{i}] {link}')
         elif h.chat_id > 0:
             # PDF-чанк: синтетический положительный chat_id (см. kb_pdf.py)
-            links.append(f'[{i}] файл «{h.topic_name}», стр. {h.msg_first}')
+            src_lines.append(f'[{i}] файл «{h.topic_name}», стр. {h.msg_first}')
+        else:
+            src_lines.append(f'[{i}] обсуждение в чате, {h.date_from}')
     # temperature/max_tokens не передаём: модели класса gpt-5 их не принимают
     resp = await oa.chat.completions.create(
         model=ANSWER_MODEL,
@@ -119,8 +123,13 @@ async def answer_question(question: str) -> tuple[str, bool]:
                 'Контекст:\n\n' + '\n\n'.join(ctx_parts) + f'\n\nВопрос: {question}'},
         ])
     answer = (resp.choices[0].message.content or '').strip()
-    if links:
-        answer += '\n\nИсточники:\n' + '\n'.join(links[:5])
+    # В списке источников — только те, на которые LLM сослался в тексте:
+    # иначе либо висячие [7] без ссылки, либо простыня из всех top-8
+    cited = {int(n) for n in re.findall(r'\[(\d+)\]', answer)
+             if 1 <= int(n) <= len(src_lines)}
+    shown = ([src_lines[n - 1] for n in sorted(cited)]
+             if cited else src_lines[:3])
+    answer += '\n\nИсточники:\n' + '\n'.join(shown)
     return answer[:4000], True  # лимит сообщения Telegram — 4096
 
 
@@ -149,7 +158,7 @@ def _format_fw(rows: list, query: str) -> str:
     out = [f'Прошивки по запросу «{query}»:']
     current_model = None
     latest_marked = False
-    for model, version, name, chat_id, msg_id, date, confidence, is_series in rows:
+    for model, version, name, chat_id, msg_id, date, confidence, is_series, _md5, _doc in rows:
         if model != current_model:
             suffix = ' (вся серия — проверь совместимость!)' if is_series else ''
             out.append(f'\n{model}{suffix}:')
@@ -177,7 +186,18 @@ async def _handle_fw(event, text: str) -> None:
         await event.reply('Укажи модель: /fw MA5608T (можно часть: /fw 5735)')
         return
     rows = store.find_firmware(arg)
-    await event.reply(_format_fw(rows, arg), link_preview=False)
+    # Кнопки 📎 — для файлов, которые физически скачаны качалкой на NAS
+    buttons = []
+    seen: set[int] = set()
+    for row in rows:
+        md5, doc_id, name = row[8], row[9], row[2]
+        if md5 and doc_id not in seen:
+            seen.add(doc_id)
+            buttons.append([Button.inline(f'📎 {name[:40]}', f'g:{doc_id}'.encode())])
+        if len(buttons) >= 8:
+            break
+    await event.reply(_format_fw(rows, arg), link_preview=False,
+                      buttons=buttons or None)
 
 
 def _fmt_event(ts: str, kind: str, text: str, cost: float) -> str:
@@ -404,6 +424,38 @@ async def handler(event):
         return
     _last_ask[event.sender_id] = now
     await _send_answer(event, question)
+
+
+@client.on(events.CallbackQuery(pattern=rb'^g:'))
+async def on_getfile(event):
+    """Кнопка 📎 в /fw: отправка файла с тома NAS прямо в чат.
+    MTProto-боты умеют до 2 ГБ (лимит 50 МБ — только у Bot HTTP API)."""
+    if event.chat_id not in ANSWER_CHAT_IDS and event.sender_id not in ADMIN_IDS:
+        await event.answer()
+        return
+    try:
+        doc_id = int(event.data.decode().split(':', 1)[1])
+        rec = store.file_by_doc_id(doc_id)
+        if rec is None:
+            await event.answer('Файл не найден в каталоге', alert=True)
+            return
+        name, md5 = rec[0], rec[1]
+        path = os.path.join(DOWNLOAD_FOLDER, os.path.basename(name))
+        if not md5 or not os.path.exists(path):
+            await event.answer('Файла нет на диске NAS — качай по ссылке на пост',
+                               alert=True)
+            return
+        await event.answer('Отправляю файл, большие идут долго…')
+        logger.info('Sending file %s to %s (asked by %s)',
+                    name, event.chat_id, event.sender_id)
+        await client.send_file(event.chat_id, path,
+                               reply_to=event.message_id, force_document=True)
+    except Exception as e:
+        logger.warning('getfile failed: %s', e)
+        try:
+            await event.answer('Не получилось отправить файл', alert=True)
+        except Exception:
+            pass
 
 
 @client.on(events.CallbackQuery(pattern=rb'^c:'))

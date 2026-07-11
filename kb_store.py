@@ -378,7 +378,8 @@ class SqliteVecStore:
         return self.db.execute('''
             SELECT fw.device_model, fw.version, f.name, f.chat_id, f.msg_id,
                    f.date, fw.confidence,
-                   CASE WHEN d.kind = 'series' THEN 1 ELSE 0 END AS is_series
+                   CASE WHEN d.kind = 'series' THEN 1 ELSE 0 END AS is_series,
+                   f.md5, f.doc_id
             FROM firmware fw
             JOIN files f ON f.doc_id = fw.doc_id
             LEFT JOIN devices d ON d.model = fw.device_model
@@ -392,6 +393,12 @@ class SqliteVecStore:
                         WHERE kind = 'series' AND model_norm LIKE :like))
             ORDER BY fw.device_model, fw.version_key DESC, f.date DESC
             LIMIT :lim''', {'like': f'%{norm}%', 'lim': limit}).fetchall()
+
+    def file_by_doc_id(self, doc_id: int):
+        """(name, md5, chat_id, msg_id) или None — для отправки файла ботом."""
+        return self.db.execute(
+            'SELECT name, md5, chat_id, msg_id FROM files WHERE doc_id=?',
+            (doc_id,)).fetchone()
 
     def upsert_device(self, model: str, kind: str = 'model', parent: str = '',
                       source: str = 'llm', confirmed: int = 0) -> None:

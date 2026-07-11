@@ -52,11 +52,14 @@ services:
       KB_GAPS_TOPIC_ID: ${KB_GAPS_TOPIC_ID:-}
       KB_DB_PATH: /app/kb/kb.sqlite
       KB_BOT_SESSION: /app/kb/kb_bot
+      DOWNLOAD_FOLDER: /app/downloads
       EMBED_MODEL: ${EMBED_MODEL:-text-embedding-3-small}
       EMBED_DIM: ${EMBED_DIM:-512}
       ANSWER_MODEL: ${ANSWER_MODEL:-gpt-5-mini}
     volumes:
       - /volume1/docker/tg-kb:/app/kb
+      # read-only: бот только отдаёт файлы по кнопке 📎 в /fw, пишет — качалка
+      - /volume1/public/Repository/Hardware/Huawei/fromChat:/app/downloads:ro
     logging: &default-logging
       driver: json-file
       options:
