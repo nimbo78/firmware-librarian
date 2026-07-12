@@ -168,6 +168,37 @@ def parse_firmware_name(name: str) -> tuple[list[str], str, str]:
     return models, version, key
 
 
+# Категории верхнего уровня для навигации /fw (как разделы на support.huawei):
+# детерминированно по префиксу модели, порядок проверок важен (S — последним
+# среди букв, чтобы не съесть SMARTKIT; AP раньше AR не нужен — разные буквы)
+PRODUCT_CATEGORIES = ['Коммутаторы', 'WLAN', 'Роутеры', 'Доступ (OLT/ONT)',
+                      'СХД', 'Серверы', 'Безопасность', 'ПО и инструменты',
+                      'Прочее']
+
+
+def product_category(model: str) -> str:
+    m = model.upper()
+    if m.startswith(('IMASTER', 'SMARTKIT', 'EASYSUITE', 'EASYOPS', 'ESIGHT',
+                     'DCUPDATECHECK', 'SMARTDC', 'CLOUDLINK', 'FUSIONSPHERE',
+                     'FUSIONSERVER', 'IBMA', 'UEN', 'STORAGE')):
+        return 'ПО и инструменты'
+    if m.startswith('OCEANSTOR'):
+        return 'СХД'
+    if m.startswith(('AC', 'AIRENGINE', 'AP', 'WA', 'WX')):
+        return 'WLAN'
+    if m.startswith(('MA', 'OLT', 'HG', 'EG')):
+        return 'Доступ (OLT/ONT)'
+    if m.startswith(('NE', 'CX', 'AR', 'ATN', 'NETENGINE')):
+        return 'Роутеры'
+    if m.startswith('USG'):
+        return 'Безопасность'
+    if m.startswith(('CH', 'XH', 'RH')) or re.match(r'\d{4}', m):
+        return 'Серверы'
+    if m.startswith(('CE', 'CLOUDENGINE', 'S')):
+        return 'Коммутаторы'
+    return 'Прочее'
+
+
 _SIGNATURE_RE = re.compile(r'\.(asc|p7s|cms|crl)(\.(asc|p7s))?$', re.IGNORECASE)
 _DOC_WORDS_RE = re.compile(
     r'guide|documentation|description|matrix|password|acceptance|training'
@@ -363,6 +394,15 @@ def _selftest() -> None:
     _, _, k_old = parse_firmware_name('MA5608T_V800R017C10SPC200.zip')
     _, _, k_new = parse_firmware_name('MA5608T_V800R018C10SPC500.zip')
     assert k_new > k_old, (k_old, k_new)
+
+    # категории навигации
+    assert product_category('S5735-L') == 'Коммутаторы'
+    assert product_category('SMARTKIT') == 'ПО и инструменты'
+    assert product_category('AC6805') == 'WLAN'
+    assert product_category('MA5800') == 'Доступ (OLT/ONT)'
+    assert product_category('1288H-V5') == 'Серверы'
+    assert product_category('OCEANSTOR-DORADO') == 'СХД'
+    assert product_category('CX600-M2') == 'Роутеры'
 
     # классификатор типов: подписи — почти половина журнала, режем из выдачи
     assert classify_name('AC6805V200R022C10SPC100.cc.p7s') == 'signature'

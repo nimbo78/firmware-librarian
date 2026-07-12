@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 
 from telethon import Button, TelegramClient, events
 
-from kb_firmware import split_query
+from kb_firmware import PRODUCT_CATEGORIES, product_category, split_query
 from kb_ingest import embed_texts, openai_client
 from kb_store import open_store
 from tg_conn import proxy_kwargs
@@ -51,7 +51,7 @@ ADMIN_HELP = (
     '/status — база, стоимость, курсоры инжеста\n'
     '/events — последние 20 событий\n'
     '/gaps — вопросы без ответа или с 👎\n'
-    '/fw <модель> — прошивки из каталога\n'
+    '/fw [модель] — каталог: без аргумента — навигация по разделам\n'
     '/review — подтвердить связки каталога (LLM-экстракция)\n'
     '/ingest — внеплановый инжест сейчас (не ждать ночи)\n'
     '/notify on|off — уведомления о событиях в личку\n'
@@ -229,11 +229,102 @@ async def _fw_llm_match(query: str) -> tuple[list[str], list[int]]:
     return models, doc_ids[:10]
 
 
+# ── Навигация каталога кнопками: категория → модель → ветка R → файлы ──
+NAV_PAGE_SIZE = 14
+
+
+def _nav_tree() -> dict:
+    """Категория -> {модель -> {rkey(9 симв. version_key) -> счётчик}}."""
+    tree: dict = {}
+    for model, vkey in store.fw_all():
+        cat = product_category(model)
+        rkey = (vkey or '')[:9] or '-'
+        tree.setdefault(cat, {}).setdefault(model, {})
+        tree[cat][model][rkey] = tree[cat][model].get(rkey, 0) + 1
+    return tree
+
+
+def _nav_root_view() -> tuple[str, list]:
+    tree = _nav_tree()
+    if not tree:
+        return 'Каталог пока пуст — файлы появятся после инжеста.', []
+    buttons = []
+    for ci, cat in enumerate(PRODUCT_CATEGORIES):
+        models = tree.get(cat)
+        if models:
+            n_files = sum(sum(r.values()) for r in models.values())
+            buttons.append([Button.inline(
+                f'{cat} · {len(models)} моделей · {n_files} файлов',
+                f'n:c:{ci}:0'.encode())])
+    return ('Каталог прошивок и документации. Выбери раздел '
+            '(или сразу /fw <модель>):'), buttons
+
+
+def _nav_category_view(ci: int, page: int) -> tuple[str, list]:
+    cat = PRODUCT_CATEGORIES[ci]
+    models = sorted(_nav_tree().get(cat, {}).items())
+    if not models:
+        return f'{cat}: пусто.', [[Button.inline('⬅️ Разделы', b'n:r')]]
+    start = page * NAV_PAGE_SIZE
+    chunk = models[start:start + NAV_PAGE_SIZE]
+    buttons = []
+    for i in range(0, len(chunk), 2):  # по две модели в ряд
+        row = [Button.inline(f'{m} ({sum(r.values())})', f'n:m:{m}'.encode())
+               for m, r in chunk[i:i + 2]]
+        buttons.append(row)
+    nav_row = []
+    if page > 0:
+        nav_row.append(Button.inline('◀️', f'n:c:{ci}:{page - 1}'.encode()))
+    nav_row.append(Button.inline('⬅️ Разделы', b'n:r'))
+    if start + NAV_PAGE_SIZE < len(models):
+        nav_row.append(Button.inline('▶️', f'n:c:{ci}:{page + 1}'.encode()))
+    buttons.append(nav_row)
+    pages = (len(models) - 1) // NAV_PAGE_SIZE + 1
+    return f'{cat} — модели ({page + 1}/{pages}):', buttons
+
+
+def _nav_model_view(model: str) -> tuple[str, list]:
+    branches = {}
+    for m, rkeys in _nav_tree().get(product_category(model), {}).items():
+        if m == model:
+            branches = rkeys
+    if not branches:
+        return f'{model}: файлов нет.', [[Button.inline('⬅️ Разделы', b'n:r')]]
+    ci = PRODUCT_CATEGORIES.index(product_category(model))
+    buttons = []
+    for rkey in sorted(branches, reverse=True):
+        # человекочитаемая ветка: '0600.0025' -> 'V600 R025'
+        label = ('без версии' if rkey == '-' else
+                 f'V{int(rkey[:4])} R{rkey[5:9].lstrip("0") or "0"}')
+        buttons.append([Button.inline(f'{label} · {branches[rkey]} файл(ов)',
+                                      f'n:v:{model}:{rkey}'.encode())])
+    buttons.append([Button.inline('⬅️ Модели', f'n:c:{ci}:0'.encode())])
+    return f'{model} — ветки версий:', buttons
+
+
+def _nav_files_view(model: str, rkey: str) -> tuple[str, list]:
+    rows = store.find_firmware_exact(model, '' if rkey == '-' else rkey)
+    if rkey == '-':
+        rows = [r for r in rows if not r[1]]
+    text = _format_fw(rows, model)
+    buttons = []
+    seen: set[int] = set()
+    for row in rows:
+        md5, doc_id, name = row[8], row[9], row[2]
+        if md5 and doc_id not in seen and len(buttons) < 10:
+            seen.add(doc_id)
+            buttons.append([Button.inline(f'📎 {name[:40]}',
+                                          f'g:{doc_id}'.encode())])
+    buttons.append([Button.inline('⬅️ Ветки версий', f'n:m:{model}'.encode())])
+    return text, buttons
+
+
 async def _handle_fw(event, text: str) -> None:
     parts = text.split(maxsplit=1)
     arg = parts[1].strip() if len(parts) > 1 else ''
     if not arg:
-        await event.reply('Укажи модель: /fw MA5608T (можно часть: /fw 5735)')
+        nav_text, nav_buttons = _nav_root_view()
+        await event.reply(nav_text, buttons=nav_buttons or None)
         return
     # 'S5735-S-V2 R025': версия отдельным словом — фильтр, а не часть модели
     model_query, version_tokens = split_query(arg)
@@ -528,6 +619,36 @@ async def handler(event):
         return
     _last_ask[event.sender_id] = now
     await _send_answer(event, question)
+
+
+@client.on(events.CallbackQuery(pattern=rb'^n:'))
+async def on_nav(event):
+    """Кнопки навигации каталога (/fw без аргументов)."""
+    if event.chat_id not in ANSWER_CHAT_IDS and event.sender_id not in ADMIN_IDS:
+        await event.answer()
+        return
+    try:
+        parts = event.data.decode().split(':')
+        kind = parts[1]
+        if kind == 'r':
+            text, buttons = _nav_root_view()
+        elif kind == 'c':
+            text, buttons = _nav_category_view(int(parts[2]), int(parts[3]))
+        elif kind == 'm':
+            text, buttons = _nav_model_view(parts[2])
+        elif kind == 'v':
+            text, buttons = _nav_files_view(parts[2], parts[3])
+        else:
+            await event.answer()
+            return
+        await event.edit(text[:4000], buttons=buttons or None,
+                         link_preview=False)
+    except Exception as e:
+        logger.warning('nav callback failed: %s', e)
+        try:
+            await event.answer()
+        except Exception:
+            pass
 
 
 @client.on(events.CallbackQuery(pattern=rb'^a:'))

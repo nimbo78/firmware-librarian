@@ -420,6 +420,28 @@ class SqliteVecStore:
             ORDER BY fw.device_model, fw.version_key DESC, f.date DESC
             LIMIT :lim''', {'like': f'%{norm}%', 'lim': limit}).fetchall()
 
+    def fw_all(self) -> list[tuple]:
+        """(device_model, version_key) без подписей — дерево навигации /fw."""
+        return self.db.execute('''
+            SELECT fw.device_model, fw.version_key
+            FROM firmware fw JOIN files f ON f.doc_id = fw.doc_id
+            WHERE f.kind != 'signature' ''').fetchall()
+
+    def find_firmware_exact(self, model: str, vkey_prefix: str = '',
+                            limit: int = 60) -> list[tuple]:
+        """Файлы конкретной модели (и ветки версий) — лист дерева навигации.
+        Формат строк совпадает с find_firmware."""
+        return self.db.execute('''
+            SELECT fw.device_model, fw.version, f.name, f.chat_id, f.msg_id,
+                   f.date, fw.confidence,
+                   0 AS is_series, f.md5, f.doc_id, f.kind
+            FROM firmware fw
+            JOIN files f ON f.doc_id = fw.doc_id
+            WHERE f.kind != 'signature' AND fw.device_model = ?
+              AND fw.version_key LIKE ? || '%'
+            ORDER BY fw.version_key DESC, f.date DESC
+            LIMIT ?''', (model, vkey_prefix, limit)).fetchall()
+
     def file_by_doc_id(self, doc_id: int):
         """(name, md5, chat_id, msg_id, date) или None."""
         return self.db.execute(
