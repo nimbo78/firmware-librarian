@@ -40,12 +40,12 @@ model {
 
     downloader = container 'telegram-file-downloader' {
       technology 'Python 3.13 · Telethon · user-сессия bot.session'
-      description 'Скачивает документы из CHAT_IDS (дедуп имя+MD5), каталогизирует ВСЕ документы наблюдаемых чатов. Ночной пайплайн в INGEST_HOUR: инжест чатов → PDF → LLM-экстракция каталога → бэкап. Одна сессия = один процесс, поэтому всё здесь.'
+      description 'Скачивает документы из CHAT_IDS (дедуп имя+MD5), каталогизирует ВСЕ документы наблюдаемых чатов. Пайплайн в INGEST_HOUR или по /ingest: инжест чатов → каталог (md5-линковка, файлы-сироты из журнала, reparse имён) → PDF → LLM-экстракция → бэкап. Одна сессия = один процесс, поэтому всё здесь.'
     }
 
     kbbot = container 'kb-bot' {
       technology 'Python 3.13 · Telethon · bot-токен BotFather'
-      description 'RAG-ответы (/ask, @mention) с оценками 👍/👎, каталог прошивок (/fw c сериями), админ-канал (уведомления + команды), /review для LLM-связок, петля gaps: недельный пост «помогите сообществу» и авто-ответ авторам после инжеста.'
+      description 'RAG-ответы (/ask, @mention) с оценками 👍/👎 и цитатами только на упомянутые источники; каталог прошивок /fw: серии, версия-фильтр в запросе, LLM-fallback по моделям и именам файлов, кнопки 📎 (отправка файла с NAS, MTProto до 2 ГБ); админ-канал (уведомления, /status, /review, /ingest); петля gaps.'
     }
 
     kbdb = datastore 'kb.sqlite' {
@@ -54,8 +54,8 @@ model {
     }
 
     downloads = datastore 'Том загрузок' {
-      technology '/volume1/public/Repository/Hardware/Huawei/fromChat'
-      description 'Скачанные файлы + downloaded_files.txt (журнал дедупликации). PDF отсюда индексируются в базу при KB_PDF=1.'
+      technology '/volume1/public/Repository/Hardware/Huawei/fromChat (в kb-bot — read-only)'
+      description 'Скачанные файлы + downloaded_files.txt (журнал дедупликации — источник md5 и файлов-«сирот» для каталога). PDF отсюда индексируются при KB_PDF=1; kb-bot отдаёт файлы по кнопке 📎.'
     }
   }
 
@@ -96,13 +96,28 @@ views {
   }
 
   dynamic view flow_ingest {
-    title 'Сценарий: ночной пайплайн (INGEST_HOUR)'
-    downloader -> kbdb 'читает last_seen_id:<chat_id>'
+    title 'Сценарий: пайплайн инжеста (INGEST_HOUR или /ingest админа)'
+    admin -> telegram '/ingest или кнопка в /status (опционально)'
+    telegram -> kbbot 'команда/callback → state ingest_request'
+    downloader -> kbdb 'минутный тик: настал час или взведён ingest_request'
     downloader -> telegram 'iter_messages от last_seen_id, названия топиков'
     downloader -> openai 'vision/whisper для медиа (по флагам, с кэшем), эмбеддинги новых чанков'
-    downloader -> kbdb 'upsert чанков, сдвиг state'
-    downloader -> openai 'LLM-экстракция: подписи файлов без связок, таксономия серий'
+    downloader -> kbdb 'upsert чанков, сдвиг state; каталог: md5-линковка, сироты из журнала, reparse имён'
+    downloader -> openai 'LLM-экстракция: имена/подписи файлов без связок, таксономия серий'
     downloader -> kbdb 'firmware (medium) + devices; событие «N записей ждут /review»; backup'
+  }
+
+  dynamic view flow_fw {
+    title 'Сценарий: /fw — поиск и выдача прошивки'
+    member -> telegram '/fw S5735-S-V2 R025'
+    telegram -> kbbot 'событие NewMessage'
+    kbbot -> kbdb 'split_query: модель → поиск (+серии), R025 → фильтр версии'
+    kbbot -> openai 'пусто? LLM-fallback: запрос против моделей и имён файлов'
+    kbbot -> kbdb 'выдача по подобранным моделям/файлам (пометка «подобрано LLM»)'
+    kbbot -> telegram 'список версий + ссылки на посты + кнопки 📎'
+    member -> telegram 'нажатие 📎'
+    telegram -> kbbot 'CallbackQuery g:<doc_id>'
+    kbbot -> telegram 'send_file с тома NAS (MTProto, до 2 ГБ)'
   }
 
   dynamic view flow_ask {
