@@ -158,19 +158,24 @@ def _format_fw(rows: list, query: str) -> str:
     if not rows:
         return (f'Прошивок по запросу «{query}» в каталоге нет. '
                 f'Каталог наполняется из имён файлов в чатах.')
+    kind_marks = {'doc': ' · 📄', 'release_notes': ' · 📄 RN',
+                  'mib': ' · MIB', 'tool': ' · 🛠', 'patch': ' · патч'}
     out = [f'Прошивки по запросу «{query}»:']
     current_model = None
     latest_marked = False
-    for model, version, name, chat_id, msg_id, date, confidence, is_series, _md5, _doc in rows:
+    for (model, version, name, chat_id, msg_id, date, confidence, is_series,
+         _md5, _doc, kind) in rows:
         if model != current_model:
             suffix = ' (вся серия — проверь совместимость!)' if is_series else ''
             out.append(f'\n{model}{suffix}:')
             current_model = model
             latest_marked = False
         mark = ''
-        if version and not latest_marked:
+        # «последняя» — только про сам софт, доки/патчи вне конкурса
+        if version and not latest_marked and kind in ('software', ''):
             mark = ' — последняя'
             latest_marked = True
+        mark += kind_marks.get(kind, '')
         if confidence != 'high':
             mark += ' · не подтверждено'
         ver = version or 'версия не распознана'
@@ -191,7 +196,7 @@ async def _fw_llm_match(query: str) -> tuple[list[str], list[int]]:
     if not os.getenv('OPENAI_API_KEY'):
         return [], []
     known = store.all_models()
-    files = store.all_files()
+    files = store.all_files(skip_signatures=True)
     if not known and not files:
         return [], []
     file_list = '\n'.join(f'{i}: {name}' for i, (_, name) in enumerate(files))

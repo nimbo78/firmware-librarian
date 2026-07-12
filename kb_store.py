@@ -109,6 +109,7 @@ class SqliteVecStore:
             # Каталог документов из чатов: ключ — telegram document id.
             # md5 дозаписывается после физического скачивания качалкой.
             # llm_done: подпись уже прогонялась через LLM-экстракцию (фаза B).
+            # kind: signature/software/patch/doc/... (kb_firmware.classify_name)
             self.db.execute('''
                 CREATE TABLE IF NOT EXISTS files(
                     doc_id INTEGER PRIMARY KEY,
@@ -120,7 +121,8 @@ class SqliteVecStore:
                     caption TEXT NOT NULL DEFAULT '',
                     topic_name TEXT NOT NULL DEFAULT '',
                     date TEXT NOT NULL DEFAULT '',
-                    llm_done INTEGER NOT NULL DEFAULT 0
+                    llm_done INTEGER NOT NULL DEFAULT 0,
+                    kind TEXT NOT NULL DEFAULT ''
                 )''')
             # Устройства и серии (фаза B): S5735-L (kind=model, parent=S5700),
             # S5700 (kind=series). Низкоуверенные связки ждут /review.
@@ -166,6 +168,7 @@ class SqliteVecStore:
         # Миграции старых баз (ALTER падает, если колонка есть)
         for stmt in (
             "ALTER TABLE files ADD COLUMN llm_done INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE files ADD COLUMN kind TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE qa_log ADD COLUMN msg_id INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE qa_log ADD COLUMN gap_posted INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE qa_log ADD COLUMN gap_closed INTEGER NOT NULL DEFAULT 0",
@@ -332,25 +335,32 @@ class SqliteVecStore:
 
     def upsert_file(self, doc_id: int, name: str, size: int, md5: str,
                     chat_id: int, msg_id: int, caption: str,
-                    topic_name: str, date: str) -> None:
+                    topic_name: str, date: str, kind: str = '') -> None:
         with self.db:
             self.db.execute('''
                 INSERT INTO files(doc_id, name, size, md5, chat_id, msg_id,
-                                  caption, topic_name, date)
-                VALUES(?,?,?,?,?,?,?,?,?)
+                                  caption, topic_name, date, kind)
+                VALUES(?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(doc_id) DO UPDATE SET
                     md5 = CASE WHEN excluded.md5 != ''
                                THEN excluded.md5 ELSE files.md5 END,
                     caption = CASE WHEN excluded.caption != ''
                                    THEN excluded.caption ELSE files.caption END,
                     topic_name = CASE WHEN excluded.topic_name != ''
-                                      THEN excluded.topic_name ELSE files.topic_name END
+                                      THEN excluded.topic_name ELSE files.topic_name END,
+                    kind = CASE WHEN excluded.kind != ''
+                                THEN excluded.kind ELSE files.kind END
                 ''', (doc_id, name, size, md5, chat_id, msg_id,
-                      caption, topic_name, date))
+                      caption, topic_name, date, kind))
 
     def set_file_md5(self, doc_id: int, md5: str) -> None:
         with self.db:
             self.db.execute('UPDATE files SET md5=? WHERE doc_id=?', (md5, doc_id))
+
+    def set_file_kind(self, doc_id: int, kind: str) -> None:
+        with self.db:
+            self.db.execute('UPDATE files SET kind=? WHERE doc_id=?',
+                            (kind, doc_id))
 
     def upsert_firmware(self, doc_id: int, device_model: str, version: str,
                         version_key: str, source: str = 'filename',
@@ -367,9 +377,12 @@ class SqliteVecStore:
                       source, confidence))
             return cur.rowcount == 1
 
-    def all_files(self) -> list[tuple]:
-        """(doc_id, name) всего каталога — для reparse_files."""
-        return self.db.execute('SELECT doc_id, name FROM files').fetchall()
+    def all_files(self, with_kind: bool = False,
+                  skip_signatures: bool = False) -> list[tuple]:
+        """(doc_id, name[, kind]) каталога — reparse_files и LLM-матчинг."""
+        cols = 'doc_id, name, kind' if with_kind else 'doc_id, name'
+        where = "WHERE kind != 'signature'" if skip_signatures else ''
+        return self.db.execute(f'SELECT {cols} FROM files {where}').fetchall()
 
     def all_models(self) -> list[str]:
         """Все известные модели и серии — словарь для LLM-fallback в /fw."""
@@ -391,18 +404,19 @@ class SqliteVecStore:
             SELECT fw.device_model, fw.version, f.name, f.chat_id, f.msg_id,
                    f.date, fw.confidence,
                    CASE WHEN d.kind = 'series' THEN 1 ELSE 0 END AS is_series,
-                   f.md5, f.doc_id
+                   f.md5, f.doc_id, f.kind
             FROM firmware fw
             JOIN files f ON f.doc_id = fw.doc_id
             LEFT JOIN devices d ON d.model = fw.device_model
-            WHERE fw.model_norm LIKE :like
+            WHERE f.kind != 'signature'
+              AND (fw.model_norm LIKE :like
                OR fw.device_model IN (
                     SELECT parent FROM devices
                     WHERE model_norm LIKE :like AND parent != '')
                OR fw.device_model IN (
                     SELECT model FROM devices WHERE parent IN (
                         SELECT model FROM devices
-                        WHERE kind = 'series' AND model_norm LIKE :like))
+                        WHERE kind = 'series' AND model_norm LIKE :like)))
             ORDER BY fw.device_model, fw.version_key DESC, f.date DESC
             LIMIT :lim''', {'like': f'%{norm}%', 'lim': limit}).fetchall()
 
@@ -435,7 +449,7 @@ class SqliteVecStore:
         быть пустой — новые схемы имён ловятся и без неё)."""
         return self.db.execute('''
             SELECT doc_id, name, caption FROM files
-            WHERE llm_done = 0
+            WHERE llm_done = 0 AND kind != 'signature'
               AND doc_id NOT IN (SELECT doc_id FROM firmware)
             ORDER BY doc_id LIMIT ?''', (limit,)).fetchall()
 

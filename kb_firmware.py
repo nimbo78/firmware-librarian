@@ -14,21 +14,52 @@ from datetime import datetime
 
 _MD5_RE = re.compile(r'^[0-9a-f]{32}$')
 
-# S5735-L, S5735-V2 (поколение железа!), MA5608T, HG8145V5, AR3260,
-# CE6857-48S6CQ-EI, NE40E, USG6300, AirEngine9700-M, NetEngine8000-M8…
+# S5735-L, S5735-V2 (поколение железа!), MA5608T, HG8145V5, AR3260, AC6805,
+# CE6857-48S6CQ-EI, NE40E, CX600-M2, USG6300, AirEngine9700-M, AirEngineX761…
 # Длинные словесные префиксы стоят в альтернативе первыми, чтобы короткие
-# (NE, AR) не перехватывали их начало. Сегменты суффикса ограничены
-# 6 символами и не могут начинаться с ВЕРСИИ V<цифры>R<цифра> — иначе жадный
-# матч съедает версию ('S5735-L-V200R019...' → модель S5735-L); при этом
-# короткое '-V2' (второе поколение) — легитимная часть модели. Границы —
-# lookaround вместо \b: '_' в именах файлов является словесным символом,
-# и 'MA5608T_V800…' с \b не матчится.
+# (NE, AR) не перехватывали их начало; словесные префиксы допускают
+# разделитель перед номером ('CloudEngine 5882'). Сегменты суффикса
+# ограничены 6 символами и не могут начинаться с ВЕРСИИ V<цифры>R<цифра> —
+# иначе жадный матч съедает версию ('S5735-L-V200R019...' → модель S5735-L);
+# при этом короткое '-V2' (второе поколение) — легитимная часть модели.
+# Границы — lookaround вместо \b: '_' в именах файлов является словесным
+# символом, и 'MA5608T_V800…' с \b не матчится.
 MODEL_RE = re.compile(
     r'(?<![A-Z0-9])'
-    r'((?:AIRENGINE|CLOUDENGINE|NETENGINE|OCEANSTOR|USG|ATN|OLT'
-    r'|MA|HG|EG|AR|CE|NE|AP)\d{3,5}[A-Z0-9]*(?:-(?!V\d{1,4}R\d)[A-Z0-9]{1,6})*'
-    r'|S\d{4}(?:-(?!V\d{1,4}R\d)[A-Z0-9]{1,6})*)'
+    r'((?:(?:AIRENGINEX|AIRENGINE|CLOUDENGINE|NETENGINE|OCEANSTOR)[ _-]?'
+    r'|USG|ATN|OLT|MA|HG|EG|AR|CE|NE|AP|AC|CX)'
+    r'\d{3,5}[A-Z0-9]*(?:-(?!V\d{1,4}R\d)[A-Z0-9]{1,6})*'
+    r'|S\d{3,5}(?:SERIES)?[A-Z]{0,3}(?:-(?!V\d{1,4}R\d)[A-Z0-9]{1,6})*'
+    r'|UPS\d{3,5})'
     r'(?![A-Z0-9])')
+
+# Продукты-слова без числовой модели: софт-платформы, СХД, узкие семейства
+WORD_MODEL_RE = re.compile(
+    r'(?<![A-Z0-9])'
+    r'(IMASTER[ _]?NCE(?:[ _]?(?:CAMPUSINSIGHT|CAMPUS|FABRICINSIGHT'
+    r'|SERVERINSTALL|T))?'
+    r'|SMARTKIT|EASYSUITE|EASYOPS|ESIGHT|DCUPDATECHECK|SMARTDC|IBMA|UEN'
+    r'|CLOUDLINK(?:[ _](?:BOX[ _]?\d+|ENDPOINTS))?'
+    r'|FUSIONSPHERE(?:[ _]OPENSTACK)?|FUSIONSERVER(?:[ _]PRO)?'
+    r'|STORAGE[ _]MEDIUM'
+    r'|OCEANSTOR(?:[ _]DORADO)?)'
+    r'(?![A-Z0-9])')
+
+# Серверные узлы FusionServer: '1288H V5', '2288X V5', '5288 V3', 'CH242 V3',
+# 'XH321 V5', 'RH2288H V3' — Vn здесь поколение железа, версии софта свои
+SERVER_MODEL_RE = re.compile(
+    r'(?<![A-Z0-9])'
+    r'((?:[CXR]H\d{3,4}[A-Z]{0,2})|\d{4}[A-Z]{1,2}|\d{4})[ _-](V\d)'
+    r'(?![A-Z0-9])')
+
+# Бандлы «семейство + перечень номеров»: 'AirEngine 5700&6700&8700&9700D',
+# 'S200,_S300,_S500...', 'CloudEngine_5800&6800' → отдельная модель на номер
+BUNDLE_RE = re.compile(
+    r'(?<![A-Z0-9])'
+    r'(AIRENGINEX|AIRENGINE|CLOUDENGINE|NETENGINE|CE|AR|AC|S)[ _-]?'
+    r'(\d{3,5}[A-Z]{0,2}(?:[ _]*[&,][ _]*(?:AND[ _]+)?\d{3,5}[A-Z]{0,2})+)'
+    r'(?![A-Z0-9])')
+_BUNDLE_ITEM_RE = re.compile(r'\d{3,5}[A-Z]{0,2}')
 
 # Версионные токены в ЗАПРОСЕ пользователя ('R025', 'V600', 'SPC500'):
 # отделяются от модели и работают фильтром по версии, а не частью имени
@@ -55,34 +86,124 @@ def split_query(query: str) -> tuple[str, list[str]]:
         return query, []
     return ' '.join(model_parts), version_tokens
 
-# V800R018C10SPC500, V5R019C00S100 (ONT), V200R019C00SPC500H01 (патч)
+# V800R018C10SPC500, V5R019C00S100 (ONT), V200R024SPH1B0 (hex в патче),
+# V200R022HP1501 (hot patch), V200R019C00SPC500H01.
+# Lookbehind пропускает ЦИФРУ перед V — версия бывает приклеена к модели
+# без разделителя ('AC6805V200R022C10SPC100'); буква перед V блокируется.
 VERSION_RE = re.compile(
-    r'(?<![A-Z0-9])'
-    r'V(\d{1,4})R(\d{1,4})(?:C(\d{1,4}))?(?:(?:SPC|SPH|S)(\d{1,4}))?'
-    r'(?:H([A-Z0-9]{1,4}))?'
+    r'(?<![A-Z])'
+    r'V(\d{1,4})R(\d{1,4})(?:C(\d{1,4}))?'
+    r'(?:(?:SPC|SPH|HP|S)([0-9A-Z]{1,4}))?'
+    r'(?:H([0-9A-Z]{1,4}))?'
     r'(?![A-Z0-9])')
+
+# Точечные версии СХД/UC: '6.1.8.SPH30', '20.1.103.SPC28', '5.1.0.48'.
+# Хвостовой lookahead запрещает только продолжение цифрами (обрубок длинной
+# версии), а точку расширения ('…SPC28.zip') пропускает.
+DOTTED_VERSION_RE = re.compile(
+    r'(?<![0-9.])'
+    r'(\d{1,2})\.(\d{1,3})\.(\d{1,3})'
+    r'(?:\.?(?:SPC|SPH)?(\d{1,4}))?'
+    r'(?![0-9])(?!\.[0-9])')
+
+
+def _pad(token: str | None) -> str:
+    """Нулепаддинг компонента версии; буквенно-цифровые ('1B0') — zfill."""
+    if not token:
+        return '0000'
+    return f'{int(token):04d}' if token.isdigit() else token.zfill(4)
 
 
 def parse_firmware_name(name: str) -> tuple[list[str], str, str]:
     """(модели, версия, ключ сортировки версии).
 
-    Ключ — нулепаддинг компонентов V.R.C.SPC, лексикографическое сравнение
-    ключей корректно упорядочивает версии ('какая последняя').
+    Версия ищется ПЕРВОЙ и вырезается из строки — иначе жадный хвост модели
+    заглатывает приклеенную версию ('AC6805V200R022...'). Ключ — нулепаддинг
+    компонентов, лексикографическое сравнение упорядочивает версии.
     """
     up = name.upper()
-    models: list[str] = []
-    for m in MODEL_RE.finditer(up):
-        tok = m.group(1)
-        if tok not in models:
-            models.append(tok)
+    version = ''
+    key = ''
     vm = VERSION_RE.search(up)
-    if not vm:
-        return models, '', ''
-    v, r, c, spc, h = vm.groups()
-    key = f'{int(v):04d}.{int(r):04d}.{int(c or 0):04d}.{int(spc or 0):04d}'
-    if h:
-        key += f'.{h}'
-    return models, vm.group(0), key
+    if vm:
+        v, r, c, spc, h = vm.groups()
+        version = vm.group(0)
+        key = f'{_pad(v)}.{_pad(r)}.{_pad(c)}.{_pad(spc)}'
+        if h:
+            key += f'.{h.zfill(4)}'
+        up = up[:vm.start()] + '§' + up[vm.end():]
+    else:
+        dm = DOTTED_VERSION_RE.search(up)
+        if dm:
+            a, b, c2, d = dm.groups()
+            version = dm.group(0)
+            key = f'{_pad(a)}.{_pad(b)}.{_pad(c2)}.{_pad(d)}'
+            up = up[:dm.start()] + '§' + up[dm.end():]
+
+    models: list[str] = []
+
+    def add(tok: str) -> None:
+        tok = tok.strip(' _-')
+        tok = re.sub(r'SERIES$', '', tok)  # 'S9300SERIES' -> 'S9300'
+        if tok and tok not in models:
+            models.append(tok)
+
+    bundle_spans = []
+    for bm in BUNDLE_RE.finditer(up):
+        bundle_spans.append(bm.span())
+        prefix = bm.group(1)
+        for num in _BUNDLE_ITEM_RE.findall(bm.group(2)):
+            add(prefix + num)
+
+    def in_bundle(pos: int) -> bool:
+        return any(s <= pos < e for s, e in bundle_spans)
+
+    for m in MODEL_RE.finditer(up):
+        if not in_bundle(m.start()):
+            add(re.sub(r'[ _]+', '', m.group(1)))
+    for m in WORD_MODEL_RE.finditer(up):
+        add(re.sub(r'[ _]+', '-', m.group(1)))
+    for m in SERVER_MODEL_RE.finditer(up):
+        add(f'{m.group(1)}-{m.group(2)}')
+    return models, version, key
+
+
+_SIGNATURE_RE = re.compile(r'\.(asc|p7s|cms|crl)(\.(asc|p7s))?$', re.IGNORECASE)
+_DOC_WORDS_RE = re.compile(
+    r'guide|documentation|description|matrix|password|acceptance|training'
+    r'|introduction|report|notes|информац|материал', re.IGNORECASE)
+_PATCH_RE = re.compile(r'(?:sph|hp)[0-9a-z]{1,4}(?![a-z0-9])|\bpatch\b',
+                       re.IGNORECASE)
+
+
+def classify_name(name: str) -> str:
+    """Тип файла по имени: signature/patch/software/doc/release_notes/mib/tool.
+
+    Подписи (.asc/.p7s/.cms/.crl) — 40% журнала: в выдаче /fw это мусор,
+    поэтому classify первым делом отсекает их. Пустая строка = не определили.
+    """
+    low = name.lower()
+    if _SIGNATURE_RE.search(low):
+        return 'signature'
+    if re.search(r'(?<![a-z])mibs?(?![a-z])', low):
+        return 'mib'
+    if 'release note' in low or 'release_note' in low:
+        return 'release_notes'
+    if _DOC_WORDS_RE.search(low):
+        return 'doc'
+    if low.endswith('.pat') or _PATCH_RE.search(low):
+        return 'patch'
+    if re.search(r'smartkit|easysuite|easyops|dcupdatecheck|(?<![a-z])tool',
+                 low):
+        return 'tool'
+    if low.endswith(('.cc', '.bin', '.mod')) or '.web.' in low:
+        return 'software'
+    if low.endswith(('.docx', '.doc', '.pdf', '.xlsx', '.xls', '.txt',
+                     '.chm')):
+        return 'doc'
+    if low.endswith(('.zip', '.rar', '.7z', '.tar.gz')):
+        return 'software'
+    return ''
 
 
 def document_filename(msg) -> str | None:
@@ -105,7 +226,7 @@ def record_file(store, msg, file_name: str, topic_name: str = '',
         doc_id=doc.id, name=file_name, size=getattr(doc, 'size', 0) or 0,
         md5=md5, chat_id=msg.chat_id or 0, msg_id=msg.id,
         caption=(msg.raw_text or '')[:500], topic_name=topic_name,
-        date=f'{msg.date:%Y-%m-%d}')
+        date=f'{msg.date:%Y-%m-%d}', kind=classify_name(file_name))
     models, version, version_key = parse_firmware_name(file_name)
     for model in models:
         store.upsert_firmware(doc.id, model, version, version_key)
@@ -113,11 +234,15 @@ def record_file(store, msg, file_name: str, topic_name: str = '',
 
 def reparse_files(store) -> int:
     """Перепрогоняет разбор имён по ВСЕМУ каталогу. Нужен после улучшения
-    регулярок: старые записи files получают новые связки firmware без
-    повторного инжеста. Идемпотентен (PK + DO NOTHING), дёшев — регулярки
-    по нескольким тысячам имён. Возвращает число новых связок."""
+    регулярок: старые записи files получают новые связки firmware и типы
+    (kind) без повторного инжеста. Идемпотентен (PK + DO NOTHING), дёшев —
+    регулярки по нескольким тысячам имён. Возвращает число новых связок."""
     added = 0
-    for doc_id, name in store.all_files():
+    for row in store.all_files(with_kind=True):
+        doc_id, name, kind = row
+        new_kind = classify_name(name)
+        if new_kind and new_kind != kind:
+            store.set_file_kind(doc_id, new_kind)
         models, version, version_key = parse_firmware_name(name)
         for model in models:
             if store.upsert_firmware(doc_id, model, version, version_key):
@@ -178,7 +303,7 @@ def link_local_files(store, folder: str) -> int:
         mdate = datetime.fromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d')
         store.upsert_file(doc_id=doc_id, name=base, size=os.path.getsize(path),
                           md5=md5, chat_id=0, msg_id=0, caption='',
-                          topic_name='', date=mdate)
+                          topic_name='', date=mdate, kind=classify_name(base))
         models, version, version_key = parse_firmware_name(base)
         for model in models:
             store.upsert_firmware(doc_id, model, version, version_key)
@@ -199,6 +324,30 @@ def _selftest() -> None:
         # поколение -V2 — часть модели, а версия после '_' не заглатывается
         'S5735-V2_V600R025C00SPC500.cc': (['S5735-V2'], 'V600R025C00SPC500'),
         'S5735-S-V2_V600R025SPH120.PAT.asc': (['S5735-S-V2'], 'V600R025SPH120'),
+        # реальные кейсы из журнала: приклеенная версия, hex-патчи, hot patch
+        'AC6805V200R022C10SPC100.cc': (['AC6805'], 'V200R022C10SPC100'),
+        'AC6805_V200R022HP1501.pat': (['AC6805'], 'V200R022HP1501'),
+        'S5731-H_V200R024SPH1b0.pat': (['S5731-H'], 'V200R024SPH1B0'),
+        # семейство + пробел, серия '9300series', роутеры CX
+        'CloudEngine 5882 V200R023SPH150 Patch Release Notes(word).zip':
+            (['CLOUDENGINE5882'], 'V200R023SPH150'),
+        'S9300series_V200R021SPH257.pat': (['S9300'], 'V200R021SPH257'),
+        'CX600-M2 V800R011SPH110 Patch Release Notes.zip':
+            (['CX600-M2'], 'V800R011SPH110'),
+        'AirEngineX761-V200R025C00SPH001.pat':
+            (['AIRENGINEX761'], 'V200R025C00SPH001'),
+        # бандлы: перечень номеров с общим префиксом
+        'S3700&S5700&S6700_V200R024SPH1b0.7z':
+            (['S3700', 'S5700', 'S6700'], 'V200R024SPH1B0'),
+        'AirEngine 5700&6700&8700&9700D V200R023C00SPC100.zip':
+            (['AIRENGINE5700', 'AIRENGINE6700', 'AIRENGINE8700',
+              'AIRENGINE9700D'], 'V200R023C00SPC100'),
+        # серверы, софт-платформы, точечные версии СХД/UC
+        '1288H_V5_V100R005C00SPC272.zip': (['1288H-V5'], 'V100R005C00SPC272'),
+        'iMasterNCE_Campus_V300R022C00SPC202_Campus_Combine_linux_x86_64.zip':
+            (['IMASTERNCE-CAMPUS'], 'V300R022C00SPC202'),
+        'CloudLink Box 300 20.1.103.SPC28.zip':
+            (['CLOUDLINK-BOX-300'], '20.1.103.SPC28'),
         'SmartAX_MA5608T_V800R017C10.tar.gz': (['MA5608T'], 'V800R017C10'),
         'CE6857-48S6CQ-EI-V200R005C10SPC800.cc': (['CE6857-48S6CQ-EI'],
                                                   'V200R005C10SPC800'),
@@ -214,6 +363,18 @@ def _selftest() -> None:
     _, _, k_old = parse_firmware_name('MA5608T_V800R017C10SPC200.zip')
     _, _, k_new = parse_firmware_name('MA5608T_V800R018C10SPC500.zip')
     assert k_new > k_old, (k_old, k_new)
+
+    # классификатор типов: подписи — почти половина журнала, режем из выдачи
+    assert classify_name('AC6805V200R022C10SPC100.cc.p7s') == 'signature'
+    assert classify_name('EasyOps_V100R022C10HP0010.zip.cms.asc') == 'signature'
+    assert classify_name('S5731-H_V200R024SPH1b0.pat') == 'patch'
+    assert classify_name('AC6805V200R022C10SPC100.cc') == 'software'
+    assert classify_name('CE_V200R023C00SPC500_MIB.zip') == 'mib'
+    assert classify_name('AC V200R024SPH150 Patch Release Notes(word).zip') \
+        == 'release_notes'
+    assert classify_name('MA5800 Feature Guide 11PDF.zip') == 'doc'
+    assert classify_name('SmartKit_V100R023C00SPC521.zip') == 'tool'
+    assert classify_name('S3700&S5700&S6700_V200R024SPH1b0.7z') == 'patch'
 
     # разбор запроса: версия отдельным словом -> фильтр, -V2 внутри — модель
     assert split_query('S5735-S-V2 R025') == ('S5735-S-V2', ['R025'])
