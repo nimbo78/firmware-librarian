@@ -745,6 +745,22 @@ def _selftest() -> None:
         assert s['files'] == 5 and s['fw_models'] == 5, (s['files'], s['fw_models'])
         assert s['qa_7d'] == 2 and s['qa_bad_7d'] == 1 and s['qa_nohit_7d'] == 1
 
+        # файлы-сироты: в журнале и на диске, но без сообщения в каталоге
+        import kb_firmware
+        dl = os.path.join(tmp, 'downloads')
+        os.makedirs(dl)
+        orphan_md5 = 'c' * 32
+        with open(os.path.join(dl, 'S5731-H_V600R023C00SPC500.cc'), 'wb') as f:
+            f.write(b'x')
+        with open(os.path.join(dl, 'downloaded_files.txt'), 'w',
+                  encoding='utf-8') as f:
+            f.write(f'{orphan_md5},S5731-H_V600R023C00SPC500.cc\n')
+        assert kb_firmware.link_local_files(store, dl) == 1
+        orphan = store.find_firmware('S5731-H')
+        assert orphan and orphan[0][8] == orphan_md5, orphan  # md5 -> кнопка 📎
+        assert orphan[0][3] == 0, orphan  # chat_id=0: ссылки на пост нет
+        assert kb_firmware.link_local_files(store, dl) == 0  # идемпотентно
+
         bak = os.path.join(tmp, 'kb.bak')
         store.backup(bak)
         assert os.path.exists(bak)

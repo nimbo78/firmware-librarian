@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import datetime
 
 _MD5_RE = re.compile(r'^[0-9a-f]{32}$')
 
@@ -145,10 +146,16 @@ def _load_md5_journal(folder: str) -> dict:
 
 
 def link_local_files(store, folder: str) -> int:
-    """Проставляет files.md5 записям каталога, чьи файлы скачаны на NAS ещё
-    ДО появления каталога (md5 берётся из журнала дедупликации): без md5
-    кнопка 📎 в /fw не показывается. Идемпотентно — обрабатываются только
-    записи с пустым md5. Возвращает число привязанных файлов."""
+    """Синхронизация каталога с журналом дедупликации и диском. Идемпотентно.
+
+    1) Проставляет files.md5 записям каталога, чьи файлы скачаны на NAS ещё
+       ДО появления каталога: без md5 кнопка 📎 в /fw не показывается.
+    2) Файлы-«сироты»: есть в журнале и на диске, но сообщения-источника в
+       каталоге нет (удалено из чата, файл положили в папку руками) —
+       создаётся синтетическая запись. doc_id — ОТРИЦАТЕЛЬНЫЙ, из md5
+       (у telegram-документов id положительные, коллизий нет), chat_id=0 —
+       ссылки на пост не будет, но /fw найдёт и 📎 отправит.
+    Возвращает число привязанных/созданных файлов."""
     journal = _load_md5_journal(folder)
     if not journal:
         return 0
@@ -159,6 +166,23 @@ def link_local_files(store, folder: str) -> int:
         if md5 and os.path.exists(os.path.join(folder, base)):
             store.set_file_md5(doc_id, md5)
             linked += 1
+    known = {os.path.basename(n) for _, n in store.all_files()}
+    for name, md5 in journal.items():
+        base = os.path.basename(name)
+        if base in known:
+            continue
+        path = os.path.join(folder, base)
+        if not os.path.exists(path):
+            continue
+        doc_id = -int(md5[:12], 16)
+        mdate = datetime.fromtimestamp(os.path.getmtime(path)).strftime('%Y-%m-%d')
+        store.upsert_file(doc_id=doc_id, name=base, size=os.path.getsize(path),
+                          md5=md5, chat_id=0, msg_id=0, caption='',
+                          topic_name='', date=mdate)
+        models, version, version_key = parse_firmware_name(base)
+        for model in models:
+            store.upsert_firmware(doc_id, model, version, version_key)
+        linked += 1
     return linked
 
 
