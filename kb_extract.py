@@ -122,9 +122,9 @@ async def build_series(store, limit: int = 50) -> tuple[int, float]:
         series = str(mapping.get(model, '') or '').strip().upper()
         if series == model:
             series = ''  # модель «сама себе серия» — бесполезная связка
-        # без серии — сразу confirmed: нечего подтверждать
-        store.upsert_device(model, kind='model', parent=series,
-                            confirmed=0 if series else 1)
+        # серии авто-подтверждаются (низкий риск, решение владельца): не
+        # копим сотни записей в /review; неверную серию видно при навигации
+        store.upsert_device(model, kind='model', parent=series, confirmed=1)
         if series:
             store.upsert_device(series, kind='series', parent='', confirmed=1)
             added += 1

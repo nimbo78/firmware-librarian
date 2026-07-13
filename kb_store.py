@@ -515,6 +515,34 @@ class SqliteVecStore:
             else:
                 self.db.execute('DELETE FROM firmware WHERE rowid=?', (rowid,))
 
+    def medium_firmware_with_names(self) -> list[tuple]:
+        """(rowid, device_model, name) для связок confidence!=high — вход
+        авто-вычистки: те, что подтверждает разбор имени, снимаются."""
+        return self.db.execute('''
+            SELECT fw.rowid, fw.device_model, f.name
+            FROM firmware fw JOIN files f ON f.doc_id = fw.doc_id
+            WHERE fw.confidence != 'high' ''').fetchall()
+
+    def delete_firmware_row(self, rowid: int) -> None:
+        with self.db:
+            self.db.execute('DELETE FROM firmware WHERE rowid=?', (rowid,))
+
+    def confirm_all_firmware(self) -> int:
+        """Массовое подтверждение всех оставшихся medium-связок (кнопка
+        «принять всё» в /review). Возвращает число повышенных."""
+        with self.db:
+            cur = self.db.execute(
+                "UPDATE firmware SET confidence='high' WHERE confidence != 'high'")
+            return cur.rowcount
+
+    def confirm_all_series(self) -> int:
+        """Авто-подтверждение таксономии серий (низкий риск): убирает их из
+        очереди review. Возвращает число подтверждённых."""
+        with self.db:
+            cur = self.db.execute(
+                "UPDATE devices SET confirmed=1 WHERE confirmed=0 AND parent!=''")
+            return cur.rowcount
+
     def confirm_device(self, model: str, ok: bool) -> None:
         """Отклонение не удаляет строку (иначе LLM переспросит завтра),
         а фиксирует «серия неизвестна»."""
@@ -756,6 +784,26 @@ def _selftest() -> None:
         # MA5800 добавилась подтверждённой связкой и тоже ждёт таксономию
         assert store.models_without_device(limit=50) == ['MA5608T', 'MA5800', 'TEST1']
 
+        # авто-review: серии оптом, medium снимается парсером, остаток — оптом
+        store.upsert_device('S5735-S', kind='model', parent='S5700', confirmed=0)
+        store.upsert_device('S9999-X', kind='model', parent='S9900', confirmed=0)
+        assert store.pending_review_count() == 2
+        assert store.confirm_all_series() == 2  # обе серии подтверждены разом
+        assert store.pending_review_count() == 0
+        # medium для файла 444, чьё ИМЯ парсер разбирает в ту же модель S5735-L
+        # (версия иная — иначе PK-конфликт с high-записью и строка не создастся)
+        store.upsert_firmware(444, 'S5735-L', 'V300R001', '0300.0001.0000.0000',
+                              source='caption', confidence='medium')
+        import kb_firmware
+        assert kb_firmware.auto_resolve_firmware(store) == 1  # снято парсером
+        # medium для файла 555, чьё имя (fw_new_final2.zip) парсер не берёт
+        store.upsert_firmware(555, 'MA5900', 'V100R023', '0100.0023.0000.0000',
+                              source='caption', confidence='medium')
+        assert kb_firmware.auto_resolve_firmware(store) == 0  # не подтверждён
+        assert store.pending_review_count() == 1
+        assert store.confirm_all_firmware() == 1  # массовое подтверждение
+        assert store.pending_review_count() == 0
+
         # лог вопрос-ответ и оценки
         qa_id = store.log_qa(-1001234, 777, 'как прошить ONT?', 'вот так', True,
                              msg_id=100)
@@ -778,8 +826,8 @@ def _selftest() -> None:
         s = store.kb_stats()
         assert s['chunks'] == 2 and s['downloads_24h'] == 1  # 2: один чанк убрал prune
         assert abs(s['events_cost'] - 0.12) < 1e-9
-        # 5 моделей: MA5608T, S5700, S5735-L, MA5800 + тестовая TEST1
-        assert s['files'] == 5 and s['fw_models'] == 5, (s['files'], s['fw_models'])
+        # 6 моделей: MA5608T, S5700, S5735-L, MA5800, TEST1, MA5900 (авто-review)
+        assert s['files'] == 5 and s['fw_models'] == 6, (s['files'], s['fw_models'])
         assert s['qa_7d'] == 2 and s['qa_bad_7d'] == 1 and s['qa_nohit_7d'] == 1
 
         # файлы-сироты: в журнале и на диске, но без сообщения в каталоге

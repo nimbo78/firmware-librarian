@@ -463,10 +463,11 @@ async def handle_admin(event) -> None:
     elif low.startswith('/fw'):
         await _handle_fw(event, text)
     elif low.startswith('/review'):
-        fw_items, dev_items = store.review_items(5)
-        if not fw_items and not dev_items:
-            await event.reply('Нечего подтверждать.')
+        pending = store.pending_review_count()
+        if not pending:
+            await event.reply('Нечего подтверждать — каталог чист.')
             return
+        fw_items, dev_items = store.review_items(5)
         for rowid, model, version, fname, source in fw_items:
             btns = [[Button.inline('✅ верно', f'c:f:{rowid}:1'.encode()),
                      Button.inline('❌ нет', f'c:f:{rowid}:0'.encode())]]
@@ -478,6 +479,11 @@ async def handle_admin(event) -> None:
                      Button.inline('❌ нет', f'c:d:{model}:0'.encode())]]
             await event.reply(f'Серия: {model} принадлежит {parent}?',
                               buttons=btns)
+        # массовое подтверждение остатка — без тысячи кликов
+        await event.reply(
+            f'Всего на подтверждении: {pending}. Проверять поштучно не '
+            f'обязательно — можно принять всё разом:',
+            buttons=[[Button.inline(f'✅ Принять все {pending}', b'c:allfw')]])
     elif text.startswith('/') and not low.startswith('/ask'):
         await event.reply(ADMIN_HELP)
     else:
@@ -717,6 +723,10 @@ async def on_confirm(event):
         return
     try:
         parts = event.data.decode().split(':')
+        if parts[1] == 'allfw':  # массовое подтверждение остатка
+            n = store.confirm_all_firmware()
+            await event.edit(f'✅ Подтверждено связок разом: {n}', buttons=None)
+            return
         kind, key, ok = parts[1], parts[2], parts[3] == '1'
         if kind == 'f':
             store.confirm_firmware(int(key), ok)

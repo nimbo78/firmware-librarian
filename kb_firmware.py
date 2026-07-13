@@ -282,6 +282,24 @@ def record_file(store, msg, file_name: str, topic_name: str = '',
         store.upsert_firmware(doc.id, model, version, version_key)
 
 
+def _norm_model(s: str) -> str:
+    return re.sub(r'[^A-Z0-9]', '', s.upper())
+
+
+def auto_resolve_firmware(store) -> int:
+    """Снимает medium-связки, которые подтверждает детерминированный разбор
+    имени того же файла (парсер независимо нашёл ту же модель). Такая связка
+    избыточна — её уже представляет high-запись, созданная reparse_files.
+    Запускать ПОСЛЕ reparse_files. Возвращает число снятых связок."""
+    removed = 0
+    for rowid, model, name in store.medium_firmware_with_names():
+        det_models, _, _ = parse_firmware_name(name)
+        if _norm_model(model) in {_norm_model(m) for m in det_models}:
+            store.delete_firmware_row(rowid)
+            removed += 1
+    return removed
+
+
 def reparse_files(store) -> int:
     """Перепрогоняет разбор имён по ВСЕМУ каталогу. Нужен после улучшения
     регулярок: старые записи files получают новые связки firmware и типы
