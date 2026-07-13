@@ -421,9 +421,10 @@ class SqliteVecStore:
             LIMIT :lim''', {'like': f'%{norm}%', 'lim': limit}).fetchall()
 
     def fw_all(self) -> list[tuple]:
-        """(device_model, version_key) без подписей — дерево навигации /fw."""
+        """(device_model, version, version_key) без подписей — дерево /fw.
+        version нужен для человекочитаемой метки ветки (не из padded-ключа)."""
         return self.db.execute('''
-            SELECT fw.device_model, fw.version_key
+            SELECT fw.device_model, fw.version, fw.version_key
             FROM firmware fw JOIN files f ON f.doc_id = fw.doc_id
             WHERE f.kind != 'signature' ''').fetchall()
 

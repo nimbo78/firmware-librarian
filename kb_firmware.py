@@ -176,6 +176,25 @@ PRODUCT_CATEGORIES = ['Коммутаторы', 'WLAN', 'Роутеры', 'До�
                       'Прочее']
 
 
+_VR_LABEL_RE = re.compile(r'V(\d+)R(\d+)', re.IGNORECASE)
+_DOTTED_LABEL_RE = re.compile(r'(\d+)\.(\d+)')
+
+
+def version_branch_label(version: str) -> str:
+    """Короткая метка ветки версий для кнопки навигации, из СЫРОЙ версии
+    (не из padded-ключа): 'V600R025C00SPC500' -> 'V600 R025' (нули как у
+    Huawei), '6.1.8.SPH30' -> '6.1', '' -> 'без версии'."""
+    if not version:
+        return 'без версии'
+    m = _VR_LABEL_RE.search(version)
+    if m:
+        return f'V{m.group(1)} R{m.group(2)}'
+    m = _DOTTED_LABEL_RE.search(version)
+    if m:
+        return f'{m.group(1)}.{m.group(2)}'
+    return version[:16]
+
+
 def product_category(model: str) -> str:
     m = model.upper()
     if m.startswith(('IMASTER', 'SMARTKIT', 'EASYSUITE', 'EASYOPS', 'ESIGHT',
@@ -394,6 +413,13 @@ def _selftest() -> None:
     _, _, k_old = parse_firmware_name('MA5608T_V800R017C10SPC200.zip')
     _, _, k_new = parse_firmware_name('MA5608T_V800R018C10SPC500.zip')
     assert k_new > k_old, (k_old, k_new)
+
+    # метки веток версий: нули как у Huawei, точечные версии не как V/R
+    assert version_branch_label('V600R025C00SPC500') == 'V600 R025'
+    assert version_branch_label('V200R024SPH1B0') == 'V200 R024'
+    assert version_branch_label('6.1.8.SPH30') == '6.1'
+    assert version_branch_label('20.1.103.SPC28') == '20.1'
+    assert version_branch_label('') == 'без версии'
 
     # категории навигации
     assert product_category('S5735-L') == 'Коммутаторы'

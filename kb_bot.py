@@ -16,7 +16,8 @@ from datetime import datetime, timedelta
 
 from telethon import Button, TelegramClient, events
 
-from kb_firmware import PRODUCT_CATEGORIES, product_category, split_query
+from kb_firmware import (PRODUCT_CATEGORIES, product_category, split_query,
+                         version_branch_label)
 from kb_ingest import embed_texts, openai_client
 from kb_store import open_store
 from tg_conn import proxy_kwargs
@@ -234,14 +235,23 @@ NAV_PAGE_SIZE = 14
 
 
 def _nav_tree() -> dict:
-    """Категория -> {модель -> {rkey(9 симв. version_key) -> счётчик}}."""
+    """Категория -> {модель -> {rkey(9 симв. version_key) -> (счётчик, метка)}}.
+    Метка ветки берётся из сырой версии (version_branch_label), не из ключа."""
     tree: dict = {}
-    for model, vkey in store.fw_all():
+    for model, version, vkey in store.fw_all():
         cat = product_category(model)
         rkey = (vkey or '')[:9] or '-'
-        tree.setdefault(cat, {}).setdefault(model, {})
-        tree[cat][model][rkey] = tree[cat][model].get(rkey, 0) + 1
+        node = tree.setdefault(cat, {}).setdefault(model, {})
+        if rkey in node:
+            node[rkey] = (node[rkey][0] + 1, node[rkey][1])
+        else:
+            node[rkey] = (1, version_branch_label(version))
     return tree
+
+
+def _branch_files(branch: dict) -> int:
+    """Сумма файлов по всем веткам модели (значения — (счётчик, метка))."""
+    return sum(cnt for cnt, _ in branch.values())
 
 
 def _nav_root_view() -> tuple[str, list]:
@@ -252,7 +262,7 @@ def _nav_root_view() -> tuple[str, list]:
     for ci, cat in enumerate(PRODUCT_CATEGORIES):
         models = tree.get(cat)
         if models:
-            n_files = sum(sum(r.values()) for r in models.values())
+            n_files = sum(_branch_files(r) for r in models.values())
             buttons.append([Button.inline(
                 f'{cat} · {len(models)} моделей · {n_files} файлов',
                 f'n:c:{ci}:0'.encode())])
@@ -269,7 +279,7 @@ def _nav_category_view(ci: int, page: int) -> tuple[str, list]:
     chunk = models[start:start + NAV_PAGE_SIZE]
     buttons = []
     for i in range(0, len(chunk), 2):  # по две модели в ряд
-        row = [Button.inline(f'{m} ({sum(r.values())})', f'n:m:{m}'.encode())
+        row = [Button.inline(f'{m} ({_branch_files(r)})', f'n:m:{m}'.encode())
                for m, r in chunk[i:i + 2]]
         buttons.append(row)
     nav_row = []
@@ -293,10 +303,8 @@ def _nav_model_view(model: str) -> tuple[str, list]:
     ci = PRODUCT_CATEGORIES.index(product_category(model))
     buttons = []
     for rkey in sorted(branches, reverse=True):
-        # человекочитаемая ветка: '0600.0025' -> 'V600 R025'
-        label = ('без версии' if rkey == '-' else
-                 f'V{int(rkey[:4])} R{rkey[5:9].lstrip("0") or "0"}')
-        buttons.append([Button.inline(f'{label} · {branches[rkey]} файл(ов)',
+        count, label = branches[rkey]  # метка уже человекочитаемая
+        buttons.append([Button.inline(f'{label} · {count} файл(ов)',
                                       f'n:v:{model}:{rkey}'.encode())])
     buttons.append([Button.inline('⬅️ Модели', f'n:c:{ci}:0'.encode())])
     return f'{model} — ветки версий:', buttons
