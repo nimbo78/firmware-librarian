@@ -16,8 +16,8 @@ from datetime import datetime, timedelta
 
 from telethon import Button, TelegramClient, events
 
-from kb_firmware import (PRODUCT_CATEGORIES, product_category, split_query,
-                         version_branch_label)
+from kb_firmware import (OS_NAMES, PRODUCT_CATEGORIES, product_category,
+                         split_query, version_branch_label)
 from kb_ingest import embed_texts, openai_client
 from kb_store import open_store
 from tg_conn import proxy_kwargs
@@ -53,6 +53,8 @@ ADMIN_HELP = (
     '/events — последние 20 событий\n'
     '/gaps — вопросы без ответа или с 👎\n'
     '/fw [модель] — каталог: без аргумента — навигация по разделам\n'
+    '/sw <модель> — сводка: ветки системного софта, образ и патчи рядом\n'
+    '/download <начало имени> — прислать все файлы с этим префиксом\n'
     '/review — подтвердить связки каталога (LLM-экстракция)\n'
     '/ingest — внеплановый инжест сейчас (не ждать ночи)\n'
     '/notify on|off — уведомления о событиях в личку\n'
@@ -327,6 +329,117 @@ def _nav_files_view(model: str, rkey: str) -> tuple[str, list]:
     return text, buttons
 
 
+# порядок групп внутри ветки /sw: образ системного софта → патчи → остальное
+_SW_KIND_ORDER = {'software': 0, 'patch': 1, 'release_notes': 2, 'doc': 3,
+                  'mib': 4, 'tool': 5, '': 6}
+_SW_KIND_TITLES = {'software': 'Образ', 'patch': 'Патчи',
+                   'release_notes': 'Release notes', 'doc': 'Документация',
+                   'mib': 'MIB', 'tool': 'Инструменты', '': 'Прочее'}
+
+
+async def _handle_sw(event, text: str) -> None:
+    """Семантическая сводка: продукт → ветка V+R (ОС) → образ/патчи рядом.
+
+    Схема имени Huawei (от владельца): продукт _ Vxxx(ОС) Rxxx(версия
+    системного софта) Cxx(codebase) SPCxxx/SPHxxx(билд софта/патча).
+    Ветка V+R и есть «версия системного софта» — группируем по ней.
+    """
+    parts = text.split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ''
+    if not arg:
+        await event.reply('Укажи модель: /sw S5735-S (можно с веткой: '
+                          '/sw S5735-S R024)')
+        return
+    model_query, version_tokens = split_query(arg)
+    rows = store.find_firmware(model_query, limit=120)
+    if version_tokens:
+        rows = [r for r in rows
+                if all(t in (r[1] or '').upper() for t in version_tokens)]
+    if not rows:
+        await event.reply(f'По «{arg}» в каталоге пусто. Попробуй /fw {arg} '
+                          f'(там есть LLM-подбор) или /download <начало имени>.')
+        return
+    # (model, ветка V+R) -> строки; внутри — по типу файла
+    grouped: dict = {}
+    for r in rows:
+        branch = version_branch_label(r[1])
+        grouped.setdefault(r[0], {}).setdefault(branch, []).append(r)
+    out = []
+    buttons = []
+    seen: set[int] = set()
+    for model in sorted(grouped)[:3]:  # не больше трёх моделей на сводку
+        out.append(f'━ {model}')
+        for branch in sorted(grouped[model], reverse=True):
+            os_name = OS_NAMES.get(branch.split(' ')[0], '')
+            os_mark = f' · {os_name}' if os_name else ''
+            out.append(f'\n▸ {branch}{os_mark}')
+            branch_rows = sorted(
+                grouped[model][branch],
+                key=lambda r: (_SW_KIND_ORDER.get(r[10], 6), r[2]))
+            for r in branch_rows[:12]:
+                title = _SW_KIND_TITLES.get(r[10], 'Прочее')
+                line = f'  {title}: {r[2]} · {r[5]}'
+                link = _msg_link(r[3], r[4])
+                if link:
+                    line += f'\n    {link}'
+                out.append(line)
+                if r[8] and r[9] not in seen and len(buttons) < 10:
+                    seen.add(r[9])
+                    buttons.append([Button.inline(f'📎 {r[2][:40]}',
+                                                  f'g:{r[9]}'.encode())])
+        out.append('')
+    await event.reply('\n'.join(out)[:4000], link_preview=False,
+                      buttons=buttons or None)
+
+
+DOWNLOAD_BATCH_LIMIT = 12
+
+
+async def _handle_download(event, text: str) -> None:
+    """Фолбэк, когда парсер бессилен: все скачанные файлы, чьё имя начинается
+    с префикса, шлются последовательно — включая подписи .asc/.p7s (они нужны
+    для проверки PGP) и многотомные архивы (сортировка по имени)."""
+    parts = text.split(maxsplit=1)
+    prefix = parts[1].strip() if len(parts) > 1 else ''
+    if len(prefix) < 8:
+        await event.reply('Дай начало имени файла (минимум 8 символов): '
+                          '/download iMasterNCEServerInstall_V100R022C00SPC908')
+        return
+    rows = store.files_by_prefix(prefix, limit=DOWNLOAD_BATCH_LIMIT + 1)
+    on_disk = []
+    for doc_id, name, md5 in rows:
+        path = os.path.join(DOWNLOAD_FOLDER, os.path.basename(name))
+        if md5 and os.path.exists(path):
+            on_disk.append((name, path))
+    if not on_disk:
+        if rows:
+            await event.reply('Файлы с таким именем есть в каталоге, но на '
+                              'диске NAS их нет — качай по ссылкам из /fw.')
+        else:
+            await event.reply(f'Ничего не начинается с «{prefix[:60]}».')
+        return
+    truncated = len(on_disk) > DOWNLOAD_BATCH_LIMIT
+    on_disk = on_disk[:DOWNLOAD_BATCH_LIMIT]
+    note = (f' (первые {DOWNLOAD_BATCH_LIMIT}, уточни префикс для остальных)'
+            if truncated else '')
+    await event.reply(f'Отправляю {len(on_disk)} файл(ов){note} — большие '
+                      f'идут долго…')
+    logger.info('Download batch "%s": %d files to %s (asked by %s)',
+                prefix[:60], len(on_disk), event.chat_id, event.sender_id)
+    sent = 0
+    for name, path in on_disk:
+        try:
+            await client.send_file(event.chat_id, path,
+                                   reply_to=event.message.id,
+                                   force_document=True)
+            sent += 1
+        except Exception as e:
+            logger.warning('download batch send failed for %s: %s', name, e)
+    if sent < len(on_disk):
+        await event.reply(f'Отправлено {sent} из {len(on_disk)} — остальные '
+                          f'не ушли, детали в логах.')
+
+
 async def _handle_fw(event, text: str) -> None:
     parts = text.split(maxsplit=1)
     arg = parts[1].strip() if len(parts) > 1 else ''
@@ -462,6 +575,10 @@ async def handle_admin(event) -> None:
                           'События придут сюда по мере выполнения.')
     elif low.startswith('/fw'):
         await _handle_fw(event, text)
+    elif low.startswith('/sw'):
+        await _handle_sw(event, text)
+    elif low.startswith('/download'):
+        await _handle_download(event, text)
     elif low.startswith('/review'):
         pending = store.pending_review_count()
         if not pending:
@@ -618,8 +735,21 @@ async def handler(event):
     if event.chat_id not in ANSWER_CHAT_IDS:
         return
     text = (event.raw_text or '').strip()
-    if text.lower().startswith('/fw'):
+    low = text.lower()
+    if low.startswith('/fw'):
         await _handle_fw(event, text)  # без кулдауна: дёшево, без LLM
+        return
+    if low.startswith('/sw'):
+        await _handle_sw(event, text)
+        return
+    if low.startswith('/download'):
+        # кулдаун: пачка до 12 больших файлов — лёгкий вектор флуда в группе
+        now = time.monotonic()
+        if now - _last_ask.get(event.sender_id, 0.0) < COOLDOWN_SECONDS:
+            await event.reply('Подожди немного перед следующей пачкой файлов.')
+            return
+        _last_ask[event.sender_id] = now
+        await _handle_download(event, text)
         return
     question = _extract_question(text)
     if question is None:

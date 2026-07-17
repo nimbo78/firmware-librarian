@@ -449,6 +449,17 @@ class SqliteVecStore:
             'SELECT name, md5, chat_id, msg_id, date FROM files WHERE doc_id=?',
             (doc_id,)).fetchone()
 
+    def files_by_prefix(self, prefix: str, limit: int = 20) -> list[tuple]:
+        """(doc_id, name, md5) файлов, чьё имя начинается с prefix — для
+        /download. LIKE-спецсимволы экранируются: в именах Huawei сплошные
+        '_', которые иначе значат «любой символ»."""
+        escaped = (prefix.replace('\\', '\\\\')
+                   .replace('%', r'\%').replace('_', r'\_'))
+        return self.db.execute(
+            "SELECT doc_id, name, md5 FROM files "
+            "WHERE name LIKE ? || '%' ESCAPE '\\' "
+            "ORDER BY name LIMIT ?", (escaped, limit)).fetchall()
+
     def files_without_md5(self) -> list[tuple]:
         """(doc_id, name) записей без md5 — кандидаты на привязку к уже
         скачанным файлам через журнал дедупликации (link_local_files)."""
@@ -740,6 +751,12 @@ def _selftest() -> None:
         rec = store.file_by_doc_id(222)
         assert rec[0].startswith('MA5608T_V800R018') and rec[4] == '2026-03-12'
         assert store.file_by_doc_id(999999) is None
+
+        # /download: поиск по префиксу имени с экранированием LIKE-символов
+        pref = store.files_by_prefix('MA5608T_V800R017')
+        assert [r[1] for r in pref] == ['MA5608T_V800R017C10SPC200.zip'], pref
+        assert store.files_by_prefix('MA5608T%') == []  # % — литерал, не wildcard
+        assert store.files_by_prefix('MA5608TzV800') == []  # _ не «любой символ»
         fw = store.find_firmware('5608')
         assert len(fw) == 2 and fw[0][1] == 'V800R018C10SPC500', fw  # свежая первой
         assert store.find_firmware('S9999') == []

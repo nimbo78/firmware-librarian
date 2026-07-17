@@ -61,6 +61,18 @@ BUNDLE_RE = re.compile(
     r'(?![A-Z0-9])')
 _BUNDLE_ITEM_RE = re.compile(r'\d{3,5}[A-Z]{0,2}')
 
+# Dash-бандлы: 'CE6800-8800-9800' = серии CE6800+CE8800+CE9800 (семантика
+# имён Huawei — подтверждено владельцем). Каждый сегмент — ЦЕЛИКОМ из цифр:
+# 'CE8850-64CQ-EI' бандлом не является ('64CQ' с буквами = суффикс модели).
+DASH_BUNDLE_RE = re.compile(
+    r'(?<![A-Z0-9])'
+    r'(AIRENGINE|CLOUDENGINE|NETENGINE|CE|AR|AC|S)[ _-]?'
+    r'(\d{3,5}(?:-\d{3,5})+)'
+    r'(?![A-Z0-9])')
+
+# Подписи ОС для веток версий — только подтверждённые владельцем маппинги
+OS_NAMES = {'V200': 'VRP', 'V600': 'YunShan OS'}
+
 # Версионные токены в ЗАПРОСЕ пользователя ('R025', 'V600', 'SPC500'):
 # отделяются от модели и работают фильтром по версии, а не частью имени
 VERSION_TOKEN_RE = re.compile(
@@ -153,6 +165,11 @@ def parse_firmware_name(name: str) -> tuple[list[str], str, str]:
         bundle_spans.append(bm.span())
         prefix = bm.group(1)
         for num in _BUNDLE_ITEM_RE.findall(bm.group(2)):
+            add(prefix + num)
+    for bm in DASH_BUNDLE_RE.finditer(up):
+        bundle_spans.append(bm.span())
+        prefix = bm.group(1)
+        for num in bm.group(2).split('-'):
             add(prefix + num)
 
     def in_bundle(pos: int) -> bool:
@@ -410,6 +427,12 @@ def _selftest() -> None:
         'AirEngine 5700&6700&8700&9700D V200R023C00SPC100.zip':
             (['AIRENGINE5700', 'AIRENGINE6700', 'AIRENGINE8700',
               'AIRENGINE9700D'], 'V200R023C00SPC100'),
+        # dash-бандлы: несколько серий в одном имени; суффиксы с буквами —
+        # НЕ бандл, а модель (CE8850-64CQ-EI)
+        'CE6800-8800-9800_V300R024C00SPC500.cc':
+            (['CE6800', 'CE8800', 'CE9800'], 'V300R024C00SPC500'),
+        'CE8850-64CQ-EI-V200R005C10SPC800_2.cc':
+            (['CE8850-64CQ-EI'], 'V200R005C10SPC800'),
         # серверы, софт-платформы, точечные версии СХД/UC
         '1288H_V5_V100R005C00SPC272.zip': (['1288H-V5'], 'V100R005C00SPC272'),
         'iMasterNCE_Campus_V300R022C00SPC202_Campus_Combine_linux_x86_64.zip':
