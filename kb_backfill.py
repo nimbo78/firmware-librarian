@@ -239,9 +239,10 @@ async def main() -> None:
         flood_sleep_threshold=86400,
         **proxy_kwargs(),
     )
-    # телеграмные предупреждения (FloodWait, обрывы) — в stderr, а не в тишину
+    # телеграмные предупреждения (FloodWait, обрывы) — в stderr, а не в тишину;
+    # %(name)s подписывает источник (telethon.network.* vs наши модули)
     logging.basicConfig(level=logging.WARNING,
-                        format='%(asctime)s - %(levelname)s - %(message)s')
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     print('Подключаюсь к Telegram...', flush=True)
     await client.start(phone=lambda: input('Enter your phone: '))
     print('Подключился.', flush=True)

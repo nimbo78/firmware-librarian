@@ -93,9 +93,11 @@ SYSTEM_PROMPT = (
     'контексте нет — прямо скажи об этом, не выдумывай.'
 )
 
+# %(name)s подписывает источник: telethon.network.* — сетевой слой Telegram,
+# kb_bot/kb_* — наши модули (иначе непонятно, чей варнинг)
 logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('kb_bot')
 logging.getLogger('telethon').setLevel(logging.WARNING)
 
 client = TelegramClient(SESSION, API_ID, API_HASH,

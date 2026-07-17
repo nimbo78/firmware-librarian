@@ -81,11 +81,13 @@ if not CHAT_IDS:
 downloaded_files_log = os.path.join(DOWNLOAD_FOLDER, 'downloaded_files.txt')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
+# %(name)s подписывает источник: telethon.network.* — сетевой слой Telegram,
+# downloader/kb_* — наши модули (иначе непонятно, чей варнинг)
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('downloader')
 logging.getLogger('telethon').setLevel(logging.WARNING)
 
 _MD5_RE = re.compile(r'^[0-9a-f]{32}$')
