@@ -67,9 +67,11 @@ def _user_help() -> str:
         '📦 Каталог прошивок и документации:\n'
         '• /fw — навигация по разделам, как на support.huawei.com\n'
         '• /fw <модель> [версия] — поиск: /fw S5735-S R024, /fw 5735\n'
-        '• /sw <модель> — сводка по веткам софта: образ и патчи рядом\n'
+        '• /sw <модель> — сводка по веткам софта\n'
         '• /download <начало имени> — все файлы с этим префиксом подряд\n'
         '  (включая .asc/.p7s для проверки подписи и многотомники)\n'
+        '• В выдаче: софт по веткам от новых к старым (💿 образ, 🩹 патчи),\n'
+        '  документация и прочее — блоком 📖 в конце.\n'
         '• Кнопка 📎 присылает файл прямо в чат (до 2 ГБ).\n'
         '  После трёх отправок с одного списка он удаляется — не мусорим.'
     )
@@ -194,12 +196,17 @@ _SW_KIND_TITLES = {'software': '💿 Образ', 'patch': '🩹 Патчи',
 _RENDER_MAX_BRANCHES = 6
 
 
+_RENDER_MAX_DOCS = 8
+_SW_KINDS = ('software', 'patch')  # «софт-часть» ветки; остальное — в конец
+
+
 def _render_grouped(rows: list, query: str, model_query: str = '',
                     max_models: int = 3) -> tuple[str, list, set]:
-    """Единый рендер каталога для /fw, /sw и листа навигации:
-    📦 модель → 🔀 ветка V+R (свежие сверху, «без версии» в конце) →
-    секции по типам с эмодзи, до 5 файлов на секцию.
+    """Единый рендер каталога для /fw, /sw и листа навигации.
 
+    Порядок (решение владельца): сначала софт по веткам от новых к старым —
+    🔀 R025 (💿 образ + 🩹 патчи), затем R024 и т.д., — а вся документация/
+    RN/MIB/прочее одним блоком 📖 в конце модели с пометкой ветки.
     Запрошенная модель всегда первой — иначе серия (S5700) заливает лимит
     4096 и запрошенное отрезается. Возвращает (текст, кнопки 📎, seen_doc_ids)
     — seen нужен вызывающему, чтобы дополнять кнопки без дублей.
@@ -221,6 +228,19 @@ def _render_grouped(rows: list, query: str, model_query: str = '',
     out = [f'Каталог по запросу «{query}»:']
     buttons: list = []
     seen: set[int] = set()
+
+    def _emit(r: tuple, extra: str = '') -> None:
+        unconfirmed = ' · не подтверждено' if r[6] != 'high' else ''
+        line = f'  • {r[2]} · {r[5]}{extra}{unconfirmed}'
+        link = _msg_link(r[3], r[4])
+        if link:
+            line += f'\n    {link}'
+        out.append(line)
+        if r[8] and r[9] not in seen and len(buttons) < 10:
+            seen.add(r[9])
+            buttons.append([Button.inline(f'📎 {r[2][:40]}',
+                                          f'g:{r[9]}'.encode())])
+
     for model in sorted(grouped, key=_model_rank)[:max_models]:
         suffix = (' (вся серия — проверь совместимость!)'
                   if is_series[model] else '')
@@ -229,37 +249,47 @@ def _render_grouped(rows: list, query: str, model_query: str = '',
                           reverse=True)
         if 'без версии' in grouped[model]:
             branches.append('без версии')
-        for branch in branches[:_RENDER_MAX_BRANCHES]:
-            os_name = OS_NAMES.get(branch.split(' ')[0], '')
-            os_mark = f' · {os_name}' if os_name else ''
-            out.append(f'🔀 {branch}{os_mark}')
-            by_kind: dict = {}
+        # софт-часть по веткам; документация копится в общий хвост модели
+        sw_branches: list[tuple[str, dict]] = []
+        docs_pool: list[tuple[str, tuple]] = []
+        doc_names: set[str] = set()
+        for branch in branches:
             seen_names: set[str] = set()
+            by_kind: dict = {}
             for r in grouped[model][branch]:
                 if r[2] in seen_names:
                     continue  # повторные посты того же файла не дублируем
                 seen_names.add(r[2])
-                by_kind.setdefault(r[10], []).append(r)
+                if r[10] in _SW_KINDS:
+                    by_kind.setdefault(r[10], []).append(r)
+                elif r[2] not in doc_names:
+                    doc_names.add(r[2])
+                    docs_pool.append((branch, r))
+            if by_kind:
+                sw_branches.append((branch, by_kind))
+        for branch, by_kind in sw_branches[:_RENDER_MAX_BRANCHES]:
+            os_name = OS_NAMES.get(branch.split(' ')[0], '')
+            os_mark = f' · {os_name}' if os_name else ''
+            out.append(f'🔀 {branch}{os_mark}')
             for kind in sorted(by_kind, key=lambda k: _SW_KIND_ORDER.get(k, 6)):
                 out.append(f'  {_SW_KIND_TITLES.get(kind, "📁 Прочее")}:')
                 for r in by_kind[kind][:5]:
-                    unconfirmed = (' · не подтверждено'
-                                   if r[6] != 'high' else '')
-                    line = f'  • {r[2]} · {r[5]}{unconfirmed}'
-                    link = _msg_link(r[3], r[4])
-                    if link:
-                        line += f'\n    {link}'
-                    out.append(line)
-                    if r[8] and r[9] not in seen and len(buttons) < 10:
-                        seen.add(r[9])
-                        buttons.append([Button.inline(f'📎 {r[2][:40]}',
-                                                      f'g:{r[9]}'.encode())])
+                    _emit(r)
                 if len(by_kind[kind]) > 5:
                     out.append(f'    … и ещё {len(by_kind[kind]) - 5}')
-        if len(branches) > _RENDER_MAX_BRANCHES:
-            out.append(f'  … и ещё веток: '
-                       f'{len(branches) - _RENDER_MAX_BRANCHES} '
+        if len(sw_branches) > _RENDER_MAX_BRANCHES:
+            out.append(f'  … и ещё веток с софтом: '
+                       f'{len(sw_branches) - _RENDER_MAX_BRANCHES} '
                        f'(уточни версией: /fw {model} R0xx)')
+        if docs_pool:
+            out.append('📖 Документация и прочее:')
+            for branch, r in docs_pool[:_RENDER_MAX_DOCS]:
+                emoji = _SW_KIND_TITLES.get(r[10], '📁 Прочее').split()[0]
+                branch_mark = f' {branch}' if branch != 'без версии' else ''
+                _emit(r, extra=f' · {emoji}{branch_mark}')
+            if len(docs_pool) > _RENDER_MAX_DOCS:
+                out.append(f'    … и ещё {len(docs_pool) - _RENDER_MAX_DOCS} '
+                           f'(все — в /fw через навигацию)')
     return '\n'.join(out), buttons, seen
 
 
