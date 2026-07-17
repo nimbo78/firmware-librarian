@@ -47,15 +47,40 @@ GAPS_TOPIC_ID = int(os.getenv('KB_GAPS_TOPIC_ID', '0') or 0)  # топик фо�
 GAPS_POST_WEEKDAY = 0   # понедельник
 GAPS_POST_HOUR = 10
 
-ADMIN_HELP = (
-    'Команды администратора:\n'
-    '/status — база, стоимость, курсоры инжеста\n'
+# Каталожное сообщение удаляется после N успешных отправок файлов по 📎:
+# файлы уже в чате, простыня со списком больше не нужна (решение владельца)
+MSG_CLICKS_TO_DELETE = 3
+_msg_clicks: dict[tuple[int, int], int] = {}
+
+
+def _user_help() -> str:
+    mention = f'@{_bot_username}' if _bot_username else '@<имя бота>'
+    return (
+        '🤖 Хранитель знаний чата. Что умею:\n'
+        '\n'
+        '❓ Вопросы по базе знаний (история чата + документация):\n'
+        f'• /ask <вопрос> — или просто упомяни меня: {mention} <вопрос>\n'
+        '• Под ответом кнопки 👍/👎 — оценки делают базу лучше.\n'
+        '• Если ответа не нашлось — вопрос запоминается; как только в чате\n'
+        '  появится обсуждение, я сам отвечу реплаем.\n'
+        '\n'
+        '📦 Каталог прошивок и документации:\n'
+        '• /fw — навигация по разделам, как на support.huawei.com\n'
+        '• /fw <модель> [версия] — поиск: /fw S5735-S R024, /fw 5735\n'
+        '• /sw <модель> — сводка по веткам софта: образ и патчи рядом\n'
+        '• /download <начало имени> — все файлы с этим префиксом подряд\n'
+        '  (включая .asc/.p7s для проверки подписи и многотомники)\n'
+        '• Кнопка 📎 присылает файл прямо в чат (до 2 ГБ).\n'
+        '  После трёх отправок с одного списка он удаляется — не мусорим.'
+    )
+
+
+ADMIN_HELP_EXTRA = (
+    '\n\n🔧 Команды администратора (только в личке):\n'
+    '/status — база, стоимость, курсоры инжеста (+кнопка инжеста)\n'
     '/events — последние 20 событий\n'
     '/gaps — вопросы без ответа или с 👎\n'
-    '/fw [модель] — каталог: без аргумента — навигация по разделам\n'
-    '/sw <модель> — сводка: ветки системного софта, образ и патчи рядом\n'
-    '/download <начало имени> — прислать все файлы с этим префиксом\n'
-    '/review — подтвердить связки каталога (LLM-экстракция)\n'
+    '/review — подтвердить связки каталога (есть «принять все»)\n'
     '/ingest — внеплановый инжест сейчас (не ждать ночи)\n'
     '/notify on|off — уведомления о событиях в личку\n'
     'Любой другой текст в личке — вопрос к базе знаний.'
@@ -521,7 +546,7 @@ async def handle_admin(event) -> None:
     text = (event.raw_text or '').strip()
     low = text.lower()
     if low.startswith('/start') or low.startswith('/help'):
-        await event.reply(ADMIN_HELP)
+        await event.reply(_user_help() + ADMIN_HELP_EXTRA)
     elif low.startswith('/status'):
         s = store.kb_stats()
         notify = 'вкл' if store.get_state('admin_notify', '1') == '1' else 'выкл'
@@ -602,13 +627,13 @@ async def handle_admin(event) -> None:
             f'обязательно — можно принять всё разом:',
             buttons=[[Button.inline(f'✅ Принять все {pending}', b'c:allfw')]])
     elif text.startswith('/') and not low.startswith('/ask'):
-        await event.reply(ADMIN_HELP)
+        await event.reply(_user_help() + ADMIN_HELP_EXTRA)
     else:
         question = _extract_question(text)
         if question is None:
             question = text  # в личке админа любой текст — вопрос к базе
         if not question:
-            await event.reply(ADMIN_HELP)
+            await event.reply(_user_help() + ADMIN_HELP_EXTRA)
             return
         await _send_answer(event, question)
 
@@ -736,6 +761,9 @@ async def handler(event):
         return
     text = (event.raw_text or '').strip()
     low = text.lower()
+    if low.startswith(('/help', '/start')):
+        await event.reply(_user_help())
+        return
     if low.startswith('/fw'):
         await _handle_fw(event, text)  # без кулдауна: дёшево, без LLM
         return
@@ -837,6 +865,19 @@ async def on_getfile(event):
                     name, event.chat_id, event.sender_id)
         await client.send_file(event.chat_id, path,
                                reply_to=event.message_id, force_document=True)
+        # после N успешных отправок каталожный список удаляется из чата:
+        # файлы уже присланы, простыня больше не нужна
+        key = (event.chat_id, event.message_id)
+        _msg_clicks[key] = _msg_clicks.get(key, 0) + 1
+        if _msg_clicks[key] >= MSG_CLICKS_TO_DELETE:
+            _msg_clicks.pop(key, None)
+            try:
+                msg = await event.get_message()
+                await msg.delete()
+            except Exception as e:
+                logger.warning('listing cleanup failed: %s', e)
+        elif len(_msg_clicks) > 500:  # не копим счётчики вечно
+            _msg_clicks.clear()
     except Exception as e:
         logger.warning('getfile failed: %s', e)
         try:
