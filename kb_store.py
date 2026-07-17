@@ -538,6 +538,19 @@ class SqliteVecStore:
         with self.db:
             self.db.execute('DELETE FROM firmware WHERE rowid=?', (rowid,))
 
+    def delete_empty_version_rows(self, doc_id: int, models: list[str]) -> int:
+        """Удаляет связки файла с пустой версией для перечисленных моделей —
+        трупы старого парсера (не понимал SPH1b0/HP): reparse добавил строки
+        с версией, а пустые дубли засоряли ветку «без версии» в /sw."""
+        if not models:
+            return 0
+        with self.db:
+            marks = ','.join('?' * len(models))
+            cur = self.db.execute(
+                f"DELETE FROM firmware WHERE doc_id=? AND version='' "
+                f"AND device_model IN ({marks})", [doc_id, *models])
+            return cur.rowcount
+
     def confirm_all_firmware(self) -> int:
         """Массовое подтверждение всех оставшихся medium-связок (кнопка
         «принять всё» в /review). Возвращает число повышенных."""
@@ -862,6 +875,16 @@ def _selftest() -> None:
         assert orphan and orphan[0][8] == orphan_md5, orphan  # md5 -> кнопка 📎
         assert orphan[0][3] == 0, orphan  # chat_id=0: ссылки на пост нет
         assert kb_firmware.link_local_files(store, dl) == 0  # идемпотентно
+
+        # reparse чистит пустоверсионные дубли старого парсера
+        store.upsert_file(doc_id=666, name='S5731-H_V200R024SPH1b0.pat',
+                          size=1, md5='', chat_id=-1001234, msg_id=90,
+                          caption='', topic_name='', date='2026-04-01')
+        store.upsert_firmware(666, 'S5731-H', '', '')  # старый парсер: без версии
+        kb_firmware.reparse_files(store)
+        rows666 = store.find_firmware_exact('S5731-H')
+        assert rows666 and all(r[1] for r in rows666), rows666  # дубль удалён
+        assert any(r[1] == 'V200R024SPH1B0' for r in rows666), rows666
 
         bak = os.path.join(tmp, 'kb.bak')
         store.backup(bak)

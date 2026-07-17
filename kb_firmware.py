@@ -238,7 +238,7 @@ def product_category(model: str) -> str:
 _SIGNATURE_RE = re.compile(r'\.(asc|p7s|cms|crl)(\.(asc|p7s))?$', re.IGNORECASE)
 _DOC_WORDS_RE = re.compile(
     r'guide|documentation|description|matrix|password|acceptance|training'
-    r'|introduction|report|notes|информац|материал', re.IGNORECASE)
+    r'|introduction|report|notes|upgrade|информац|материал', re.IGNORECASE)
 _PATCH_RE = re.compile(r'(?:sph|hp)[0-9a-z]{1,4}(?![a-z0-9])|\bpatch\b',
                        re.IGNORECASE)
 
@@ -332,6 +332,10 @@ def reparse_files(store) -> int:
         for model in models:
             if store.upsert_firmware(doc_id, model, version, version_key):
                 added += 1
+        if version:
+            # трупы старого парсера: связка есть, версия пустая — теперь
+            # версию видим, пустой дубль только мусорит ветку «без версии»
+            store.delete_empty_version_rows(doc_id, models)
     return added
 
 

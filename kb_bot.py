@@ -357,9 +357,10 @@ def _nav_files_view(model: str, rkey: str) -> tuple[str, list]:
 # порядок групп внутри ветки /sw: образ системного софта → патчи → остальное
 _SW_KIND_ORDER = {'software': 0, 'patch': 1, 'release_notes': 2, 'doc': 3,
                   'mib': 4, 'tool': 5, '': 6}
-_SW_KIND_TITLES = {'software': 'Образ', 'patch': 'Патчи',
-                   'release_notes': 'Release notes', 'doc': 'Документация',
-                   'mib': 'MIB', 'tool': 'Инструменты', '': 'Прочее'}
+_SW_KIND_TITLES = {'software': '💿 Образ', 'patch': '🩹 Патчи',
+                   'release_notes': '📃 Release notes',
+                   'doc': '📖 Документация', 'mib': '🧾 MIB',
+                   'tool': '🛠 Инструменты', '': '📁 Прочее'}
 
 
 async def _handle_sw(event, text: str) -> None:
@@ -389,29 +390,49 @@ async def _handle_sw(event, text: str) -> None:
     for r in rows:
         branch = version_branch_label(r[1])
         grouped.setdefault(r[0], {}).setdefault(branch, []).append(r)
+
+    # запрошенная модель — первой: иначе серия (S5700) заливает лимит 4096,
+    # и то, что человек спрашивал (S5735-S-V2), отрезается
+    qnorm = re.sub(r'[^A-Z0-9]', '', model_query.upper())
+
+    def _model_rank(m: str) -> tuple:
+        return (0 if qnorm and qnorm in re.sub(r'[^A-Z0-9]', '', m) else 1, m)
+
     out = []
     buttons = []
     seen: set[int] = set()
-    for model in sorted(grouped)[:3]:  # не больше трёх моделей на сводку
-        out.append(f'━ {model}')
-        for branch in sorted(grouped[model], reverse=True):
+    for model in sorted(grouped, key=_model_rank)[:3]:
+        out.append(f'📦 {model}')
+        # версионные ветки по убыванию, «без версии» — в самый конец
+        branches = sorted((b for b in grouped[model] if b != 'без версии'),
+                          reverse=True)
+        if 'без версии' in grouped[model]:
+            branches.append('без версии')
+        for branch in branches:
             os_name = OS_NAMES.get(branch.split(' ')[0], '')
             os_mark = f' · {os_name}' if os_name else ''
-            out.append(f'\n▸ {branch}{os_mark}')
-            branch_rows = sorted(
-                grouped[model][branch],
-                key=lambda r: (_SW_KIND_ORDER.get(r[10], 6), r[2]))
-            for r in branch_rows[:12]:
-                title = _SW_KIND_TITLES.get(r[10], 'Прочее')
-                line = f'  {title}: {r[2]} · {r[5]}'
-                link = _msg_link(r[3], r[4])
-                if link:
-                    line += f'\n    {link}'
-                out.append(line)
-                if r[8] and r[9] not in seen and len(buttons) < 10:
-                    seen.add(r[9])
-                    buttons.append([Button.inline(f'📎 {r[2][:40]}',
-                                                  f'g:{r[9]}'.encode())])
+            out.append(f'\n🔀 {branch}{os_mark}')
+            by_kind: dict = {}
+            seen_names: set[str] = set()
+            for r in grouped[model][branch]:
+                if r[2] in seen_names:
+                    continue  # повторные посты того же файла не дублируем
+                seen_names.add(r[2])
+                by_kind.setdefault(r[10], []).append(r)
+            for kind in sorted(by_kind, key=lambda k: _SW_KIND_ORDER.get(k, 6)):
+                out.append(f'  {_SW_KIND_TITLES.get(kind, "📁 Прочее")}:')
+                for r in by_kind[kind][:5]:
+                    line = f'  • {r[2]} · {r[5]}'
+                    link = _msg_link(r[3], r[4])
+                    if link:
+                        line += f'\n    {link}'
+                    out.append(line)
+                    if r[8] and r[9] not in seen and len(buttons) < 10:
+                        seen.add(r[9])
+                        buttons.append([Button.inline(f'📎 {r[2][:40]}',
+                                                      f'g:{r[9]}'.encode())])
+                if len(by_kind[kind]) > 5:
+                    out.append(f'    … и ещё {len(by_kind[kind]) - 5}')
         out.append('')
     await event.reply('\n'.join(out)[:4000], link_preview=False,
                       buttons=buttons or None)
