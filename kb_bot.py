@@ -184,37 +184,83 @@ async def _send_answer(event, question: str) -> None:
     await event.reply(answer, link_preview=False, buttons=buttons)
 
 
-def _format_fw(rows: list, query: str) -> str:
+# порядок и подписи секций общего рендера каталога (используются также в /sw)
+_SW_KIND_ORDER = {'software': 0, 'patch': 1, 'release_notes': 2, 'doc': 3,
+                  'mib': 4, 'tool': 5, '': 6}
+_SW_KIND_TITLES = {'software': '💿 Образ', 'patch': '🩹 Патчи',
+                   'release_notes': '📃 Release notes',
+                   'doc': '📖 Документация', 'mib': '🧾 MIB',
+                   'tool': '🛠 Инструменты', '': '📁 Прочее'}
+_RENDER_MAX_BRANCHES = 6
+
+
+def _render_grouped(rows: list, query: str, model_query: str = '',
+                    max_models: int = 3) -> tuple[str, list, set]:
+    """Единый рендер каталога для /fw, /sw и листа навигации:
+    📦 модель → 🔀 ветка V+R (свежие сверху, «без версии» в конце) →
+    секции по типам с эмодзи, до 5 файлов на секцию.
+
+    Запрошенная модель всегда первой — иначе серия (S5700) заливает лимит
+    4096 и запрошенное отрезается. Возвращает (текст, кнопки 📎, seen_doc_ids)
+    — seen нужен вызывающему, чтобы дополнять кнопки без дублей.
+    """
     if not rows:
-        return (f'Прошивок по запросу «{query}» в каталоге нет. '
-                f'Каталог наполняется из имён файлов в чатах.')
-    kind_marks = {'doc': ' · 📄', 'release_notes': ' · 📄 RN',
-                  'mib': ' · MIB', 'tool': ' · 🛠', 'patch': ' · патч'}
-    out = [f'Прошивки по запросу «{query}»:']
-    current_model = None
-    latest_marked = False
-    for (model, version, name, chat_id, msg_id, date, confidence, is_series,
-         _md5, _doc, kind) in rows:
-        if model != current_model:
-            suffix = ' (вся серия — проверь совместимость!)' if is_series else ''
-            out.append(f'\n{model}{suffix}:')
-            current_model = model
-            latest_marked = False
-        mark = ''
-        # «последняя» — только про сам софт, доки/патчи вне конкурса
-        if version and not latest_marked and kind in ('software', ''):
-            mark = ' — последняя'
-            latest_marked = True
-        mark += kind_marks.get(kind, '')
-        if confidence != 'high':
-            mark += ' · не подтверждено'
-        ver = version or 'версия не распознана'
-        line = f'• {ver}{mark} · {date} · {name}'
-        link = _msg_link(chat_id, msg_id)
-        if link:
-            line += f'\n  {link}'
-        out.append(line)
-    return '\n'.join(out)[:4000]
+        return (f'По запросу «{query}» в каталоге пусто. Каталог наполняется '
+                f'из имён файлов в чатах.', [], set())
+    grouped: dict = {}
+    is_series: dict = {}
+    for r in rows:
+        branch = version_branch_label(r[1])
+        grouped.setdefault(r[0], {}).setdefault(branch, []).append(r)
+        is_series[r[0]] = is_series.get(r[0], False) or bool(r[7])
+    qnorm = re.sub(r'[^A-Z0-9]', '', (model_query or query).upper())
+
+    def _model_rank(m: str) -> tuple:
+        return (0 if qnorm and qnorm in re.sub(r'[^A-Z0-9]', '', m) else 1, m)
+
+    out = [f'Каталог по запросу «{query}»:']
+    buttons: list = []
+    seen: set[int] = set()
+    for model in sorted(grouped, key=_model_rank)[:max_models]:
+        suffix = (' (вся серия — проверь совместимость!)'
+                  if is_series[model] else '')
+        out.append(f'\n📦 {model}{suffix}')
+        branches = sorted((b for b in grouped[model] if b != 'без версии'),
+                          reverse=True)
+        if 'без версии' in grouped[model]:
+            branches.append('без версии')
+        for branch in branches[:_RENDER_MAX_BRANCHES]:
+            os_name = OS_NAMES.get(branch.split(' ')[0], '')
+            os_mark = f' · {os_name}' if os_name else ''
+            out.append(f'🔀 {branch}{os_mark}')
+            by_kind: dict = {}
+            seen_names: set[str] = set()
+            for r in grouped[model][branch]:
+                if r[2] in seen_names:
+                    continue  # повторные посты того же файла не дублируем
+                seen_names.add(r[2])
+                by_kind.setdefault(r[10], []).append(r)
+            for kind in sorted(by_kind, key=lambda k: _SW_KIND_ORDER.get(k, 6)):
+                out.append(f'  {_SW_KIND_TITLES.get(kind, "📁 Прочее")}:')
+                for r in by_kind[kind][:5]:
+                    unconfirmed = (' · не подтверждено'
+                                   if r[6] != 'high' else '')
+                    line = f'  • {r[2]} · {r[5]}{unconfirmed}'
+                    link = _msg_link(r[3], r[4])
+                    if link:
+                        line += f'\n    {link}'
+                    out.append(line)
+                    if r[8] and r[9] not in seen and len(buttons) < 10:
+                        seen.add(r[9])
+                        buttons.append([Button.inline(f'📎 {r[2][:40]}',
+                                                      f'g:{r[9]}'.encode())])
+                if len(by_kind[kind]) > 5:
+                    out.append(f'    … и ещё {len(by_kind[kind]) - 5}')
+        if len(branches) > _RENDER_MAX_BRANCHES:
+            out.append(f'  … и ещё веток: '
+                       f'{len(branches) - _RENDER_MAX_BRANCHES} '
+                       f'(уточни версией: /fw {model} R0xx)')
+    return '\n'.join(out), buttons, seen
 
 
 async def _fw_llm_match(query: str) -> tuple[list[str], list[int]]:
@@ -343,26 +389,9 @@ def _nav_files_view(model: str, rkey: str) -> tuple[str, list]:
     rows = store.find_firmware_exact(model, '' if rkey == '-' else rkey)
     if rkey == '-':
         rows = [r for r in rows if not r[1]]
-    text = _format_fw(rows, model)
-    buttons = []
-    seen: set[int] = set()
-    for row in rows:
-        md5, doc_id, name = row[8], row[9], row[2]
-        if md5 and doc_id not in seen and len(buttons) < 10:
-            seen.add(doc_id)
-            buttons.append([Button.inline(f'📎 {name[:40]}',
-                                          f'g:{doc_id}'.encode())])
+    text, buttons, _ = _render_grouped(rows, model, model, max_models=1)
     buttons.append([Button.inline('⬅️ Ветки версий', f'n:m:{model}'.encode())])
-    return text, buttons
-
-
-# порядок групп внутри ветки /sw: образ системного софта → патчи → остальное
-_SW_KIND_ORDER = {'software': 0, 'patch': 1, 'release_notes': 2, 'doc': 3,
-                  'mib': 4, 'tool': 5, '': 6}
-_SW_KIND_TITLES = {'software': '💿 Образ', 'patch': '🩹 Патчи',
-                   'release_notes': '📃 Release notes',
-                   'doc': '📖 Документация', 'mib': '🧾 MIB',
-                   'tool': '🛠 Инструменты', '': '📁 Прочее'}
+    return text[:4000], buttons
 
 
 async def _handle_sw(event, text: str) -> None:
@@ -371,6 +400,7 @@ async def _handle_sw(event, text: str) -> None:
     Схема имени Huawei (от владельца): продукт _ Vxxx(ОС) Rxxx(версия
     системного софта) Cxx(codebase) SPCxxx/SPHxxx(билд софта/патча).
     Ветка V+R и есть «версия системного софта» — группируем по ней.
+    Рендер общий с /fw (_render_grouped).
     """
     parts = text.split(maxsplit=1)
     arg = parts[1].strip() if len(parts) > 1 else ''
@@ -387,57 +417,8 @@ async def _handle_sw(event, text: str) -> None:
         await event.reply(f'По «{arg}» в каталоге пусто. Попробуй /fw {arg} '
                           f'(там есть LLM-подбор) или /download <начало имени>.')
         return
-    # (model, ветка V+R) -> строки; внутри — по типу файла
-    grouped: dict = {}
-    for r in rows:
-        branch = version_branch_label(r[1])
-        grouped.setdefault(r[0], {}).setdefault(branch, []).append(r)
-
-    # запрошенная модель — первой: иначе серия (S5700) заливает лимит 4096,
-    # и то, что человек спрашивал (S5735-S-V2), отрезается
-    qnorm = re.sub(r'[^A-Z0-9]', '', model_query.upper())
-
-    def _model_rank(m: str) -> tuple:
-        return (0 if qnorm and qnorm in re.sub(r'[^A-Z0-9]', '', m) else 1, m)
-
-    out = []
-    buttons = []
-    seen: set[int] = set()
-    for model in sorted(grouped, key=_model_rank)[:3]:
-        out.append(f'📦 {model}')
-        # версионные ветки по убыванию, «без версии» — в самый конец
-        branches = sorted((b for b in grouped[model] if b != 'без версии'),
-                          reverse=True)
-        if 'без версии' in grouped[model]:
-            branches.append('без версии')
-        for branch in branches:
-            os_name = OS_NAMES.get(branch.split(' ')[0], '')
-            os_mark = f' · {os_name}' if os_name else ''
-            out.append(f'\n🔀 {branch}{os_mark}')
-            by_kind: dict = {}
-            seen_names: set[str] = set()
-            for r in grouped[model][branch]:
-                if r[2] in seen_names:
-                    continue  # повторные посты того же файла не дублируем
-                seen_names.add(r[2])
-                by_kind.setdefault(r[10], []).append(r)
-            for kind in sorted(by_kind, key=lambda k: _SW_KIND_ORDER.get(k, 6)):
-                out.append(f'  {_SW_KIND_TITLES.get(kind, "📁 Прочее")}:')
-                for r in by_kind[kind][:5]:
-                    line = f'  • {r[2]} · {r[5]}'
-                    link = _msg_link(r[3], r[4])
-                    if link:
-                        line += f'\n    {link}'
-                    out.append(line)
-                    if r[8] and r[9] not in seen and len(buttons) < 10:
-                        seen.add(r[9])
-                        buttons.append([Button.inline(f'📎 {r[2][:40]}',
-                                                      f'g:{r[9]}'.encode())])
-                if len(by_kind[kind]) > 5:
-                    out.append(f'    … и ещё {len(by_kind[kind]) - 5}')
-        out.append('')
-    await event.reply('\n'.join(out)[:4000], link_preview=False,
-                      buttons=buttons or None)
+    out, buttons, _ = _render_grouped(rows, arg, model_query)
+    await event.reply(out[:4000], link_preview=False, buttons=buttons or None)
 
 
 DOWNLOAD_BATCH_LIMIT = 12
@@ -524,29 +505,20 @@ async def _handle_fw(event, text: str) -> None:
                             'в имени файла.\n\n')
         except Exception as e:
             logger.warning('fw llm fallback failed: %s', e)
-    # Кнопки 📎 — для файлов, которые физически скачаны качалкой на NAS
-    buttons = []
-    seen: set[int] = set()
-    for row in rows:
-        md5, doc_id, name = row[8], row[9], row[2]
-        if md5 and doc_id not in seen:
-            seen.add(doc_id)
-            buttons.append([Button.inline(f'📎 {name[:40]}', f'g:{doc_id}'.encode())])
-        if len(buttons) >= 8:
-            break
     if rows:
-        text_out = _format_fw(rows, arg)
+        text_out, buttons, seen = _render_grouped(rows, arg, model_query)
     elif extra_files:
         text_out = f'Точных связок «модель → прошивка» по «{arg}» нет.'
+        buttons, seen = [], set()
     else:
-        text_out = _format_fw(rows, arg)  # штатное «в каталоге нет»
+        text_out, buttons, seen = _render_grouped(rows, arg, model_query)
     if extra_files:
-        lines = ['', 'Возможно подходящие файлы (LLM по именам):']
+        lines = ['', '🤖 Возможно подходящие файлы (LLM по именам):']
         for doc_id, name, md5, chat_id, msg_id, date in extra_files:
-            line = f'• {date} · {name}'
+            line = f'  • {name} · {date}'
             link = _msg_link(chat_id, msg_id)
             if link:
-                line += f'\n  {link}'
+                line += f'\n    {link}'
             lines.append(line)
             if md5 and doc_id not in seen and len(buttons) < 12:
                 seen.add(doc_id)
