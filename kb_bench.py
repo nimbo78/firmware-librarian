@@ -12,11 +12,14 @@
 запрос/документ (BERTA — search_query/search_document), иначе сравнение
 нечестное.
 
-Запуск ЛОКАЛЬНО (не на NAS — torch на Celeron это часы):
+Запуск ЛОКАЛЬНО (не на NAS — torch на Celeron это часы; на CUDA-GPU
+локальные модели считаются в fp16, минуты на весь корпус):
     # скопировать /volume1/docker/tg-kb/kb.sqlite в fromChat/kb.sqlite
     pip install openai numpy sentence-transformers
+    pip install torch --index-url https://download.pytorch.org/whl/cu128
     python kb_bench.py --db fromChat/kb.sqlite --sample 100
-Первый запуск скачает модели с HF (BGE-M3 ~2.2 ГБ, BERTA ~0.5 ГБ).
+Первый запуск скачает модели с HF (BGE-M3 ~2.2 ГБ, e5-large ~2.2 ГБ,
+Qwen3-0.6B ~1.2 ГБ, BERTA ~0.5 ГБ).
 Только API-модели: --models openai-small,openai-large
 """
 from __future__ import annotations
@@ -48,6 +51,13 @@ MODELS = {
                'q_prefix': '', 'd_prefix': ''},
     'berta': {'kind': 'st', 'model': 'sergeyzh/BERTA',
               'q_prefix': 'search_query: ', 'd_prefix': 'search_document: '},
+    'e5-large': {'kind': 'st', 'model': 'intfloat/multilingual-e5-large',
+                 'q_prefix': 'query: ', 'd_prefix': 'passage: '},
+    'qwen3-0.6b': {'kind': 'st', 'model': 'Qwen/Qwen3-Embedding-0.6B',
+                   'q_prefix': 'Instruct: Given a web search query, retrieve '
+                               'relevant passages that answer the query'
+                               '\nQuery: ',
+                   'd_prefix': ''},
 }
 
 
@@ -118,12 +128,23 @@ def embed_st(texts: list[str], model_name: str, prefix: str, tag: str,
         arr = np.load(cache)
         if arr.shape[0] == len(texts):
             return arr
+    import torch
     from sentence_transformers import SentenceTransformer
-    st = SentenceTransformer(model_name)
-    arr = st.encode([prefix + t for t in texts], batch_size=16,
+    cuda = torch.cuda.is_available()
+    st = SentenceTransformer(
+        model_name, device='cuda' if cuda else 'cpu',
+        model_kwargs={'torch_dtype': torch.float16} if cuda else {})
+    # ~4000 симв. чанка ≈ 1000-1500 токенов; кап единый для всех моделей,
+    # иначе 8k-контекст bge-m3/qwen3 взорвёт память на длинных батчах
+    st.max_seq_length = min(st.max_seq_length or 2048, 2048)
+    arr = st.encode([prefix + t for t in texts],
+                    batch_size=32 if cuda else 8,
                     show_progress_bar=True, normalize_embeddings=True)
-    arr = arr.astype('float32')
+    arr = np.asarray(arr, dtype='float32')
     np.save(cache, arr)
+    del st
+    if cuda:
+        torch.cuda.empty_cache()
     return arr
 
 
@@ -155,7 +176,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--db', default='fromChat/kb.sqlite')
     parser.add_argument('--sample', type=int, default=100)
-    parser.add_argument('--models', default='openai-small,openai-large,bge-m3,berta')
+    parser.add_argument(
+        '--models',
+        default='openai-small,openai-large,bge-m3,berta,e5-large,qwen3-0.6b')
     parser.add_argument('--cache-dir', default='fromChat/bench_cache')
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
