@@ -56,6 +56,7 @@ services:
       EMBED_MODEL: ${EMBED_MODEL:-text-embedding-3-small}
       EMBED_DIM: ${EMBED_DIM:-512}
       ANSWER_MODEL: ${ANSWER_MODEL:-gpt-5-mini}
+      KB_WEB: ${KB_WEB:-0}
     volumes:
       - /volume1/docker/tg-kb:/app/kb
       # read-only: бот только отдаёт файлы по кнопке 📎 в /fw, пишет — качалка

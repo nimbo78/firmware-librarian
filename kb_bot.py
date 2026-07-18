@@ -32,6 +32,9 @@ ANSWER_CHAT_IDS = {int(x) for x in os.getenv('KB_ANSWER_CHAT_IDS', '').split(','
 # должен один раз нажать Start.
 ADMIN_IDS = {int(x) for x in os.getenv('KB_ADMIN_IDS', '').split(',') if x.strip()}
 ANSWER_MODEL = os.getenv('ANSWER_MODEL', 'gpt-5-mini')
+# KB_WEB=1: ответы могут дополняться веб-поиском (Responses API + web_search);
+# контекст чата приоритетен, веб-источники — отдельным блоком 🌐
+KB_WEB = os.getenv('KB_WEB', '0') == '1'
 SESSION = os.getenv('KB_BOT_SESSION', 'kb_bot')
 # Том загрузок качалки (read-only в compose): отсюда бот шлёт файлы по кнопке 📎
 DOWNLOAD_FOLDER = os.getenv('DOWNLOAD_FOLDER', './downloads')
@@ -129,12 +132,81 @@ def _extract_question(text: str) -> str | None:
     return None
 
 
+async def _expand_query(question: str) -> list[str]:
+    """Разворот сленга в термины: «зеркалка на 5735» → «port mirroring
+    S5735», «SPAN настройка зеркалирования». Пара альтернативных
+    формулировок ловит жаргон лучше любой смены модели эмбеддингов
+    (качество приоритетнее стоимости — решение владельца)."""
+    try:
+        oa = openai_client()
+        resp = await oa.chat.completions.create(
+            model=ANSWER_MODEL,
+            response_format={'type': 'json_object'},
+            messages=[{'role': 'user', 'content':
+                'Вопрос из чата про оборудование Huawei:\n' + question[:300] +
+                '\n\nСгенерируй 2 альтернативные поисковые формулировки: '
+                'разверни сленг/жаргон в официальные термины и добавь '
+                'англоязычный вариант с терминологией Huawei. '
+                'Верни JSON {"queries": ["...", "..."]}.'}])
+        data = json.loads(resp.choices[0].message.content or '{}')
+        out = [str(q).strip() for q in data.get('queries', [])
+               if str(q).strip()]
+        return out[:2]
+    except Exception as e:
+        logger.warning('query expansion failed: %s', e)
+        return []
+
+
+async def _search_expanded(question: str, oa) -> list:
+    """Поиск по вопросу + расширенным формулировкам, слияние через RRF
+    (тот же приём, что внутри store.search для вектора+FTS)."""
+    variants = [question] + await _expand_query(question)
+    if len(variants) > 1:
+        logger.info('Query expansion: %s', ' | '.join(variants[1:]))
+    vectors = await embed_texts(variants, client=oa)
+    scores: dict[tuple, float] = {}
+    by_key: dict[tuple, object] = {}
+    for variant, vec in zip(variants, vectors):
+        for rank, h in enumerate(store.search(variant, vec, top_k=TOP_K)):
+            key = (h.chat_id, h.msg_first)
+            by_key.setdefault(key, h)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank)
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    return [by_key[k] for k, _ in ranked[:TOP_K]]
+
+
+async def _answer_with_web(system: str, user: str, oa) -> tuple[str, list[str]]:
+    """Ответ через Responses API с веб-поиском. Возвращает (текст, веб-URL)."""
+    resp = await oa.responses.create(
+        model=ANSWER_MODEL,
+        tools=[{'type': 'web_search'}],
+        input=[{'role': 'system', 'content': system},
+               {'role': 'user', 'content': user}])
+    text = (getattr(resp, 'output_text', '') or '').strip()
+    if not text:
+        raise RuntimeError('empty web answer')
+    urls: list[str] = []
+    for item in getattr(resp, 'output', None) or []:
+        for part in getattr(item, 'content', None) or []:
+            for ann in getattr(part, 'annotations', None) or []:
+                url = getattr(ann, 'url', None)
+                if url and url not in urls:
+                    urls.append(url)
+    return text, urls[:5]
+
+
+WEB_PROMPT_EXTRA = (
+    ' Тебе доступен веб-поиск: используй его, чтобы дополнить или проверить '
+    'ответ (официальная документация Huawei, release notes, CVE), но опыт '
+    'из контекста чата приоритетен — он отражает реальную эксплуатацию.'
+)
+
+
 async def answer_question(question: str) -> tuple[str, bool]:
     """(текст ответа, нашлось ли что-то в базе) — found=False копится в /gaps."""
     oa = openai_client()
-    qvec = (await embed_texts([question], client=oa))[0]
-    hits = store.search(question, qvec, top_k=TOP_K)
-    if not hits:
+    hits = await _search_expanded(question, oa)
+    if not hits and not KB_WEB:
         return 'В базе знаний пока ничего не нашлось по этому вопросу.', False
     ctx_parts = []
     src_lines = []  # выровнено с нумерацией контекста: src_lines[i-1] = [i]
@@ -149,23 +221,38 @@ async def answer_question(question: str) -> tuple[str, bool]:
             src_lines.append(f'[{i}] файл «{h.topic_name}», стр. {h.msg_first}')
         else:
             src_lines.append(f'[{i}] обсуждение в чате, {h.date_from}')
-    # temperature/max_tokens не передаём: модели класса gpt-5 их не принимают
-    resp = await oa.chat.completions.create(
-        model=ANSWER_MODEL,
-        messages=[
-            {'role': 'system', 'content': SYSTEM_PROMPT},
-            {'role': 'user', 'content':
-                'Контекст:\n\n' + '\n\n'.join(ctx_parts) + f'\n\nВопрос: {question}'},
-        ])
-    answer = (resp.choices[0].message.content or '').strip()
+    context = ('Контекст:\n\n' + '\n\n'.join(ctx_parts)
+               if ctx_parts else 'Контекст из чата пуст.')
+    user_msg = f'{context}\n\nВопрос: {question}'
+    answer = ''
+    web_urls: list[str] = []
+    if KB_WEB:
+        try:
+            answer, web_urls = await _answer_with_web(
+                SYSTEM_PROMPT + WEB_PROMPT_EXTRA, user_msg, oa)
+        except Exception as e:
+            logger.warning('web answer failed, fallback to plain: %s', e)
+    if not answer:
+        if not hits:
+            return ('В базе знаний пока ничего не нашлось по этому '
+                    'вопросу.', False)
+        # temperature/max_tokens не передаём: модели класса gpt-5 их не принимают
+        resp = await oa.chat.completions.create(
+            model=ANSWER_MODEL,
+            messages=[{'role': 'system', 'content': SYSTEM_PROMPT},
+                      {'role': 'user', 'content': user_msg}])
+        answer = (resp.choices[0].message.content or '').strip()
     # В списке источников — только те, на которые LLM сослался в тексте:
     # иначе либо висячие [7] без ссылки, либо простыня из всех top-8
     cited = {int(n) for n in re.findall(r'\[(\d+)\]', answer)
              if 1 <= int(n) <= len(src_lines)}
     shown = ([src_lines[n - 1] for n in sorted(cited)]
              if cited else src_lines[:3])
-    answer += '\n\nИсточники:\n' + '\n'.join(shown)
-    return answer[:4000], True  # лимит сообщения Telegram — 4096
+    if shown:
+        answer += '\n\nИсточники:\n' + '\n'.join(shown)
+    if web_urls:
+        answer += '\n\n🌐 Веб:\n' + '\n'.join(web_urls)
+    return answer[:4000], bool(hits)  # лимит сообщения Telegram — 4096
 
 
 async def _send_answer(event, question: str) -> None:
