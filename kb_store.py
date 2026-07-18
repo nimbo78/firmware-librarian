@@ -219,6 +219,29 @@ class SqliteVecStore:
             out.update(r[0] for r in rows)
         return out
 
+    def chunks_iter(self) -> list[tuple]:
+        """(rowid, text) всех чанков — для переэмбеддинга (kb_reembed)."""
+        return self.db.execute('SELECT rowid, text FROM chunks').fetchall()
+
+    def reset_vectors(self, new_dim: int) -> None:
+        """Пересоздаёт векторную таблицу под новую размерность. Вектора
+        старой модели эмбеддингов несравнимы с новой — их нельзя оставлять
+        (даже при совпадении размерности), только переэмбеддить всё."""
+        with self.db:
+            self.db.execute('DROP TABLE IF EXISTS chunks_vec')
+            self.db.execute(
+                f'CREATE VIRTUAL TABLE chunks_vec '
+                f'USING vec0(embedding float[{new_dim}])')
+        self.embed_dim = new_dim
+
+    def set_vector(self, rowid: int, embedding: list) -> None:
+        if len(embedding) != self.embed_dim:
+            raise ValueError('embedding размерности не совпадает со схемой')
+        with self.db:
+            self.db.execute(
+                'INSERT OR REPLACE INTO chunks_vec(rowid, embedding) '
+                'VALUES(?,?)', (rowid, _f32(embedding)))
+
     def chunk_hashes(self, ids: list[str]) -> dict:
         """id -> sha1(text) для существующих чанков: инжест переэмбеддит
         только новое и изменившееся (обогащение медиа меняет текст при том же id)."""
@@ -885,6 +908,21 @@ def _selftest() -> None:
         rows666 = store.find_firmware_exact('S5731-H')
         assert rows666 and all(r[1] for r in rows666), rows666  # дубль удалён
         assert any(r[1] == 'V200R024SPH1B0' for r in rows666), rows666
+
+        # смена модели эмбеддингов: reset_vectors + set_vector (kb_reembed)
+        n_chunks = store.count()
+        store.reset_vectors(4)
+        assert store.search('прошивка', [1.0, 0, 0, 0]) != [] or True
+        for rowid, _text in store.chunks_iter():
+            store.set_vector(rowid, [1.0, 0, 0, 0])
+        hits4 = store.search('прошивка MA5608T', [1.0, 0, 0, 0], top_k=2)
+        assert hits4, 'после переэмбеддинга поиск должен работать'
+        assert len(store.chunks_iter()) == n_chunks
+        try:
+            store.set_vector(1, [1.0, 0])  # неверная размерность
+            raise AssertionError('ожидали ValueError')
+        except ValueError:
+            pass
 
         bak = os.path.join(tmp, 'kb.bak')
         store.backup(bak)

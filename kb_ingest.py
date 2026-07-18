@@ -108,6 +108,25 @@ def embed_cost(texts: list[str]) -> float:
     return sum(len(t) for t in texts) / 3 / 1e6 * EMBED_PRICE_PER_MTOK
 
 
+def embed_cfg() -> str:
+    return (f"{os.getenv('EMBED_MODEL', 'text-embedding-3-small')}"
+            f":{int(os.getenv('EMBED_DIM', '512'))}")
+
+
+def check_embed_cfg(store) -> str | None:
+    """Защита от смешанных векторов: эмбеддинги разных моделей несравнимы,
+    и молчаливая смена EMBED_MODEL/EMBED_DIM в .env дала бы мусорный поиск.
+
+    None — конфигурация совпадает (или зафиксирована впервые); иначе —
+    строка со старой конфигурацией: нужно прогнать kb_reembed.py."""
+    current = embed_cfg()
+    stored = store.get_state('embed_cfg')
+    if not stored:
+        store.set_state('embed_cfg', current)
+        return None
+    return None if stored == current else stored
+
+
 async def describe_image(data: bytes, mime: str = 'image/jpeg') -> str:
     oa = openai_client()
     b64 = base64.b64encode(data).decode('ascii')

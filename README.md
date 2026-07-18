@@ -323,6 +323,26 @@ KB_IMPLEMENTATION_PLAN.md   исходное техзадание подсист
 CLAUDE.md                   заметки для Claude Code
 ```
 
+## Смена модели эмбеддингов
+
+По умолчанию — `text-embedding-3-small` (512). Для максимума качества
+(русский чат + смешанная терминология) рекомендуется
+`text-embedding-3-large` + `EMBED_DIM=1024` — переэмбеддинг всей базы стоит
+доли доллара. Вектора разных моделей несравнимы, поэтому смена — только
+через полный переэмбеддинг:
+
+```sh
+# 1. в .env: EMBED_MODEL=text-embedding-3-large, EMBED_DIM=1024
+docker compose stop telegram-file-downloader kb-bot
+docker compose run --rm telegram-file-downloader python kb_reembed.py
+docker compose start telegram-file-downloader kb-bot
+```
+
+Telegram для этого не нужен (тексты уже в базе). Guard `embed_cfg` в state
+не даст качалке и боту работать со «смешанной» базой: если поменять .env и
+забыть про kb_reembed.py, инжест блокируется с событием админу, а бот на
+вопросы честно отвечает «переэмбеддируюсь».
+
 ## Переезд на Qdrant (когда понадобится)
 
 Триггеры: миллионы чанков, сетевые потребители базы. Процедура: контейнер

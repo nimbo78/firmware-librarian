@@ -230,6 +230,19 @@ async def kb_ingest_loop() -> None:
             continue
         if not client.is_connected():
             continue  # флажки не сбрасываем — попробуем через минуту
+        from kb_ingest import check_embed_cfg, embed_cfg
+        mismatch = check_embed_cfg(store)
+        if mismatch:
+            # смешанные вектора = молча мусорный поиск; лучше не инжестить
+            logger.error('KB ingest blocked: embed cfg %s в базе, %s в env — '
+                         'прогони kb_reembed.py', mismatch, embed_cfg())
+            store.add_event('error',
+                            f'Инжест заблокирован: база на {mismatch}, env '
+                            f'{embed_cfg()} — нужен kb_reembed.py')
+            store.set_state('ingest_request', '')
+            if due_daily:
+                store.set_state('ingest_done_date', today)
+            continue
         store.set_state('ingest_request', '')
         if due_daily:
             store.set_state('ingest_done_date', today)

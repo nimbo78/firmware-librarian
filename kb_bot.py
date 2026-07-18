@@ -170,6 +170,13 @@ async def answer_question(question: str) -> tuple[str, bool]:
 
 async def _send_answer(event, question: str) -> None:
     """Общий путь ответа (группа и личка): лог Q&A + кнопки оценки."""
+    from kb_ingest import check_embed_cfg
+    if check_embed_cfg(store):
+        # база на другой модели эмбеддингов: поиск был бы мусорным
+        await event.reply('База знаний переэмбеддируется (сменилась модель '
+                          'эмбеддингов) — вопросы временно недоступны. '
+                          'Админ: kb_reembed.py.')
+        return
     logger.info('Question from %s in %s: %s',
                 event.sender_id, event.chat_id, question[:100])
     try:

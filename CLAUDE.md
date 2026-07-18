@@ -96,6 +96,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **kb-bot не падает без конфига**: без `KB_BOT_TOKEN`/`KB_ANSWER_CHAT_IDS` уходит в вечный sleep с ошибкой в логе (чтобы не крутить crash-loop под `restart: unless-stopped`). Для упоминаний боту нужен выключенный privacy mode (`/setprivacy` → Disable в BotFather).
 - **Запросы FTS санитизируются** ([kb_store.py:251-263](kb_store.py#L251-L263)) — сырой пользовательский текст в `MATCH` роняет FTS5-синтаксис.
 - **Для моделей класса gpt-5 не передавать `temperature`/`max_tokens`** ([kb_bot.py:120-128](kb_bot.py#L120-L128)).
+- **Смена модели эмбеддингов — только через [kb_reembed.py](kb_reembed.py)** (оба сервиса остановить; Telegram не нужен — тексты в базе). Вектора разных моделей несравнимы даже при равной размерности; guard `check_embed_cfg` ([kb_ingest.py](kb_ingest.py), state `embed_cfg`) блокирует инжест (событие админу) и ответы бота, если env разошёлся с базой. `reset_vectors` пересоздаёт `chunks_vec` под новую размерность; state обновляется только после успешного прогона. Рекомендация владельцу: `text-embedding-3-large` + `EMBED_DIM=1024`.
 
 ## Устойчивость к сетевым сбоям
 
