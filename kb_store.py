@@ -184,6 +184,10 @@ class SqliteVecStore:
             "ALTER TABLE qa_log ADD COLUMN msg_id INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE qa_log ADD COLUMN gap_posted INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE qa_log ADD COLUMN gap_closed INTEGER NOT NULL DEFAULT 0",
+            # диалоги: id сообщения-ответа бота (реплай на него = follow-up)
+            # и ссылка на родительский Q&A для восстановления цепочки
+            "ALTER TABLE qa_log ADD COLUMN answer_msg_id INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE qa_log ADD COLUMN parent_qa_id INTEGER NOT NULL DEFAULT 0",
         ):
             try:
                 with self.db:
@@ -651,14 +655,46 @@ class SqliteVecStore:
                     (model,))
 
     def log_qa(self, chat_id: int, user_id: int, question: str,
-               answer: str, found: bool, msg_id: int = 0) -> int:
+               answer: str, found: bool, msg_id: int = 0,
+               parent_qa_id: int = 0) -> int:
         with self.db:
             cur = self.db.execute(
-                'INSERT INTO qa_log(chat_id, user_id, question, answer, found, msg_id) '
-                'VALUES(?,?,?,?,?,?)',
+                'INSERT INTO qa_log(chat_id, user_id, question, answer, '
+                'found, msg_id, parent_qa_id) VALUES(?,?,?,?,?,?,?)',
                 (chat_id, user_id, question[:500], answer[:1000],
-                 1 if found else 0, msg_id))
+                 1 if found else 0, msg_id, parent_qa_id))
             return cur.lastrowid
+
+    def set_qa_answer_msg(self, qa_id: int, answer_msg_id: int) -> None:
+        """Фиксирует id сообщения-ответа бота: реплай на него — follow-up."""
+        with self.db:
+            self.db.execute('UPDATE qa_log SET answer_msg_id=? WHERE id=?',
+                            (answer_msg_id, qa_id))
+
+    def qa_by_answer_msg(self, chat_id: int, answer_msg_id: int) -> int | None:
+        """id Q&A, чьим ответом является сообщение бота (или None)."""
+        row = self.db.execute(
+            'SELECT id FROM qa_log WHERE chat_id=? AND answer_msg_id=?',
+            (chat_id, answer_msg_id)).fetchone()
+        return row[0] if row else None
+
+    def qa_dialog(self, qa_id: int, depth: int = 3) -> list[tuple[str, str]]:
+        """Цепочка (вопрос, ответ) от корня к qa_id включительно, не глубже
+        depth последних обменов — контекст follow-up-вопросов."""
+        chain: list[tuple[str, str]] = []
+        cur = qa_id
+        for _ in range(depth):
+            row = self.db.execute(
+                'SELECT question, answer, parent_qa_id FROM qa_log WHERE id=?',
+                (cur,)).fetchone()
+            if not row:
+                break
+            chain.append((row[0], row[1]))
+            if not row[2]:
+                break
+            cur = row[2]
+        chain.reverse()
+        return chain
 
     def set_qa_rating(self, qa_id: int, rating: int) -> str | None:
         """Ставит оценку, возвращает текст вопроса (для события админу)."""
@@ -913,6 +949,20 @@ def _selftest() -> None:
         qa_id = store.log_qa(-1001234, 777, 'как прошить ONT?', 'вот так', True,
                              msg_id=100)
         assert store.set_qa_rating(qa_id, -1) == 'как прошить ONT?'
+
+        # диалоговая цепочка: реплай на ответ бота -> follow-up
+        store.set_qa_answer_msg(qa_id, 555)
+        assert store.qa_by_answer_msg(-1001234, 555) == qa_id
+        assert store.qa_by_answer_msg(-1001234, 556) is None
+        assert store.qa_by_answer_msg(-999, 555) is None, 'чужой чат'
+        fu_id = store.log_qa(-1001234, 777, 'а на R024?', 'на R024 иначе',
+                             True, msg_id=102, parent_qa_id=qa_id)
+        store.set_qa_answer_msg(fu_id, 556)
+        dialog = store.qa_dialog(fu_id)
+        assert dialog == [('как прошить ONT?', 'вот так'),
+                          ('а на R024?', 'на R024 иначе')], dialog
+        assert store.qa_dialog(fu_id, depth=1) == \
+            [('а на R024?', 'на R024 иначе')]
         store.log_qa(-1001234, 778, 'про что-то неизвестное', '', False,
                      msg_id=101)
         assert len(store.gaps()) == 2
@@ -933,7 +983,8 @@ def _selftest() -> None:
         assert abs(s['events_cost'] - 0.12) < 1e-9
         # 6 моделей: MA5608T, S5700, S5735-L, MA5800, TEST1, MA5900 (авто-review)
         assert s['files'] == 5 and s['fw_models'] == 6, (s['files'], s['fw_models'])
-        assert s['qa_7d'] == 2 and s['qa_bad_7d'] == 1 and s['qa_nohit_7d'] == 1
+        # 3 вопроса: исходный, follow-up диалога и вопрос без ответа
+        assert s['qa_7d'] == 3 and s['qa_bad_7d'] == 1 and s['qa_nohit_7d'] == 1
 
         # файлы-сироты: в журнале и на диске, но без сообщения в каталоге
         import kb_firmware

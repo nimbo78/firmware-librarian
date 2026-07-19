@@ -63,6 +63,8 @@ def _user_help() -> str:
         '\n'
         '❓ Вопросы по базе знаний (история чата + документация):\n'
         f'• /ask <вопрос> — или просто упомяни меня: {mention} <вопрос>\n'
+        '• Ответь реплаем на мой ответ — продолжу диалог с учётом контекста\n'
+        '  (можно уточнять: «а на R024?», «подробнее про DFS»).\n'
         '• Под ответом кнопки 👍/👎 — оценки делают базу лучше.\n'
         '• Если ответа не нашлось — вопрос запоминается; как только в чате\n'
         '  появится обсуждение, я сам отвечу реплаем.\n'
@@ -157,10 +159,12 @@ async def _expand_query(question: str) -> list[str]:
         return []
 
 
-async def _search_expanded(question: str) -> list:
+async def _search_expanded(question: str, extra: list[str] = ()) -> list:
     """Поиск по вопросу + расширенным формулировкам, слияние через RRF
-    (тот же приём, что внутри store.search для вектора+FTS)."""
-    variants = [question] + await _expand_query(question)
+    (тот же приём, что внутри store.search для вектора+FTS).
+    extra — доп. варианты (вопросы из диалога: follow-up «а на R024?» сам
+    по себе не несёт сущностей, их держит предыдущий вопрос)."""
+    variants = [question] + list(extra) + await _expand_query(question)
     if len(variants) > 1:
         logger.info('Query expansion: %s', ' | '.join(variants[1:]))
     try:
@@ -208,10 +212,12 @@ WEB_PROMPT_EXTRA = (
 )
 
 
-async def answer_question(question: str) -> tuple[str, bool]:
-    """(текст ответа, нашлось ли что-то в базе) — found=False копится в /gaps."""
+async def answer_question(question: str,
+                          dialog: list[tuple[str, str]] = ()) -> tuple[str, bool]:
+    """(текст ответа, нашлось ли что-то в базе) — found=False копится в /gaps.
+    dialog — предыдущие обмены (вопрос, ответ) при follow-up реплаем."""
     oa = openai_client()
-    hits = await _search_expanded(question)
+    hits = await _search_expanded(question, extra=[q for q, _ in dialog])
     if not hits and not KB_WEB:
         return 'В базе знаний пока ничего не нашлось по этому вопросу.', False
     ctx_parts = []
@@ -232,7 +238,13 @@ async def answer_question(question: str) -> tuple[str, bool]:
             src_lines.append(f'[{i}] обсуждение в чате, {h.date_from}')
     context = ('Контекст:\n\n' + '\n\n'.join(ctx_parts)
                if ctx_parts else 'Контекст из чата пуст.')
-    user_msg = f'{context}\n\nВопрос: {question}'
+    dialog_block = ''
+    if dialog:
+        turns = [f'Вопрос: {q}\nТвой ответ: {a[:800]}' for q, a in dialog]
+        dialog_block = ('Предыдущий диалог (пользователь ответил на твоё '
+                        'последнее сообщение — вопрос ниже продолжает его):\n'
+                        + '\n\n'.join(turns) + '\n\n')
+    user_msg = f'{dialog_block}{context}\n\nВопрос: {question}'
     answer = ''
     web_urls: list[str] = []
     if KB_WEB:
@@ -264,8 +276,9 @@ async def answer_question(question: str) -> tuple[str, bool]:
     return answer[:4000], bool(hits)  # лимит сообщения Telegram — 4096
 
 
-async def _send_answer(event, question: str) -> None:
-    """Общий путь ответа (группа и личка): лог Q&A + кнопки оценки."""
+async def _send_answer(event, question: str, parent_qa_id: int = 0) -> None:
+    """Общий путь ответа (группа и личка): лог Q&A + кнопки оценки.
+    parent_qa_id != 0 — follow-up: в промпт и поиск идёт цепочка диалога."""
     from kb_ingest import check_embed_cfg
     if check_embed_cfg(store):
         # база на другой модели эмбеддингов: поиск был бы мусорным
@@ -273,20 +286,25 @@ async def _send_answer(event, question: str) -> None:
                           'эмбеддингов) — вопросы временно недоступны. '
                           'Админ: kb_reembed.py.')
         return
-    logger.info('Question from %s in %s: %s',
-                event.sender_id, event.chat_id, question[:100])
+    dialog = store.qa_dialog(parent_qa_id) if parent_qa_id else []
+    logger.info('Question from %s in %s%s: %s',
+                event.sender_id, event.chat_id,
+                ' (follow-up)' if dialog else '', question[:100])
     try:
-        answer, found = await answer_question(question)
+        answer, found = await answer_question(question, dialog=dialog)
     except Exception as e:
         logger.warning('Answer failed: %s', e)
         await event.reply('Не получилось получить ответ, попробуй позже.')
         return
     qa_id = store.log_qa(event.chat_id or 0, event.sender_id or 0,
                          question, answer, found,
-                         msg_id=event.message.id)  # для авто-ответа реплаем
+                         msg_id=event.message.id,  # для авто-ответа реплаем
+                         parent_qa_id=parent_qa_id)
     buttons = [[Button.inline('👍', f'r:{qa_id}:1'.encode()),
                 Button.inline('👎', f'r:{qa_id}:-1'.encode())]]
-    await event.reply(answer, link_preview=False, buttons=buttons)
+    sent = await event.reply(answer, link_preview=False, buttons=buttons)
+    # реплай на это сообщение = продолжение диалога
+    store.set_qa_answer_msg(qa_id, sent.id)
 
 
 # порядок и подписи секций общего рендера каталога (используются также в /sw)
@@ -763,7 +781,11 @@ async def handle_admin(event) -> None:
         if not question:
             await event.reply(_user_help() + ADMIN_HELP_EXTRA)
             return
-        await _send_answer(event, question)
+        parent_qa = 0
+        reply_id = event.message.reply_to_msg_id
+        if reply_id:
+            parent_qa = store.qa_by_answer_msg(event.chat_id, reply_id) or 0
+        await _send_answer(event, question, parent_qa_id=parent_qa)
 
 
 async def notifier_loop() -> None:
@@ -819,13 +841,17 @@ async def auto_answer_gaps() -> int:
                     Button.inline('👎', f'r:{new_qa}:-1'.encode())]]
         text = 'Появился ответ на вопрос выше:\n\n' + answer
         try:
-            await client.send_message(chat_id, text[:4000], reply_to=msg_id,
-                                      buttons=buttons, link_preview=False)
+            sent = await client.send_message(chat_id, text[:4000],
+                                             reply_to=msg_id,
+                                             buttons=buttons,
+                                             link_preview=False)
         except Exception:
             # исходное сообщение могли удалить — отвечаем без реплая, с цитатой
             text = f'По вопросу «{question[:200]}»:\n\n{answer}'
-            await client.send_message(chat_id, text[:4000],
-                                      buttons=buttons, link_preview=False)
+            sent = await client.send_message(chat_id, text[:4000],
+                                             buttons=buttons,
+                                             link_preview=False)
+        store.set_qa_answer_msg(new_qa, sent.id)  # реплай на него = follow-up
         store.mark_gap_closed(qa_id)
         answered += 1
     if answered:
@@ -907,9 +933,17 @@ async def handler(event):
         _last_ask[event.sender_id] = now
         await _handle_download(event, text)
         return
+    # реплай на ответ бота = продолжение диалога: /ask и упоминание не нужны,
+    # цепочка предыдущих Q&A уходит в промпт и в поиск
+    parent_qa = 0
+    reply_id = event.message.reply_to_msg_id
+    if reply_id:
+        parent_qa = store.qa_by_answer_msg(event.chat_id, reply_id) or 0
     question = _extract_question(text)
     if question is None:
-        return
+        if not parent_qa or not text:
+            return
+        question = text  # follow-up без команды
     if not question:
         await event.reply('Напиши вопрос после команды: /ask как прошить ONT')
         return
@@ -918,7 +952,7 @@ async def handler(event):
         await event.reply('Подожди немного перед следующим вопросом.')
         return
     _last_ask[event.sender_id] = now
-    await _send_answer(event, question)
+    await _send_answer(event, question, parent_qa_id=parent_qa)
 
 
 @client.on(events.CallbackQuery(pattern=rb'^n:'))
