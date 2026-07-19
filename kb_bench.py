@@ -108,12 +108,25 @@ def embed_openai(texts: list[str], model: str, dim: int, tag: str,
         arr = np.load(cache)
         if arr.shape[0] == len(texts):
             return arr
+    import time
     from openai import OpenAI
     oa = OpenAI()
     out = []
     for i in range(0, len(texts), 96):
         batch = [t[:20000] for t in texts[i:i + 96]]
-        resp = oa.embeddings.create(model=model, input=batch, dimensions=dim)
+        # корпус целиком легко упирается в TPM-лимит эмбеддингов — ретрай
+        for attempt in range(8):
+            try:
+                resp = oa.embeddings.create(model=model, input=batch,
+                                            dimensions=dim)
+                break
+            except Exception as e:
+                if attempt == 7:
+                    raise
+                wait = 10 * (attempt + 1)
+                print(f'  {tag}: {e.__class__.__name__}, ретрай через {wait} с',
+                      flush=True)
+                time.sleep(wait)
         out.extend(d.embedding for d in resp.data)
         print(f'  {tag}: {min(i + 96, len(texts))}/{len(texts)}', flush=True)
     arr = np.asarray(out, dtype='float32')
