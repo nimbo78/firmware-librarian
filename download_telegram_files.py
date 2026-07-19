@@ -289,6 +289,20 @@ async def kb_ingest_loop() -> None:
             except Exception as e:
                 logger.warning('KB PDF ingest failed: %s', e)
                 store.add_event('error', f'PDF-инжест упал: {e}')
+        from kb_hedex import hedex_enabled
+        if hedex_enabled():
+            try:
+                from kb_hedex import ingest_hdx
+                files, chunks, cost = await ingest_hdx(store, DOWNLOAD_FOLDER)
+                if files:
+                    logger.info('KB HedEx ingest: %d packages -> %d chunks, '
+                                '~$%.2f', files, chunks, cost)
+                    store.add_event('hedex',
+                                    f'HedEx-инжест: {files} пакетов -> '
+                                    f'{chunks} чанков', cost)
+            except Exception as e:
+                logger.warning('KB HedEx ingest failed: %s', e)
+                store.add_event('error', f'HedEx-инжест упал: {e}')
         try:
             from kb_extract import run_extraction
             fw_added, dev_added, cost = await run_extraction(store)

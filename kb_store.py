@@ -42,6 +42,9 @@ class ScoredChunk:
     date_from: str
     msg_first: int
     text: str
+    # 0 или id топика Telegram; конвенция для синтетических чатов (chat_id>0):
+    # 0 — PDF (kb_pdf), 1 — HedEx-документация (kb_hedex)
+    topic_id: int = 0
 
 
 def _f32(vec) -> bytes:
@@ -300,10 +303,21 @@ class SqliteVecStore:
         out = []
         for rowid, score in best:
             row = self.db.execute(
-                'SELECT chat_id, topic_name, date_from, msg_first, text '
+                'SELECT chat_id, topic_name, date_from, msg_first, text, topic_id '
                 'FROM chunks WHERE rowid=?', (rowid,)).fetchone()
             if row:
                 out.append(ScoredChunk(score, *row))
+        return out
+
+    def doc_text_hashes(self) -> set[str]:
+        """sha1 ТЕЛА (текст без первой строки-заголовка) всех HedEx-чанков —
+        кросс-версионный дедуп страниц документации: заголовок содержит
+        версию пакета, поэтому хэшируется только тело."""
+        out: set[str] = set()
+        for (text,) in self.db.execute(
+                'SELECT text FROM chunks WHERE topic_id=1 AND chat_id>0'):
+            body = text.split('\n', 1)[1] if '\n' in text else text
+            out.add(hashlib.sha1(body.encode('utf-8')).hexdigest())
         return out
 
     def get_state(self, key: str, default: str | None = None) -> str | None:

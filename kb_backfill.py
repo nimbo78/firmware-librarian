@@ -52,6 +52,9 @@ def _progress(stage: str, done: int, total: int, cost: float) -> None:
         print(f'  эмбеддинги: {done}/{total}, потрачено ~${cost:.2f}', flush=True)
     elif stage == 'pdf':
         print(f'  PDF: {done} файлов, потрачено ~${cost:.2f}', flush=True)
+    elif stage == 'hedex':
+        print(f'  HedEx: {done} пакетов, {total} чанков, '
+              f'потрачено ~${cost:.2f}', flush=True)
 
 
 async def _dry_run(client, chat_ids: list[int], download_folder: str) -> None:
@@ -83,6 +86,17 @@ async def _dry_run(client, chat_ids: list[int], download_folder: str) -> None:
               f'-> эмбеддинги ~${pdf_cost:.2f}')
     else:
         print('PDF: KB_PDF выключен — не считается')
+    from kb_hedex import hedex_enabled
+    if hedex_enabled():
+        from kb_hedex import scan_hdx
+        files, chars = scan_hdx(open_store(), download_folder)
+        hedex_cost = chars / 3 / 1e6 * EMBED_PRICE_PER_MTOK
+        total += hedex_cost
+        print(f'HedEx в {download_folder}: новых пакетов {files} '
+              f'-> эмбеддинги ~${hedex_cost:.2f} (без кросс-версионного '
+              f'дедупа — реально будет меньше)')
+    else:
+        print('HedEx: KB_HEDEX выключен — не считается')
     print(f'\nИтого оценка: ~${total:.2f}')
     print('Подсказка: --max-cost N остановит боевой прогон при достижении N$.')
 
@@ -185,6 +199,17 @@ async def _backfill(client, chat_ids: list[int], download_folder: str,
                 store, download_folder, progress=_progress, max_cost=remaining())
             spent += cost
             print(f'PDF: {files} файлов -> {chunks} чанков, ~${cost:.2f}')
+        except BudgetExceeded as e:
+            spent += e.cost
+            stopped = True
+    from kb_hedex import hedex_enabled
+    if hedex_enabled() and not stopped:
+        from kb_hedex import ingest_hdx
+        try:
+            files, chunks, cost = await ingest_hdx(
+                store, download_folder, progress=_progress, max_cost=remaining())
+            spent += cost
+            print(f'HedEx: {files} пакетов -> {chunks} чанков, ~${cost:.2f}')
         except BudgetExceeded as e:
             spent += e.cost
             stopped = True

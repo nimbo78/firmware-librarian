@@ -222,6 +222,9 @@ async def answer_question(question: str) -> tuple[str, bool]:
         link = _msg_link(h.chat_id, h.msg_first)
         if link:
             src_lines.append(f'[{i}] {link}')
+        elif h.chat_id > 0 and h.topic_id == 1:
+            # HedEx-чанк (kb_hedex.py): topic_name = «продукт версия — раздел»
+            src_lines.append(f'[{i}] документация: {h.topic_name}')
         elif h.chat_id > 0:
             # PDF-чанк: синтетический положительный chat_id (см. kb_pdf.py)
             src_lines.append(f'[{i}] файл «{h.topic_name}», стр. {h.msg_first}')
