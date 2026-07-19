@@ -62,9 +62,17 @@ def _file_md5(path: str) -> str:
 
 
 def list_hdx(folder: str) -> list[str]:
+    """Относительные пути .hdx, рекурсивно — включая hedex_extracted/,
+    куда kb_archive складывает пакеты, извлечённые из архивов."""
     if not os.path.isdir(folder):
         return []
-    return sorted(n for n in os.listdir(folder) if n.lower().endswith('.hdx'))
+    out = []
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        for n in files:
+            if n.lower().endswith('.hdx'):
+                out.append(os.path.relpath(os.path.join(root, n), folder))
+    return sorted(out)
 
 
 def parse_profile(z: zipfile.ZipFile) -> dict:

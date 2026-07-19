@@ -289,6 +289,20 @@ async def kb_ingest_loop() -> None:
             except Exception as e:
                 logger.warning('KB PDF ingest failed: %s', e)
                 store.add_event('error', f'PDF-инжест упал: {e}')
+        from kb_archive import archive_enabled
+        if archive_enabled():
+            try:
+                from kb_archive import process_archives
+                arcs, chunks, cost = await process_archives(store, DOWNLOAD_FOLDER)
+                if arcs:
+                    logger.info('KB archive scan: %d archives -> %d chunks, '
+                                '~$%.2f', arcs, chunks, cost)
+                    store.add_event('archive',
+                                    f'Архивы: {arcs} просмотрено -> '
+                                    f'{chunks} чанков', cost)
+            except Exception as e:
+                logger.warning('KB archive scan failed: %s', e)
+                store.add_event('error', f'Скан архивов упал: {e}')
         from kb_hedex import hedex_enabled
         if hedex_enabled():
             try:

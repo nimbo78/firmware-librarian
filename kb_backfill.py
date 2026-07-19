@@ -55,6 +55,9 @@ def _progress(stage: str, done: int, total: int, cost: float) -> None:
     elif stage == 'hedex':
         print(f'  HedEx: {done} пакетов, {total} чанков, '
               f'потрачено ~${cost:.2f}', flush=True)
+    elif stage == 'archive':
+        print(f'  архивы: {done} просмотрено, {total} чанков, '
+              f'потрачено ~${cost:.2f}', flush=True)
 
 
 async def _dry_run(client, chat_ids: list[int], download_folder: str) -> None:
@@ -86,6 +89,16 @@ async def _dry_run(client, chat_ids: list[int], download_folder: str) -> None:
               f'-> эмбеддинги ~${pdf_cost:.2f}')
     else:
         print('PDF: KB_PDF выключен — не считается')
+    from kb_archive import archive_enabled
+    if archive_enabled():
+        from kb_archive import scan_archives
+        files, chars = scan_archives(open_store(), download_folder)
+        arc_cost = chars / 3 / 1e6 * EMBED_PRICE_PER_MTOK
+        total += arc_cost
+        print(f'Архивы в {download_folder}: новых {files} '
+              f'-> эмбеддинги ~${arc_cost:.2f} (грубая оценка по листингам)')
+    else:
+        print('Архивы: KB_ARCHIVE выключен — не считается')
     from kb_hedex import hedex_enabled
     if hedex_enabled():
         from kb_hedex import scan_hdx
@@ -199,6 +212,18 @@ async def _backfill(client, chat_ids: list[int], download_folder: str,
                 store, download_folder, progress=_progress, max_cost=remaining())
             spent += cost
             print(f'PDF: {files} файлов -> {chunks} чанков, ~${cost:.2f}')
+        except BudgetExceeded as e:
+            spent += e.cost
+            stopped = True
+    from kb_archive import archive_enabled
+    if archive_enabled() and not stopped:
+        from kb_archive import process_archives
+        try:
+            arcs, chunks, cost = await process_archives(
+                store, download_folder, progress=_progress,
+                max_cost=remaining())
+            spent += cost
+            print(f'Архивы: {arcs} просмотрено -> {chunks} чанков, ~${cost:.2f}')
         except BudgetExceeded as e:
             spent += e.cost
             stopped = True

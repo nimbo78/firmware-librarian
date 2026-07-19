@@ -25,6 +25,7 @@ services:
       KB_VOICE: ${KB_VOICE:-0}
       KB_PDF: ${KB_PDF:-0}
       KB_HEDEX: ${KB_HEDEX:-0}
+      KB_ARCHIVE: ${KB_ARCHIVE:-0}
       KB_VISION_MODEL: ${KB_VISION_MODEL:-gpt-5-mini}
       KB_ADMIN_IDS: ${KB_ADMIN_IDS:-}
     volumes:

@@ -127,6 +127,15 @@ class SqliteVecStore:
                     llm_done INTEGER NOT NULL DEFAULT 0,
                     kind TEXT NOT NULL DEFAULT ''
                 )''')
+            # Листинг содержимого архивов (kb_archive): что лежит внутри
+            # zip/rar/7z/tar — для каталога по внутренностям и показа состава
+            self.db.execute('''
+                CREATE TABLE IF NOT EXISTS archive_files(
+                    archive_md5 TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    size INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(archive_md5, path)
+                )''')
             # Устройства и серии (фаза B): S5735-L (kind=model, parent=S5700),
             # S5700 (kind=series). Низкоуверенные связки ждут /review.
             self.db.execute('''
@@ -397,6 +406,27 @@ class SqliteVecStore:
     def set_file_md5(self, doc_id: int, md5: str) -> None:
         with self.db:
             self.db.execute('UPDATE files SET md5=? WHERE doc_id=?', (md5, doc_id))
+
+    def doc_id_by_md5(self, md5: str) -> int | None:
+        row = self.db.execute(
+            'SELECT doc_id FROM files WHERE md5=?', (md5,)).fetchone()
+        return row[0] if row else None
+
+    def upsert_archive_files(self, archive_md5: str,
+                             members: list[tuple[str, int]]) -> None:
+        """Листинг архива целиком заменяется (повторный скан = свежая правда)."""
+        with self.db:
+            self.db.execute('DELETE FROM archive_files WHERE archive_md5=?',
+                            (archive_md5,))
+            self.db.executemany(
+                'INSERT OR REPLACE INTO archive_files(archive_md5, path, size) '
+                'VALUES(?,?,?)',
+                [(archive_md5, p, s) for p, s in members])
+
+    def archive_members(self, archive_md5: str) -> list[tuple[str, int]]:
+        return self.db.execute(
+            'SELECT path, size FROM archive_files WHERE archive_md5=? '
+            'ORDER BY path', (archive_md5,)).fetchall()
 
     def set_file_kind(self, doc_id: int, kind: str) -> None:
         with self.db:
@@ -932,6 +962,16 @@ def _selftest() -> None:
         assert any(r[1] == 'V200R024SPH1B0' for r in rows666), rows666
 
         # смена модели эмбеддингов: reset_vectors + set_vector (kb_reembed)
+        # листинг архивов + поиск doc_id по md5 (kb_archive)
+        store.upsert_archive_files('a' * 32, [('inner/S5735.cc', 100),
+                                              ('rn.pdf', 5)])
+        assert store.archive_members('a' * 32) == [('inner/S5735.cc', 100),
+                                                   ('rn.pdf', 5)]
+        store.upsert_archive_files('a' * 32, [('other.txt', 1)])
+        assert store.archive_members('a' * 32) == [('other.txt', 1)], \
+            'повторный скан должен заменять листинг целиком'
+        assert store.doc_id_by_md5('нет такого') is None
+
         n_chunks = store.count()
         store.reset_vectors(4)
         assert store.search('прошивка', [1.0, 0, 0, 0]) != [] or True

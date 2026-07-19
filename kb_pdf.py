@@ -32,9 +32,16 @@ def _file_md5(path: str) -> str:
 
 
 def _list_pdfs(folder: str) -> list[str]:
+    """Относительные пути PDF, рекурсивно (подпапки — ручная раскладка)."""
     if not os.path.isdir(folder):
         return []
-    return sorted(n for n in os.listdir(folder) if n.lower().endswith('.pdf'))
+    out = []
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        for n in files:
+            if n.lower().endswith('.pdf'):
+                out.append(os.path.relpath(os.path.join(root, n), folder))
+    return sorted(out)
 
 
 def scan_pdfs(folder: str) -> tuple[int, int]:

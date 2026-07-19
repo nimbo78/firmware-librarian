@@ -3,3 +3,7 @@ openai>=1.55,<3
 sqlite-vec>=0.1.6
 pypdf>=4,<6
 Pillow>=10,<13
+# kb_archive: просмотр архивов (KB_ARCHIVE=1)
+py7zr>=0.20,<1
+rarfile>=4.1,<5
+openpyxl>=3.1,<4
