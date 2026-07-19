@@ -259,21 +259,24 @@ class _RarReader:
 
 
 def open_archive(path: str):
-    low = path.lower()
-    if low.endswith('.zip'):
+    """Формат определяется по СИГНАТУРЕ, не по расширению: в реальной папке
+    встречаются rar/7z, названные .zip (Huawei), — расширение лишь фолбэк."""
+    with open(path, 'rb') as f:
+        head = f.read(8)
+    if head.startswith(b'PK'):
         return _ZipReader(path)
-    if low.endswith('.rar'):
+    if head.startswith(b'Rar!'):
         return _RarReader(path)
-    if low.endswith('.7z'):
+    if head.startswith(b'7z\xbc\xaf'):
         return _SevenZipReader(path)
-    if low.endswith(('.tar', '.tar.gz', '.tgz')):
-        return _TarReader(path)
-    if low.endswith('.gz'):
-        import tarfile
+    import tarfile
+    if head.startswith(b'\x1f\x8b'):  # gzip: tar.gz или одиночный .gz
         if tarfile.is_tarfile(path):
             return _TarReader(path)
         return _GzReader(path)
-    raise ValueError(f'не архив: {path}')
+    if tarfile.is_tarfile(path):  # ustar-магия лежит на смещении 257
+        return _TarReader(path)
+    raise ValueError(f'неизвестный формат (первые байты: {head!r})')
 
 
 # --- извлечение текста из членов ---
@@ -294,8 +297,12 @@ def docx_text(data: bytes) -> str:
 
 def xlsx_text(data: bytes) -> str:
     """Листы -> строки текстом; openpyxl read-only (потоковый)."""
+    import warnings
     from openpyxl import load_workbook
-    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    with warnings.catch_warnings():
+        # хуавеевские xlsx массово без default style — шум в журнале NAS
+        warnings.simplefilter('ignore')
+        wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     parts: list[str] = []
     for ws in wb.worksheets:
         parts.append(f'== Лист: {ws.title} ==')
@@ -511,11 +518,32 @@ def scan_archives(store, folder: str) -> tuple[int, int]:
     return files, chars
 
 
+def _process_archive_sync(path: str, arc_name: str, md5: str,
+                          folder: str) -> tuple[list, list, int]:
+    """Тяжёлая синхронная часть одного архива (листинг, извлечение .hdx,
+    парсинг текста). Вызывается через asyncio.to_thread: часы распаковки
+    в event loop качалки глушат Telethon — сокет не читается, и после
+    возврата сыплется «Server sent a very old message» + Security error."""
+    reader = open_archive(path)
+    try:
+        members = reader.members()
+        extracted = extract_containers(path, arc_name,
+                                       os.path.join(folder, HEDEX_SUBDIR),
+                                       reader=reader)
+        chunks = archive_text_chunks(path, md5, arc_name, reader=reader)
+    finally:
+        reader.close()
+    return members, chunks, extracted
+
+
 async def process_archives(store, folder: str, progress=None,
                            max_cost: float | None = None
                            ) -> tuple[int, int, float]:
     """Полный проход: листинг + каталог + текст в RAG + извлечение .hdx.
-    Возвращает (архивов, чанков, стоимость $)."""
+    Возвращает (архивов, чанков, стоимость $). Работа с store — только
+    из основного потока (sqlite-коннект не потокобезопасен)."""
+    import asyncio
+
     from kb_ingest import BudgetExceeded, EMBED_BATCH, embed_cost, embed_texts
 
     journal = _load_md5_journal(folder)
@@ -525,34 +553,23 @@ async def process_archives(store, folder: str, progress=None,
     for rel in list_archives(folder):
         path = os.path.join(folder, rel)
         arc_name = os.path.basename(rel)
-        md5 = journal.get(arc_name) or _file_md5(path)
+        md5 = journal.get(arc_name)
+        if not md5:
+            md5 = await asyncio.to_thread(_file_md5, path)
         if store.get_state(f'archive_scanned:{md5}'):
             continue
         try:
-            reader = open_archive(path)
-        except Exception as e:
-            logger.warning('archive open failed %s: %s', rel, e)
-            continue
-        try:
-            members = reader.members()
-            store.upsert_archive_files(md5, members)
-
-            doc_id = store.doc_id_by_md5(md5)
-            if doc_id is not None:
-                for model, version, key in inner_firmware(members):
-                    store.upsert_firmware(doc_id, model, version, key,
-                                          source='archive')
-
-            extract_containers(path, arc_name,
-                               os.path.join(folder, HEDEX_SUBDIR),
-                               reader=reader)
-
-            chunks = archive_text_chunks(path, md5, arc_name, reader=reader)
+            members, chunks, _ = await asyncio.to_thread(
+                _process_archive_sync, path, arc_name, md5, folder)
         except Exception as e:
             logger.warning('archive processing failed %s: %s', rel, e)
-            reader.close()
             continue
-        reader.close()
+        store.upsert_archive_files(md5, members)
+        doc_id = store.doc_id_by_md5(md5)
+        if doc_id is not None:
+            for model, version, key in inner_firmware(members):
+                store.upsert_firmware(doc_id, model, version, key,
+                                      source='archive')
 
         known = store.existing_ids([c.id for c in chunks])
         new_chunks = [c for c in chunks if c.id not in known]
@@ -648,6 +665,20 @@ def _selftest() -> None:
         assert r.members()[0][0] == 'notes.txt'
         assert b'CAPWAP' in r.read('notes.txt', 1 << 20)
         r.close()
+
+        # --- сигнатура важнее расширения: zip под именем .rar (реальный
+        # кейс папки: rar/7z, названные .zip) ---
+        fake = os.path.join(tmp, 'на_самом_деле.rar')
+        with zipfile.ZipFile(fake, 'w') as z:
+            z.writestr('inner.txt', 'x' * 100)
+        r = open_archive(fake)
+        assert isinstance(r, _ZipReader), type(r)
+        r.close()
+        try:
+            open_archive(__file__)  # обычный python-файл — не архив
+            raise SystemExit('FAIL: ожидали ValueError')
+        except ValueError as e:
+            assert 'первые байты' in str(e), e
 
         # --- xlsx (если openpyxl доступен) ---
         try:
