@@ -102,6 +102,7 @@ def gen_questions(chunks: list, sample_ids: list[int], cache_path: str) -> dict:
 def embed_openai(texts: list[str], model: str, dim: int, tag: str,
                  cache_dir: str):
     import numpy as np
+    os.makedirs(cache_dir, exist_ok=True)
     cache = os.path.join(cache_dir, f'{tag}.npy')
     if os.path.exists(cache):
         arr = np.load(cache)
@@ -123,6 +124,7 @@ def embed_openai(texts: list[str], model: str, dim: int, tag: str,
 def embed_st(texts: list[str], model_name: str, prefix: str, tag: str,
              cache_dir: str):
     import numpy as np
+    os.makedirs(cache_dir, exist_ok=True)
     cache = os.path.join(cache_dir, f'{tag}.npy')
     if os.path.exists(cache):
         arr = np.load(cache)
@@ -137,7 +139,10 @@ def embed_st(texts: list[str], model_name: str, prefix: str, tag: str,
     # ~4000 симв. чанка ≈ 1000-1500 токенов; кап единый для всех моделей,
     # иначе 8k-контекст bge-m3/qwen3 взорвёт память на длинных батчах
     st.max_seq_length = min(st.max_seq_length or 2048, 2048)
-    arr = st.encode([prefix + t for t in texts],
+    # prompt= вместо ручной конкатенации: явный prompt (даже пустой)
+    # отключает default_prompt_name модели (у BERTA это 'Classification' —
+    # иначе он приклеился бы ПОВЕРХ нашего префикса)
+    arr = st.encode(list(texts), prompt=prefix,
                     batch_size=32 if cuda else 8,
                     show_progress_bar=True, normalize_embeddings=True)
     arr = np.asarray(arr, dtype='float32')
