@@ -157,13 +157,19 @@ async def _expand_query(question: str) -> list[str]:
         return []
 
 
-async def _search_expanded(question: str, oa) -> list:
+async def _search_expanded(question: str) -> list:
     """Поиск по вопросу + расширенным формулировкам, слияние через RRF
     (тот же приём, что внутри store.search для вектора+FTS)."""
     variants = [question] + await _expand_query(question)
     if len(variants) > 1:
         logger.info('Query expansion: %s', ' | '.join(variants[1:]))
-    vectors = await embed_texts(variants, client=oa)
+    try:
+        vectors = await embed_texts(variants)
+    except Exception as e:
+        # эмбеддинг-провайдер лёг — деградируем до FTS-only, а не падаем:
+        # фолбэк на другую модель невозможен (вектора несравнимы)
+        logger.warning('embedding failed, FTS-only search: %s', e)
+        vectors = [None] * len(variants)
     scores: dict[tuple, float] = {}
     by_key: dict[tuple, object] = {}
     for variant, vec in zip(variants, vectors):
@@ -205,7 +211,7 @@ WEB_PROMPT_EXTRA = (
 async def answer_question(question: str) -> tuple[str, bool]:
     """(текст ответа, нашлось ли что-то в базе) — found=False копится в /gaps."""
     oa = openai_client()
-    hits = await _search_expanded(question, oa)
+    hits = await _search_expanded(question)
     if not hits and not KB_WEB:
         return 'В базе знаний пока ничего не нашлось по этому вопросу.', False
     ctx_parts = []

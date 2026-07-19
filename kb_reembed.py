@@ -6,7 +6,9 @@
 тексты уже в базе. Процедура (оба сервиса остановить, чтобы поиск и инжест
 не работали по полупустой таблице):
 
-    # в .env выставить новые EMBED_MODEL / EMBED_DIM, затем:
+    # в .env выставить новые EMBED_MODEL / EMBED_DIM (для стороннего
+    # OpenAI-совместимого провайдера — ещё EMBED_API_BASE / EMBED_API_KEY,
+    # например DeepInfra: https://api.deepinfra.com/v1/openai), затем:
     docker compose stop telegram-file-downloader kb-bot
     docker compose run --rm telegram-file-downloader python kb_reembed.py
     docker compose start telegram-file-downloader kb-bot
@@ -22,18 +24,15 @@ from __future__ import annotations
 import asyncio
 import os
 
-from kb_ingest import EMBED_BATCH, embed_cfg, embed_texts
+from kb_ingest import EMBED_BATCH, EMBED_PRICE_PER_MTOK, embed_cfg, embed_texts
 from kb_store import open_store
-
-# цены за 1M токенов; для новых моделей добавить строку
-EMBED_PRICES = {
-    'text-embedding-3-small': 0.02,
-    'text-embedding-3-large': 0.13,
-}
 
 
 async def main() -> None:
-    if not os.getenv('OPENAI_API_KEY'):
+    if os.getenv('EMBED_API_BASE', '').strip():
+        if not os.getenv('EMBED_API_KEY', '').strip():
+            raise SystemExit('EMBED_API_BASE задан, а EMBED_API_KEY нет')
+    elif not os.getenv('OPENAI_API_KEY'):
         raise SystemExit('OPENAI_API_KEY не задан')
     model = os.getenv('EMBED_MODEL', 'text-embedding-3-small')
     dim = int(os.getenv('EMBED_DIM', '512'))
@@ -44,7 +43,7 @@ async def main() -> None:
         store.set_state('embed_cfg', embed_cfg())
         return
     tokens = sum(len(t) for _, t in chunks) // 3
-    price = EMBED_PRICES.get(model, 0.13)
+    price = EMBED_PRICE_PER_MTOK
     print(f'Чанков: {len(chunks)}, ~{tokens} токенов')
     print(f'Модель: {model}, размерность: {dim}')
     print(f'Оценка стоимости: ~${tokens / 1e6 * price:.2f}')

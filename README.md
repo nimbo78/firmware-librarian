@@ -279,6 +279,7 @@ Selftest хранилища (без сети вообще): `python kb_store.py`
 | `KB_GAPS_CHAT_ID` / `KB_GAPS_TOPIC_ID` | нет | еженедельный пост вопросов без ответа |
 | `KB_VISION` / `KB_VOICE` / `KB_PDF` | нет (0) | обогащение: картинки / голосовые / PDF |
 | `EMBED_MODEL` / `EMBED_DIM` | нет (`text-embedding-3-small` / 512) | модель эмбеддингов |
+| `EMBED_API_BASE` / `EMBED_API_KEY` | нет | OpenAI-совместимый провайдер только для эмбеддингов (DeepInfra и т.п.) |
 | `ANSWER_MODEL` / `KB_VISION_MODEL` | нет (`gpt-5-mini`) | модели ответов и vision |
 | `INGEST_HOUR` | нет (5) | час ночного инжеста |
 
@@ -302,8 +303,9 @@ Selftest хранилища (без сети вообще): `python kb_store.py`
   Файл в `.gitignore` и никогда не попадает в репозиторий. При этом он обязан
   лежать в каталоге сборки на хосте (Dockerfile копирует его в образ) — на новый
   хост переносится вручную, не через git.
-- Тексты чатов `KB_CHAT_IDS` отправляются в OpenAI (эмбеддинги и контекст
-  ответов) — участников это устраивает by design.
+- Тексты чатов `KB_CHAT_IDS` отправляются в OpenAI (контекст ответов,
+  vision/whisper) и эмбеддинг-провайдеру из `EMBED_API_BASE` (по умолчанию
+  тот же OpenAI) — участников это устраивает by design.
 - Имена скачиваемых файлов санитизируются (path traversal невозможен).
 
 ## Структура репозитория
@@ -330,14 +332,26 @@ CLAUDE.md                   заметки для Claude Code
 
 ## Смена модели эмбеддингов
 
-По умолчанию — `text-embedding-3-small` (512). Для максимума качества
-(русский чат + смешанная терминология) рекомендуется
-`text-embedding-3-large` + `EMBED_DIM=1024` — переэмбеддинг всей базы стоит
-доли доллара. Вектора разных моделей несравнимы, поэтому смена — только
-через полный переэмбеддинг:
+Эмбеддинги не обязаны идти через OpenAI: `EMBED_API_BASE` + `EMBED_API_KEY`
+переключают их на любого OpenAI-совместимого провайдера (тот же клиент,
+другой base_url). Ответы, vision и whisper всегда остаются на OpenAI.
+
+Рекомендация по бенчмарку `kb_bench.py` на реальном корпусе базы (300
+синтетических вопросов, обычные + сленговые, 07.2026): **`BAAI/bge-m3`
+через DeepInfra** — MRR@10 0.527/0.476 против 0.442/0.412 у
+`text-embedding-3-large@1024`, при цене $0.01/1M токенов (в 13 раз дешевле).
+Если оставаться на OpenAI — `text-embedding-3-large` + `EMBED_DIM=1024`
+(полная размерность 3072 даёт лишь +0.01 MRR).
+
+Вектора разных моделей несравнимы, поэтому смена — только через полный
+переэмбеддинг (переэмбеддинг всей базы на DeepInfra стоит копейки):
 
 ```sh
-# 1. в .env: EMBED_MODEL=text-embedding-3-large, EMBED_DIM=1024
+# 1. в .env:
+#    EMBED_MODEL=BAAI/bge-m3
+#    EMBED_DIM=1024
+#    EMBED_API_BASE=https://api.deepinfra.com/v1/openai
+#    EMBED_API_KEY=...
 docker compose stop telegram-file-downloader kb-bot
 docker compose run --rm telegram-file-downloader python kb_reembed.py
 docker compose start telegram-file-downloader kb-bot
@@ -346,7 +360,9 @@ docker compose start telegram-file-downloader kb-bot
 Telegram для этого не нужен (тексты уже в базе). Guard `embed_cfg` в state
 не даст качалке и боту работать со «смешанной» базой: если поменять .env и
 забыть про kb_reembed.py, инжест блокируется с событием админу, а бот на
-вопросы честно отвечает «переэмбеддируюсь».
+вопросы честно отвечает «переэмбеддируюсь». Если эмбеддинг-провайдер
+недоступен в момент вопроса, бот не падает — поиск деградирует до
+полнотекстового (FTS) до восстановления провайдера.
 
 ## Переезд на Qdrant (когда понадобится)
 

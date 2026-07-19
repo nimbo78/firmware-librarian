@@ -17,6 +17,9 @@ services:
       KB_DB_PATH: /app/kb/kb.sqlite
       EMBED_MODEL: ${EMBED_MODEL:-text-embedding-3-small}
       EMBED_DIM: ${EMBED_DIM:-512}
+      EMBED_API_BASE: ${EMBED_API_BASE:-}
+      EMBED_API_KEY: ${EMBED_API_KEY:-}
+      EMBED_PRICE_PER_MTOK: ${EMBED_PRICE_PER_MTOK:-}
       INGEST_HOUR: ${INGEST_HOUR:-5}
       KB_VISION: ${KB_VISION:-0}
       KB_VOICE: ${KB_VOICE:-0}
@@ -55,6 +58,8 @@ services:
       DOWNLOAD_FOLDER: /app/downloads
       EMBED_MODEL: ${EMBED_MODEL:-text-embedding-3-small}
       EMBED_DIM: ${EMBED_DIM:-512}
+      EMBED_API_BASE: ${EMBED_API_BASE:-}
+      EMBED_API_KEY: ${EMBED_API_KEY:-}
       ANSWER_MODEL: ${ANSWER_MODEL:-gpt-5-mini}
       KB_WEB: ${KB_WEB:-0}
     volumes:

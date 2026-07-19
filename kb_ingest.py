@@ -16,6 +16,7 @@ import base64
 import hashlib
 import io
 import logging
+import math
 import os
 from dataclasses import dataclass
 
@@ -31,8 +32,17 @@ GAP_SECONDS = 30 * 60    # пауза, разрывающая беседу на 
 CHUNK_MAX_CHARS = 4000   # ~1200 токенов для русского текста
 EMBED_BATCH = 96
 
-# Оценки стоимости для расчёта бюджета (реальные цены OpenAI могут меняться)
-EMBED_PRICE_PER_MTOK = 0.02     # $ / 1M токенов, text-embedding-3-small
+# Оценки стоимости для расчёта бюджета (реальные цены могут меняться).
+# Цена эмбеддингов берётся по EMBED_MODEL из карты; для модели не из карты
+# или нестандартного тарифа — переопредели EMBED_PRICE_PER_MTOK в .env.
+EMBED_PRICES = {
+    'text-embedding-3-small': 0.02,
+    'text-embedding-3-large': 0.13,
+    'BAAI/bge-m3': 0.01,        # DeepInfra
+}
+EMBED_PRICE_PER_MTOK = (
+    float(os.getenv('EMBED_PRICE_PER_MTOK', '0') or 0)
+    or EMBED_PRICES.get(os.getenv('EMBED_MODEL', 'text-embedding-3-small'), 0.02))
 VISION_COST_PER_IMAGE = 0.004   # $ / изображение (усреднённо)
 WHISPER_PRICE_PER_MIN = 0.006   # $ / минута, whisper-1
 
@@ -49,6 +59,7 @@ VISION_PROMPT = (
 )
 
 _openai = None
+_embed = None
 
 
 def openai_client():
@@ -57,6 +68,25 @@ def openai_client():
         from openai import AsyncOpenAI
         _openai = AsyncOpenAI()
     return _openai
+
+
+def embed_client():
+    """Клиент ТОЛЬКО для эмбеддингов. EMBED_API_BASE переключает на
+    OpenAI-совместимого провайдера (DeepInfra и т.п.: base_url + ключ
+    EMBED_API_KEY); пусто — общий клиент OpenAI. Ответы, vision и whisper
+    всегда остаются на OpenAI (openai_client)."""
+    global _embed
+    if _embed is None:
+        base = os.getenv('EMBED_API_BASE', '').strip()
+        if base:
+            key = os.getenv('EMBED_API_KEY', '').strip()
+            if not key:
+                raise RuntimeError('EMBED_API_BASE задан без EMBED_API_KEY')
+            from openai import AsyncOpenAI
+            _embed = AsyncOpenAI(base_url=base, api_key=key)
+        else:
+            _embed = openai_client()
+    return _embed
 
 
 def vision_enabled() -> bool:
@@ -89,18 +119,31 @@ class BudgetExceeded(Exception):
         self.cost = cost
 
 
-async def embed_texts(texts: list[str], client=None) -> list[list[float]]:
+async def embed_texts(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
-    client = client or openai_client()
+    client = embed_client()
     model = os.getenv('EMBED_MODEL', 'text-embedding-3-small')
     dim = int(os.getenv('EMBED_DIM', '512'))
+    # dimensions (Matryoshka-обрезка) — фича моделей OpenAI; у сторонних
+    # провайдеров размерность фиксирована моделью, параметр не передаём
+    kwargs = {} if os.getenv('EMBED_API_BASE', '').strip() else {'dimensions': dim}
     out: list[list[float]] = []
     for i in range(0, len(texts), EMBED_BATCH):
         # обрезка — страховка от лимита 8192 токена на один вход
         batch = [t[:20000] for t in texts[i:i + EMBED_BATCH]]
-        resp = await client.embeddings.create(model=model, input=batch, dimensions=dim)
-        out.extend(d.embedding for d in resp.data)
+        resp = await client.embeddings.create(model=model, input=batch, **kwargs)
+        got = len(resp.data[0].embedding)
+        if got != dim:
+            raise RuntimeError(
+                f'модель {model} вернула размерность {got} при EMBED_DIM={dim} '
+                f'— поправь EMBED_DIM (все вектора в базе должны совпадать)')
+        # нормализация: KNN sqlite-vec ранжирует по L2, что эквивалентно
+        # косинусу только на единичных векторах; у OpenAI это no-op,
+        # сторонние провайдеры нормализацию не гарантируют
+        for d in resp.data:
+            norm = math.sqrt(sum(x * x for x in d.embedding)) or 1.0
+            out.append([x / norm for x in d.embedding])
     return out
 
 

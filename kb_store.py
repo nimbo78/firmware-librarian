@@ -269,11 +269,15 @@ class SqliteVecStore:
                 self.db.execute('DELETE FROM chunks_fts WHERE rowid=?', (rowid,))
         return len(stale)
 
-    def search(self, query_text: str, query_vector: list, top_k: int = 8,
+    def search(self, query_text: str, query_vector: list | None, top_k: int = 8,
                candidates: int = 24) -> list[ScoredChunk]:
-        vec_ids = [r[0] for r in self.db.execute(
-            'SELECT rowid, distance FROM chunks_vec WHERE embedding MATCH ? AND k = ? '
-            'ORDER BY distance', (_f32(query_vector), candidates))]
+        # query_vector=None — FTS-only режим (деградация при недоступности
+        # эмбеддинг-провайдера: фолбэк на другую модель невозможен)
+        vec_ids: list[int] = []
+        if query_vector is not None:
+            vec_ids = [r[0] for r in self.db.execute(
+                'SELECT rowid, distance FROM chunks_vec WHERE embedding MATCH ? AND k = ? '
+                'ORDER BY distance', (_f32(query_vector), candidates))]
         # Пользовательский текст нельзя отдавать в MATCH сырым: синтаксис FTS5
         # падает на кавычках/минусах, поэтому только слова, каждое в кавычках.
         fts_ids: list[int] = []
@@ -738,6 +742,10 @@ def _selftest() -> None:
         # лексический хит: вектор указывает мимо, точное слово решает
         hits = store.search('S5735', vec(2), top_k=3)
         assert any('S5735' in h.text for h in hits), hits
+
+        # FTS-only деградация: без вектора поиск живёт на полнотексте
+        hits = store.search('прошивка MA5608T', None, top_k=3)
+        assert any('MA5608T' in h.text for h in hits), hits
 
         store.set_state('last_seen_id:-1001234', '35')
         assert store.get_state('last_seen_id:-1001234') == '35'
