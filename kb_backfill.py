@@ -114,6 +114,70 @@ async def _dry_run(client, chat_ids: list[int], download_folder: str) -> None:
     print('Подсказка: --max-cost N остановит боевой прогон при достижении N$.')
 
 
+async def _local_pipelines(store, download_folder: str,
+                           budget: float | None) -> tuple[float, bool]:
+    """Конвейеры, которым НЕ нужен Telegram: архивы -> HedEx -> PDF.
+    Возвращает (потрачено $, упёрлись ли в бюджет)."""
+    spent = 0.0
+
+    def rem() -> float | None:
+        return None if budget is None else max(0.0, budget - spent)
+
+    from kb_archive import archive_enabled
+    if archive_enabled():
+        from kb_archive import process_archives
+        try:
+            arcs, chunks, cost = await process_archives(
+                store, download_folder, progress=_progress, max_cost=rem())
+            spent += cost
+            print(f'Архивы: {arcs} просмотрено -> {chunks} чанков, ~${cost:.2f}')
+        except BudgetExceeded as e:
+            return spent + e.cost, True
+    from kb_hedex import hedex_enabled
+    if hedex_enabled():
+        from kb_hedex import ingest_hdx
+        try:
+            files, chunks, cost = await ingest_hdx(
+                store, download_folder, progress=_progress, max_cost=rem())
+            spent += cost
+            print(f'HedEx: {files} пакетов -> {chunks} чанков, ~${cost:.2f}')
+        except BudgetExceeded as e:
+            return spent + e.cost, True
+    if pdf_enabled():
+        from kb_pdf import ingest_pdfs
+        try:
+            files, chunks, cost = await ingest_pdfs(
+                store, download_folder, progress=_progress, max_cost=rem())
+            spent += cost
+            print(f'PDF: {files} файлов -> {chunks} чанков, ~${cost:.2f}')
+        except BudgetExceeded as e:
+            return spent + e.cost, True
+    return spent, False
+
+
+async def _local_only(download_folder: str, max_cost: float | None) -> None:
+    """--local-only: без подключения к Telegram (сессию не трогает, качалку
+    можно не гасить) — архивы, HedEx, PDF и LLM-экстракция. Нужен только
+    ключ эмбеддингов/OpenAI. Гонки с ночным джобом безопасны (state/md5),
+    но осмысленнее не пересекаться по времени."""
+    store = open_store()
+    spent, stopped = await _local_pipelines(store, download_folder, max_cost)
+    if not stopped:
+        from kb_extract import run_extraction
+        fw_added, dev_added, cost = await run_extraction(store)
+        spent += cost
+        print(f'LLM-экстракция: {fw_added} связок, {dev_added} серий, '
+              f'~${cost:.2f}')
+    store.backup()
+    print(f'\nЧанков в базе: {store.count()}. Потрачено: ~${spent:.2f}')
+    if stopped:
+        print('ЛИМИТ БЮДЖЕТА ДОСТИГНУТ — повторный запуск продолжит без '
+              'двойной оплаты.')
+    store.add_event('backfill',
+                    f'Локальный прогон (--local-only) завершён, чанков: '
+                    f'{store.count()}', spent)
+
+
 async def _backfill(client, chat_ids: list[int], download_folder: str,
                     max_cost: float | None,
                     extra_chat_ids: list[int]) -> None:
@@ -205,39 +269,10 @@ async def _backfill(client, chat_ids: list[int], download_folder: str,
                 break
             spent += stats.cost
             print(f'  обновлено чанков: {stats.new_chunks}, ~${stats.cost:.2f}')
-    if pdf_enabled() and not stopped:
-        from kb_pdf import ingest_pdfs
-        try:
-            files, chunks, cost = await ingest_pdfs(
-                store, download_folder, progress=_progress, max_cost=remaining())
-            spent += cost
-            print(f'PDF: {files} файлов -> {chunks} чанков, ~${cost:.2f}')
-        except BudgetExceeded as e:
-            spent += e.cost
-            stopped = True
-    from kb_archive import archive_enabled
-    if archive_enabled() and not stopped:
-        from kb_archive import process_archives
-        try:
-            arcs, chunks, cost = await process_archives(
-                store, download_folder, progress=_progress,
-                max_cost=remaining())
-            spent += cost
-            print(f'Архивы: {arcs} просмотрено -> {chunks} чанков, ~${cost:.2f}')
-        except BudgetExceeded as e:
-            spent += e.cost
-            stopped = True
-    from kb_hedex import hedex_enabled
-    if hedex_enabled() and not stopped:
-        from kb_hedex import ingest_hdx
-        try:
-            files, chunks, cost = await ingest_hdx(
-                store, download_folder, progress=_progress, max_cost=remaining())
-            spent += cost
-            print(f'HedEx: {files} пакетов -> {chunks} чанков, ~${cost:.2f}')
-        except BudgetExceeded as e:
-            spent += e.cost
-            stopped = True
+    if not stopped:
+        extra, stopped = await _local_pipelines(store, download_folder,
+                                                remaining())
+        spent += extra
     if not stopped:
         from kb_extract import run_extraction
         fw_added, dev_added, cost = await run_extraction(store)
@@ -268,7 +303,19 @@ async def main() -> None:
     parser.add_argument('--max-cost', type=float, default=None, metavar='N',
                         help='остановиться при достижении бюджета N$ (безопасно: '
                              'повторный запуск продолжит с кэша)')
+    parser.add_argument('--local-only', action='store_true',
+                        help='только локальные конвейеры (архивы, HedEx, PDF, '
+                             'экстракция) — БЕЗ подключения к Telegram: сессию '
+                             'не трогает, качалку можно не останавливать')
     args = parser.parse_args()
+
+    if args.local_only:
+        if args.dry_run:
+            raise SystemExit('--local-only несовместим с --dry-run: оценка '
+                             'печатается самими конвейерами')
+        await _local_only(os.getenv('DOWNLOAD_FOLDER', './downloads'),
+                          args.max_cost)
+        return
 
     api_id = int(_require('TELEGRAM_API_ID'))
     api_hash = _require('TELEGRAM_API_HASH')

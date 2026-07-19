@@ -17,6 +17,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Selftest хранилища (не требует Telegram и OpenAI): `pip install sqlite-vec && python kb_store.py`.
 - Бэкфилл истории в базу знаний — см. процедуру в разделе «База знаний».
 - Отладочный поиск по базе: `docker compose run --rm telegram-file-downloader python kb_search.py "вопрос"`.
+- Локальные конвейеры без Telegram (архивы/HedEx/PDF/экстракция; сессию не трогает, качалку можно не гасить): `docker compose run --rm telegram-file-downloader python kb_backfill.py --local-only`.
 - Тестов, линтеров и CI в репозитории нет (кроме selftest в `kb_store.py`).
 
 ## Переменные окружения
