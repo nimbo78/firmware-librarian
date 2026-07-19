@@ -47,6 +47,8 @@ MODELS = {
                      'dim': 512},
     'openai-large': {'kind': 'openai', 'model': 'text-embedding-3-large',
                      'dim': 1024},
+    'openai-large-3072': {'kind': 'openai', 'model': 'text-embedding-3-large',
+                          'dim': 3072},
     'bge-m3': {'kind': 'st', 'model': 'BAAI/bge-m3',
                'q_prefix': '', 'd_prefix': ''},
     'berta': {'kind': 'st', 'model': 'sergeyzh/BERTA',
