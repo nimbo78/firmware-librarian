@@ -21,7 +21,13 @@ import os
 from dataclasses import dataclass
 
 from telethon import errors
-from telethon.tl.functions.channels import GetForumTopicsRequest
+
+try:  # Telethon <=1.43: форум-топики в channels
+    from telethon.tl.functions.channels import GetForumTopicsRequest
+    _FORUM_PEER_KW = 'channel'
+except ImportError:  # 1.44+: Telegram перенёс метод в messages, channel -> peer
+    from telethon.tl.functions.messages import GetForumTopicsRequest
+    _FORUM_PEER_KW = 'peer'
 
 from kb_firmware import document_filename, record_file
 from kb_store import Chunk
@@ -327,7 +333,7 @@ async def fetch_topic_names(tg_client, chat_id: int) -> dict[int, str]:
     try:
         while True:
             res = await tg_client(GetForumTopicsRequest(
-                channel=chat_id, offset_date=None, offset_id=0,
+                **{_FORUM_PEER_KW: chat_id}, offset_date=None, offset_id=0,
                 offset_topic=offset_topic, limit=100))
             for t in res.topics:
                 if hasattr(t, 'title'):  # у ForumTopicDeleted нет title
