@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -1003,6 +1004,33 @@ async def on_admin_action(event):
             pass
 
 
+_md5_cache: dict[str, tuple[float, int, str]] = {}  # path -> (mtime, size, md5)
+
+
+async def _verify_md5(path: str, expected: str) -> bool:
+    """Сверка файла на диске с каталогом перед отправкой: качалка могла
+    перезаписать файл новым содержимым под тем же именем (дедуп по имени),
+    и каталожный md5 устарел бы. Хэш большого файла считается в thread'е
+    (Celeron: ~десятки секунд на гигабайты) и кэшируется по (mtime, size)."""
+    st = os.stat(path)
+    cached = _md5_cache.get(path)
+    if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return cached[2] == expected
+
+    def _calc() -> str:
+        h = hashlib.md5()
+        with open(path, 'rb') as f:
+            for block in iter(lambda: f.read(1 << 20), b''):
+                h.update(block)
+        return h.hexdigest()
+
+    md5 = await asyncio.to_thread(_calc)
+    if len(_md5_cache) > 500:
+        _md5_cache.clear()
+    _md5_cache[path] = (st.st_mtime, st.st_size, md5)
+    return md5 == expected
+
+
 @client.on(events.CallbackQuery(pattern=rb'^g:'))
 async def on_getfile(event):
     """Кнопка 📎 в /fw: отправка файла с тома NAS прямо в чат.
@@ -1023,6 +1051,15 @@ async def on_getfile(event):
                                alert=True)
             return
         await event.answer('Отправляю файл, большие идут долго…')
+        if not await _verify_md5(path, md5):
+            logger.warning('md5 mismatch for %s: disk differs from catalog',
+                           name)
+            store.add_event('error',
+                            f'md5 не совпал для «{name}» — файл на диске '
+                            f'изменился после каталогизации, 📎 не отправлен')
+            await event.reply(f'⚠️ «{name}» на диске не совпадает с каталогом '
+                              f'— не отправляю, админ уведомлён.')
+            return
         logger.info('Sending file %s to %s (asked by %s)',
                     name, event.chat_id, event.sender_id)
         await client.send_file(event.chat_id, path,
@@ -1056,9 +1093,28 @@ async def on_confirm(event):
         return
     try:
         parts = event.data.decode().split(':')
-        if parts[1] == 'allfw':  # массовое подтверждение остатка
+        if parts[1] == 'allfw':
+            # шаг 1: превью того, что будет подтверждено, — массовое действие
+            # не должно быть слепым (когда-то так чуть не приняли 649 связок
+            # старого слабого парсера не глядя)
+            rows = store.medium_firmware_with_names()
+            lines = [f'• {name[:60]} → {model}'
+                     for _, model, name in rows[:15]]
+            more = f'\n…и ещё {len(rows) - 15}' if len(rows) > 15 else ''
+            await event.edit(
+                f'Будут подтверждены {len(rows)} связок:\n'
+                + '\n'.join(lines) + more,
+                buttons=[[Button.inline(f'✅ Подтверждаю все {len(rows)}',
+                                        b'c:allfw2'),
+                          Button.inline('✖️ Отмена', b'c:cancel')]])
+            return
+        if parts[1] == 'allfw2':  # шаг 2: подтверждение после превью
             n = store.confirm_all_firmware()
             await event.edit(f'✅ Подтверждено связок разом: {n}', buttons=None)
+            return
+        if parts[1] == 'cancel':
+            await event.edit('Отменено — связки остались на /review.',
+                             buttons=None)
             return
         kind, key, ok = parts[1], parts[2], parts[3] == '1'
         if kind == 'f':
