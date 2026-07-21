@@ -214,7 +214,7 @@ async def kb_ingest_loop() -> None:
         logger.warning('KB_CHAT_IDS задан, но OPENAI_API_KEY отсутствует — '
                        'ночной ingest выключен')
         return
-    from kb_ingest import ingest_chat, pdf_enabled
+    from kb_ingest import ingest_chat
     from kb_store import open_store
     store = open_store()
     logger.info('KB ingest scheduled daily at %02d:00 for chats %s '
@@ -262,81 +262,13 @@ async def kb_ingest_loop() -> None:
                 logger.warning('KB ingest failed for %s: %s', chat_id, e)
                 store.add_event('error', f'Инжест {chat_id} упал: {e}')
         try:
-            from kb_firmware import (auto_resolve_firmware, link_local_files,
-                                     reparse_files)
-            linked = link_local_files(store, DOWNLOAD_FOLDER)
-            reparsed = reparse_files(store)  # новые регулярки -> старые файлы
-            resolved = auto_resolve_firmware(store)  # medium, подтверждённые парсером
-            confirmed_series = store.confirm_all_series()
-            if linked or reparsed or resolved or confirmed_series:
-                logger.info('KB catalog: linked %d, reparsed %d, auto-resolved %d, '
-                            'series %d', linked, reparsed, resolved, confirmed_series)
-                store.add_event('catalog',
-                                f'Каталог: привязано {linked}, связок +{reparsed}, '
-                                f'авто-снято medium {resolved}, серий {confirmed_series}')
+            # каталог -> PDF -> архивы -> HedEx -> экстракция -> бэкап;
+            # шаги изолированы внутри, отчёт — событиями админу
+            from kb_pipeline import run_post_ingest
+            await run_post_ingest(store, DOWNLOAD_FOLDER)
         except Exception as e:
-            logger.warning('KB catalog maintenance failed: %s', e)
-        if pdf_enabled():
-            try:
-                from kb_pdf import ingest_pdfs
-                files, chunks, cost = await ingest_pdfs(store, DOWNLOAD_FOLDER)
-                if files:
-                    logger.info('KB PDF ingest: %d files -> %d chunks, ~$%.2f',
-                                files, chunks, cost)
-                    store.add_event('pdf',
-                                    f'PDF-инжест: {files} файлов -> {chunks} чанков',
-                                    cost)
-            except Exception as e:
-                logger.warning('KB PDF ingest failed: %s', e)
-                store.add_event('error', f'PDF-инжест упал: {e}')
-        from kb_archive import archive_enabled
-        if archive_enabled():
-            try:
-                from kb_archive import process_archives
-                arcs, chunks, cost = await process_archives(store, DOWNLOAD_FOLDER)
-                if arcs:
-                    logger.info('KB archive scan: %d archives -> %d chunks, '
-                                '~$%.2f', arcs, chunks, cost)
-                    store.add_event('archive',
-                                    f'Архивы: {arcs} просмотрено -> '
-                                    f'{chunks} чанков', cost)
-            except Exception as e:
-                logger.warning('KB archive scan failed: %s', e)
-                store.add_event('error', f'Скан архивов упал: {e}')
-        from kb_hedex import hedex_enabled
-        if hedex_enabled():
-            try:
-                from kb_hedex import ingest_hdx
-                files, chunks, cost = await ingest_hdx(store, DOWNLOAD_FOLDER)
-                if files:
-                    logger.info('KB HedEx ingest: %d packages -> %d chunks, '
-                                '~$%.2f', files, chunks, cost)
-                    store.add_event('hedex',
-                                    f'HedEx-инжест: {files} пакетов -> '
-                                    f'{chunks} чанков', cost)
-            except Exception as e:
-                logger.warning('KB HedEx ingest failed: %s', e)
-                store.add_event('error', f'HedEx-инжест упал: {e}')
-        try:
-            from kb_extract import run_extraction
-            fw_added, dev_added, cost = await run_extraction(store)
-            if fw_added or dev_added:
-                logger.info('KB extract: %d firmware links, %d series, ~$%.2f',
-                            fw_added, dev_added, cost)
-                store.add_event('extract',
-                                f'LLM-экстракция: {fw_added} связок прошивок, '
-                                f'{dev_added} серий', cost)
-            pending = store.pending_review_count()
-            if pending:
-                store.add_event('review',
-                                f'{pending} записей каталога ждут подтверждения — /review')
-        except Exception as e:
-            logger.warning('KB extract failed: %s', e)
-        try:
-            store.backup()
-        except Exception as e:
-            logger.warning('KB backup failed: %s', e)
-            store.add_event('error', f'Бэкап базы знаний упал: {e}')
+            logger.warning('KB post-ingest pipeline failed: %s', e)
+            store.add_event('error', f'Пост-инжест конвейер упал: {e}')
 
 
 async def run() -> None:

@@ -114,61 +114,16 @@ async def _dry_run(client, chat_ids: list[int], download_folder: str) -> None:
     print('Подсказка: --max-cost N остановит боевой прогон при достижении N$.')
 
 
-async def _local_pipelines(store, download_folder: str,
-                           budget: float | None) -> tuple[float, bool]:
-    """Конвейеры, которым НЕ нужен Telegram: архивы -> HedEx -> PDF.
-    Возвращает (потрачено $, упёрлись ли в бюджет)."""
-    spent = 0.0
-
-    def rem() -> float | None:
-        return None if budget is None else max(0.0, budget - spent)
-
-    from kb_archive import archive_enabled
-    if archive_enabled():
-        from kb_archive import process_archives
-        try:
-            arcs, chunks, cost = await process_archives(
-                store, download_folder, progress=_progress, max_cost=rem())
-            spent += cost
-            print(f'Архивы: {arcs} просмотрено -> {chunks} чанков, ~${cost:.2f}')
-        except BudgetExceeded as e:
-            return spent + e.cost, True
-    from kb_hedex import hedex_enabled
-    if hedex_enabled():
-        from kb_hedex import ingest_hdx
-        try:
-            files, chunks, cost = await ingest_hdx(
-                store, download_folder, progress=_progress, max_cost=rem())
-            spent += cost
-            print(f'HedEx: {files} пакетов -> {chunks} чанков, ~${cost:.2f}')
-        except BudgetExceeded as e:
-            return spent + e.cost, True
-    if pdf_enabled():
-        from kb_pdf import ingest_pdfs
-        try:
-            files, chunks, cost = await ingest_pdfs(
-                store, download_folder, progress=_progress, max_cost=rem())
-            spent += cost
-            print(f'PDF: {files} файлов -> {chunks} чанков, ~${cost:.2f}')
-        except BudgetExceeded as e:
-            return spent + e.cost, True
-    return spent, False
-
-
 async def _local_only(download_folder: str, max_cost: float | None) -> None:
     """--local-only: без подключения к Telegram (сессию не трогает, качалку
-    можно не гасить) — архивы, HedEx, PDF и LLM-экстракция. Нужен только
+    можно не гасить) — весь пост-инжест конвейер kb_pipeline. Нужен только
     ключ эмбеддингов/OpenAI. Гонки с ночным джобом безопасны (state/md5),
     но осмысленнее не пересекаться по времени."""
+    from kb_pipeline import run_post_ingest
     store = open_store()
-    spent, stopped = await _local_pipelines(store, download_folder, max_cost)
-    if not stopped:
-        from kb_extract import run_extraction
-        fw_added, dev_added, cost = await run_extraction(store)
-        spent += cost
-        print(f'LLM-экстракция: {fw_added} связок, {dev_added} серий, '
-              f'~${cost:.2f}')
-    store.backup()
+    spent, stopped = await run_post_ingest(store, download_folder,
+                                           budget=max_cost,
+                                           progress=_progress, report='print')
     print(f'\nЧанков в базе: {store.count()}. Потрачено: ~${spent:.2f}')
     if stopped:
         print('ЛИМИТ БЮДЖЕТА ДОСТИГНУТ — повторный запуск продолжит без '
@@ -225,20 +180,6 @@ async def _backfill(client, chat_ids: list[int], download_folder: str,
                             topics.get(message_topic_id(msg), ''))
                 recorded += 1
             print(f'  документов закаталогизировано: {recorded}')
-    if not stopped:
-        # каталог: файлы, скачанные до его появления, получают md5 из журнала
-        # дедупликации — без этого у них не будет кнопки 📎 в /fw;
-        # reparse добирает связки после улучшения регулярок разбора имён
-        from kb_firmware import (auto_resolve_firmware, link_local_files,
-                                 reparse_files)
-        linked = link_local_files(store, download_folder)
-        reparsed = reparse_files(store)
-        resolved = auto_resolve_firmware(store)
-        confirmed_series = store.confirm_all_series()
-        if linked or reparsed or resolved or confirmed_series:
-            print(f'Каталог: привязано {linked}, связок +{reparsed}, '
-                  f'авто-снято medium {resolved}, серий {confirmed_series}')
-
     # Этап 2: vision/whisper — только наполнение кэша, чанки не трогаем
     if media_wanted and not stopped:
         for chat_id in chat_ids:
@@ -270,19 +211,16 @@ async def _backfill(client, chat_ids: list[int], download_folder: str,
             spent += stats.cost
             print(f'  обновлено чанков: {stats.new_chunks}, ~${stats.cost:.2f}')
     if not stopped:
-        extra, stopped = await _local_pipelines(store, download_folder,
-                                                remaining())
+        # общий пост-инжест конвейер: каталог -> PDF -> архивы -> HedEx ->
+        # экстракция -> бэкап (kb_pipeline, тот же путь, что у ночного джоба)
+        from kb_pipeline import run_post_ingest
+        extra, stopped = await run_post_ingest(store, download_folder,
+                                               budget=remaining(),
+                                               progress=_progress,
+                                               report='print')
         spent += extra
-    if not stopped:
-        from kb_extract import run_extraction
-        fw_added, dev_added, cost = await run_extraction(store)
-        spent += cost
-        print(f'LLM-экстракция: {fw_added} связок прошивок, {dev_added} серий, '
-              f'~${cost:.2f}')
-        pending = store.pending_review_count()
-        if pending:
-            print(f'На подтверждение (/review в личке бота): {pending}')
-    store.backup()
+    else:
+        store.backup()
     print(f'\nЧанков в базе: {store.count()}. Потрачено в этом прогоне: ~${spent:.2f}')
     if stopped:
         print('ЛИМИТ БЮДЖЕТА ДОСТИГНУТ. Обработанное закэшировано — пополни '

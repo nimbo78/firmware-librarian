@@ -74,7 +74,7 @@ flowchart TB
 
    ```sh
    pip install -r requirements.txt
-   python download_telegram_files.py   # спросит телефон и код — появится bot.session
+   python librarian.py   # спросит телефон и код — появится bot.session
    ```
 
    Полученный `bot.session` должен лежать рядом с `Dockerfile` — он копируется
@@ -318,7 +318,8 @@ Selftest хранилища (без сети вообще): `python kb_store.py`
 ## Структура репозитория
 
 ```
-download_telegram_files.py  качалка + ночной kb-ingest
+librarian.py                качалка + ночной kb-ingest
+kb_pipeline.py              общий пост-инжест конвейер (ночной джоб + бэкфилл)
 tg_conn.py                  опциональный MTProto-прокси (MTPROXY_*)
 kb_store.py                 хранилище: sqlite-vec + FTS5 + RRF (+selftest)
 kb_ingest.py                чанкер, vision/whisper-обогащение, эмбеддинги

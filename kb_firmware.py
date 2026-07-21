@@ -342,7 +342,7 @@ def reparse_files(store) -> int:
 def _load_md5_journal(folder: str) -> dict:
     """downloaded_files.txt качалки -> {имя: md5}. Формат журнала —
     <md5>,<имя> (новый) и <имя>,<md5> (старый); парсинг продублирован из
-    download_telegram_files, который нельзя импортировать (side effects)."""
+    librarian (качалки), который нельзя импортировать (side effects)."""
     path = os.path.join(folder, 'downloaded_files.txt')
     out: dict = {}
     if not os.path.exists(path):

@@ -1,7 +1,7 @@
 """Чанкинг сообщений Telegram, обогащение медиа и эмбеддинги OpenAI.
 
-Используется ночным джобом качалки (download_telegram_files.py) и kb_backfill.py.
-НЕ импортирует download_telegram_files — у того side-effects на импорте
+Используется ночным джобом качалки (librarian.py) и kb_backfill.py.
+НЕ импортирует librarian — у того side-effects на импорте
 (валидация env, создание клиента).
 
 Обогащение медиа (опционально, флаги в .env):
