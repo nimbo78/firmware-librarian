@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Назначение
 
-Два сервиса в одном docker-compose на NAS Synology DS720+:
+Проект **firmware-librarian** (бывший telegram-file-downloader; compose-проект зафиксирован `name:` в docker-compose.yml). Два сервиса в одном docker-compose на NAS Synology DS720+:
 
 1. **Качалка** ([download_telegram_files.py](download_telegram_files.py)) — Telethon user-клиент, слушает чаты `CHAT_IDS`, скачивает документы с подходящим расширением, дедуплицирует по имени + MD5, складывает на том NAS. Плюс ночной инжест базы знаний (см. ниже).
 2. **KB-бот** ([kb_bot.py](kb_bot.py)) — бот (токен BotFather), отвечает на `/ask` и `@упоминание` в чатах `KB_ANSWER_CHAT_IDS`, используя RAG по истории чатов: гибридный поиск sqlite-vec + FTS5, ответы через OpenAI API.
@@ -16,8 +16,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Передеплой на NAS: [`./redeploy.sh`](redeploy.sh) — проверяет наличие `.env` и `bot.session`, делает `down --remove-orphans` + `up --build -d` + выводит статус и последние 30 строк логов.
 - Selftest хранилища (не требует Telegram и OpenAI): `pip install sqlite-vec && python kb_store.py`.
 - Бэкфилл истории в базу знаний — см. процедуру в разделе «База знаний».
-- Отладочный поиск по базе: `docker compose run --rm telegram-file-downloader python kb_search.py "вопрос"`.
-- Локальные конвейеры без Telegram (архивы/HedEx/PDF/экстракция; сессию не трогает, качалку можно не гасить): `docker compose run --rm telegram-file-downloader python kb_backfill.py --local-only`.
+- Отладочный поиск по базе: `docker compose run --rm librarian python kb_search.py "вопрос"`.
+- Локальные конвейеры без Telegram (архивы/HedEx/PDF/экстракция; сессию не трогает, качалку можно не гасить): `docker compose run --rm librarian python kb_backfill.py --local-only`.
 - Тестов, линтеров и CI в репозитории нет (кроме selftest в `kb_store.py`).
 
 ## Переменные окружения
@@ -102,7 +102,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **`events_cost` в `/status` уже включает медиа-затраты** инжест-прогонов — `media_cost` из `media_cache` это деталь, а не слагаемое (иначе двойной счёт).
 - **Ночной джоб** — `kb_ingest_loop()` в качалке ([download_telegram_files.py:204](download_telegram_files.py#L204)): тик раз в минуту, срабатывает в `INGEST_HOUR` локального времени (сделанность суток — state `ingest_done_date`; tzdata ставится в Dockerfile ради `TZ`) **или по запросу админа** — `/ingest` (и кнопка в `/status`) ставит state `ingest_request`, качалка подхватывает в течение минуты. Цикл: инжест чатов → каталог (link/reparse) → PDF (если `KB_PDF=1`) → LLM-экстракция → бэкап через `VACUUM INTO` (горячее копирование файла с WAL небезопасно).
 - **Бэкфилл** (`kb_backfill.py`) запускать только при остановленной качалке (общая сессия!) и **до** включения ночного инжеста:
-  `docker compose stop telegram-file-downloader` → `docker compose run --rm telegram-file-downloader python kb_backfill.py --dry-run` (оценка объёма/стоимости) → без `--dry-run` → `docker compose start telegram-file-downloader`.
+  `docker compose stop librarian` → `docker compose run --rm librarian python kb_backfill.py --dry-run` (оценка объёма/стоимости) → без `--dry-run` → `docker compose start librarian`.
 - **kb-bot не падает без конфига**: без `KB_BOT_TOKEN`/`KB_ANSWER_CHAT_IDS` уходит в вечный sleep с ошибкой в логе (чтобы не крутить crash-loop под `restart: unless-stopped`). Для упоминаний боту нужен выключенный privacy mode (`/setprivacy` → Disable в BotFather).
 - **Запросы FTS санитизируются** ([kb_store.py:251-263](kb_store.py#L251-L263)) — сырой пользовательский текст в `MATCH` роняет FTS5-синтаксис.
 - **Для моделей класса gpt-5 не передавать `temperature`/`max_tokens`** ([kb_bot.py:120-128](kb_bot.py#L120-L128)).

@@ -1,4 +1,4 @@
-// Архитектура telegram-file-downloader + база знаний (RAG) + каталог прошивок.
+// Архитектура firmware-librarian + база знаний (RAG) + каталог прошивок.
 // Просмотр: расширение LikeC4 для VS Code или `npx likec4 start` в этой папке.
 
 specification {
@@ -38,7 +38,7 @@ model {
 
   nas = system 'Synology DS720+ · Docker Compose' {
 
-    downloader = container 'telegram-file-downloader' {
+    downloader = container 'librarian (качалка)' {
       technology 'Python 3.13 · Telethon · user-сессия bot.session'
       description 'Скачивает документы из CHAT_IDS (дедуп имя+MD5), каталогизирует ВСЕ документы наблюдаемых чатов. Пайплайн в INGEST_HOUR или по /ingest: инжест чатов → каталог (md5-линковка, файлы-сироты из журнала, reparse имён) → PDF → LLM-экстракция → бэкап. Одна сессия = один процесс, поэтому всё здесь.'
     }

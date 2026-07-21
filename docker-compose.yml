@@ -1,5 +1,9 @@
+# Имя compose-проекта фиксировано и не зависит от имени папки:
+# от него — префикс контейнеров/сетей на NAS
+name: firmware-librarian
+
 services:
-  telegram-file-downloader:
+  librarian:
     build: .
     restart: unless-stopped
     environment:
@@ -38,6 +42,7 @@ services:
         max-file: "3"
 
   kb-bot:
+
     build: .
     command: ["python", "kb_bot.py"]
     restart: unless-stopped
@@ -68,8 +73,4 @@ services:
       - /volume1/docker/tg-kb:/app/kb
       # read-only: бот только отдаёт файлы по кнопке 📎 в /fw, пишет — качалка
       - /volume1/public/Repository/Hardware/Huawei/fromChat:/app/downloads:ro
-    logging: &default-logging
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging

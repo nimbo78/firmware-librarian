@@ -9,9 +9,9 @@
     # в .env выставить новые EMBED_MODEL / EMBED_DIM (для стороннего
     # OpenAI-совместимого провайдера — ещё EMBED_API_BASE / EMBED_API_KEY,
     # например DeepInfra: https://api.deepinfra.com/v1/openai), затем:
-    docker compose stop telegram-file-downloader kb-bot
-    docker compose run --rm telegram-file-downloader python kb_reembed.py
-    docker compose start telegram-file-downloader kb-bot
+    docker compose stop librarian kb-bot
+    docker compose run --rm librarian python kb_reembed.py
+    docker compose start librarian kb-bot
 
 Стоимость печатается до старта (у text-embedding-3-large — $0.13/1M токенов).
 Прерванный прогон безопасно перезапускать: он просто начнёт заново

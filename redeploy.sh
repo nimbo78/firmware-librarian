@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-# redeploy.sh — пересборка и запуск telegram-file-downloader.
+# redeploy.sh — пересборка и запуск firmware-librarian.
 # Запуск: ./redeploy.sh из любого каталога (cd делается автоматически).
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

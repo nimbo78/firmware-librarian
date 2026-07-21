@@ -1,4 +1,7 @@
-# telegram-file-downloader
+# firmware-librarian
+
+> Бывший `telegram-file-downloader` — проект перерос имя: теперь это
+> библиотекарь прошивок и документации с RAG-ботом поверх истории чатов.
 
 Два сервиса в одном docker-compose на NAS Synology DS720+:
 
@@ -22,7 +25,7 @@ flowchart TB
     admin -->|"/status · /events · /gaps · /review · /notify"| tg
 
     subgraph nas["Synology DS720+ · Docker Compose"]
-        dl["telegram-file-downloader<br/>· скачивание документов<br/>· каталогизация файлов<br/>· ночной пайплайн 05:00:<br/>чаты → PDF → экстракция"]
+        dl["librarian (качалка)<br/>· скачивание документов<br/>· каталогизация файлов<br/>· ночной пайплайн 05:00:<br/>чаты → PDF → архивы → HedEx → экстракция"]
         bot["kb-bot<br/>· /ask, @mention — RAG<br/>· /fw — каталог прошивок<br/>· оценки 👍/👎, /review<br/>· уведомления админам<br/>· петля gaps"]
         db[("kb.sqlite<br/>чанки + вектора: sqlite-vec + FTS5<br/>каталог files/firmware/devices<br/>события · qa-лог · state")]
         vol[("Том загрузок<br/>файлы + журнал дедупликации")]
@@ -96,10 +99,10 @@ flowchart TB
 5. **Бэкфилл истории в базу знаний** (один раз; качалку остановить — общая сессия):
 
    ```sh
-   docker compose stop telegram-file-downloader
-   docker compose run --rm telegram-file-downloader python kb_backfill.py --dry-run   # оценка объёма и цены
-   docker compose run --rm telegram-file-downloader python kb_backfill.py             # сам бэкфилл
-   docker compose start telegram-file-downloader
+   docker compose stop librarian
+   docker compose run --rm librarian python kb_backfill.py --dry-run   # оценка объёма и цены
+   docker compose run --rm librarian python kb_backfill.py             # сам бэкфилл
+   docker compose start librarian
    ```
 
    Бэкфилл идемпотентен: прерванный прогон можно перезапускать, уже записанные
@@ -246,7 +249,7 @@ Start в личке бота — бот не может написать пер�
 Отладка поиска без LLM и без Telegram:
 
 ```sh
-docker compose run --rm telegram-file-downloader python kb_search.py "как прошить ONT"
+docker compose run --rm librarian python kb_search.py "как прошить ONT"
 ```
 
 Selftest хранилища (без сети вообще): `python kb_store.py`.
@@ -260,7 +263,7 @@ Selftest хранилища (без сети вообще): `python kb_store.py`
 | Рестарт только бота | `docker compose restart kb-bot` |
 | Выключить бота | `docker compose stop kb-bot` |
 | Бэкфилл | см. «Быстрый старт», шаг 5 |
-| Поиск по базе | `docker compose run --rm telegram-file-downloader python kb_search.py "вопрос"` |
+| Поиск по базе | `docker compose run --rm librarian python kb_search.py "вопрос"` |
 
 ## Переменные окружения
 
@@ -358,9 +361,9 @@ CLAUDE.md                   заметки для Claude Code
 #    EMBED_DIM=1024
 #    EMBED_API_BASE=https://api.deepinfra.com/v1/openai
 #    EMBED_API_KEY=...
-docker compose stop telegram-file-downloader kb-bot
-docker compose run --rm telegram-file-downloader python kb_reembed.py
-docker compose start telegram-file-downloader kb-bot
+docker compose stop librarian kb-bot
+docker compose run --rm librarian python kb_reembed.py
+docker compose start librarian kb-bot
 ```
 
 Telegram для этого не нужен (тексты уже в базе). Guard `embed_cfg` в state

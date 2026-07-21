@@ -4,10 +4,10 @@
 Одновременная работа двух процессов с одной сессией роняет соединение
 (AuthKeyDuplicatedError). Запускать ТОЛЬКО при остановленной качалке:
 
-    docker compose stop telegram-file-downloader
-    docker compose run --rm telegram-file-downloader python kb_backfill.py --dry-run
-    docker compose run --rm telegram-file-downloader python kb_backfill.py [--max-cost 10]
-    docker compose start telegram-file-downloader
+    docker compose stop librarian
+    docker compose run --rm librarian python kb_backfill.py --dry-run
+    docker compose run --rm librarian python kb_backfill.py [--max-cost 10]
+    docker compose start librarian
 
 Порядок ввода в строй: сначала полный бэкфилл, потом включать ночной ingest —
 иначе границы суточных чанков не совпадут с полными и появятся почти-дубли.
