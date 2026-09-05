@@ -24,31 +24,18 @@ from kb_render import (ADMIN_HELP_EXTRA, fmt_event, msg_link,
                        nav_category_view, nav_files_view, nav_model_view,
                        nav_root_view, render_grouped, render_sources,
                        user_help)
+from kb_spaces import load_spaces
 from kb_store import open_store
 from tg_conn import proxy_kwargs
 
 API_ID = int(os.environ['TELEGRAM_API_ID'])
 API_HASH = os.environ['TELEGRAM_API_HASH']
 BOT_TOKEN = os.getenv('KB_BOT_TOKEN', '')
-def _parse_chat_topics(raw: str) -> dict[int, set[int]]:
-    """'-100123:15,-100123:22,-100999' -> {-100123: {15, 22}, -100999: set()}.
-
-    Пустой набор топиков = отвечаем в чате где угодно (обратная
-    совместимость со старым форматом «просто список чатов»). В форуме
-    иначе бот засоряет все топики подряд — а его ждут в одном-двух."""
-    out: dict[int, set[int]] = {}
-    for item in raw.split(','):
-        item = item.strip()
-        if not item:
-            continue
-        chat, _, topic = item.partition(':')
-        topics = out.setdefault(int(chat), set())
-        if topic.strip():
-            topics.add(int(topic))
-    return out
-
-
-ANSWER_TOPICS = _parse_chat_topics(os.getenv('KB_ANSWER_CHAT_IDS', ''))
+# Пространства знаний: где бот отвечает, по какой области ищет, чьей
+# персоной говорит. Без spaces.toml — одно неявное пространство из env,
+# то есть ровно прежнее поведение (kb_spaces.load_spaces).
+SPACES = load_spaces()
+ANSWER_TOPICS = SPACES.answer_topics()   # {чат: {топики}}, пусто = весь чат
 ANSWER_CHAT_IDS = set(ANSWER_TOPICS)
 # Через сколько минут убирать за собой служебные сообщения (каталожные
 # простыни, «подожди», подсказки). 0 = не убирать. Ответы на вопросы не
@@ -69,8 +56,9 @@ NOTIFY_POLL_SECONDS = 60
 # Петля «вопросы без ответа»: авто-ответ через час после ночного инжеста
 # (свежие знания уже в базе) и еженедельный пост «помогите сообществу».
 GAP_CHECK_HOUR = int(os.getenv('INGEST_HOUR', '5')) + 1
-GAPS_CHAT_ID = int(os.getenv('KB_GAPS_CHAT_ID', '0') or 0)   # 0 = пост выключен
-GAPS_TOPIC_ID = int(os.getenv('KB_GAPS_TOPIC_ID', '0') or 0)  # топик форума
+# Куда постить «помогите сообществу» — поле пространства (gaps_chat = 0
+# выключает пост); у неявного пространства оно берётся из KB_GAPS_CHAT_ID
+GAPS_SPACES = [s for s in SPACES.all if s.gaps_chat]
 GAPS_POST_WEEKDAY = 0   # понедельник
 GAPS_POST_HOUR = 10
 
@@ -149,7 +137,8 @@ async def _closed_in(chat_id: int) -> set[int]:
 
 
 async def _topic_allowed(event) -> bool:
-    """Разрешён ли ответ в этом топике форума (см. _parse_chat_topics).
+    """Разрешён ли ответ в этом топике форума (гейт по всем пространствам:
+    kb_spaces.Spaces.answer_topics; пустой набор топиков = весь чат).
 
     Закрытый топик приравнен к чужому: писать в него всё равно не выйдет,
     а промолчать до генерации ответа дешевле, чем после."""
@@ -243,11 +232,16 @@ async def _send_answer(event, question: str, parent_qa_id: int = 0) -> None:
                      'Админ: kb_reembed.py.')
         return
     dialog = store.qa_dialog(parent_qa_id) if parent_qa_id else []
-    logger.info('Question from %s in %s%s: %s',
+    # «#b4 вопрос» -> область b4 и текст без указателя; чат без привязки
+    # к пространству ищет по всем областям (kb_spaces.Spaces.resolve)
+    scope, question = SPACES.resolve(event.chat_id or 0, question)
+    logger.info('Question from %s in %s%s [%s]: %s',
                 event.sender_id, event.chat_id,
-                ' (follow-up)' if dialog else '', question[:100])
+                ' (follow-up)' if dialog else '', scope.slug or 'all',
+                question[:100])
     try:
-        answer, found = await answer_question(store, question, dialog=dialog)
+        answer, found = await answer_question(store, question, dialog=dialog,
+                                              scope=scope)
     except Exception as e:
         logger.warning('Answer failed: %s', e)
         await _reply(event, 'Не получилось получить ответ, попробуй позже.')
@@ -255,7 +249,8 @@ async def _send_answer(event, question: str, parent_qa_id: int = 0) -> None:
     qa_id = store.log_qa(event.chat_id or 0, event.sender_id or 0,
                          question, answer, found,
                          msg_id=event.message.id,  # для авто-ответа реплаем
-                         parent_qa_id=parent_qa_id)
+                         parent_qa_id=parent_qa_id,
+                         space=scope.slug or 'all')
     buttons = [[Button.inline('👍', f'r:{qa_id}:1'.encode()),
                 Button.inline('👎', f'r:{qa_id}:-1'.encode())]]
     sent = await _reply(event, answer, link_preview=False, buttons=buttons)
@@ -420,7 +415,7 @@ async def handle_admin(event) -> None:
     text = (event.raw_text or '').strip()
     low = text.lower()
     if low.startswith('/start') or low.startswith('/help'):
-        await event.reply(user_help(_bot_username) + ADMIN_HELP_EXTRA)
+        await event.reply(user_help(_bot_username, SPACES) + ADMIN_HELP_EXTRA)
     elif low.startswith('/status'):
         s = store.kb_stats()
         notify = 'вкл' if store.get_state('admin_notify', '1') == '1' else 'выкл'
@@ -508,13 +503,13 @@ async def handle_admin(event) -> None:
             f'обязательно — можно принять всё разом:',
             buttons=[[Button.inline(f'✅ Принять все {pending}', b'c:allfw')]])
     elif text.startswith('/') and not low.startswith('/ask'):
-        await event.reply(user_help(_bot_username) + ADMIN_HELP_EXTRA)
+        await event.reply(user_help(_bot_username, SPACES) + ADMIN_HELP_EXTRA)
     else:
         question = _extract_question(text)
         if question is None:
             question = text  # в личке админа любой текст — вопрос к базе
         if not question:
-            await event.reply(user_help(_bot_username) + ADMIN_HELP_EXTRA)
+            await event.reply(user_help(_bot_username, SPACES) + ADMIN_HELP_EXTRA)
             return
         parent_qa = 0
         reply_id = event.message.reply_to_msg_id
@@ -564,14 +559,16 @@ async def auto_answer_gaps() -> int:
         if chat_id not in ANSWER_CHAT_IDS and chat_id not in ADMIN_IDS:
             store.mark_gap_closed(qa_id)  # чат больше не обслуживается
             continue
+        scope, question = SPACES.resolve(chat_id, question)
         try:
-            answer, found = await answer_question(store, question)
+            answer, found = await answer_question(store, question, scope=scope)
         except Exception as e:
             logger.warning('gap re-answer failed for %s: %s', qa_id, e)
             continue
         if not found:
             continue  # знаний всё ещё нет — оставляем пробел открытым
-        new_qa = store.log_qa(chat_id, 0, question, answer, True)
+        new_qa = store.log_qa(chat_id, 0, question, answer, True,
+                              space=scope.slug or 'all')
         buttons = [[Button.inline('👍', f'r:{new_qa}:1'.encode()),
                     Button.inline('👎', f'r:{new_qa}:-1'.encode())]]
         text = 'Появился ответ на вопрос выше:\n\n' + answer
@@ -602,31 +599,35 @@ async def auto_answer_gaps() -> int:
 
 
 async def post_gaps() -> None:
-    """Еженедельный пост «помогите сообществу» — топ вопросов без ответа.
-    Обсуждение подберёт ночной инжест, авто-ответ закроет петлю."""
-    rows = store.unposted_gaps(3)
-    if not rows:
-        return
-    lines = [f'{i}. {q}' for i, (_, q) in enumerate(rows, 1)]
-    text = ('Помогите сообществу! Я не смог ответить на эти вопросы:\n\n'
-            + '\n'.join(lines)
-            + '\n\nОбсудите в чате — ночью я прочитаю обсуждение и отвечу '
-              'авторам вопросов.')
-    try:
-        await client.send_message(GAPS_CHAT_ID, text[:4000],
-                                  reply_to=GAPS_TOPIC_ID or None)
-    except Exception as e:
-        if not _is_mute_error(e):
-            raise
-        # это конфиг, а не случайность: чинится правкой KB_GAPS_* в .env
-        logger.info('weekly gaps post skipped — cannot write to %s/%s',
-                    GAPS_CHAT_ID, GAPS_TOPIC_ID)
-        store.add_event('error', f'Пост «помогите сообществу» не ушёл: топик '
-                                 f'{GAPS_CHAT_ID}/{GAPS_TOPIC_ID} закрыт — '
-                                 f'поправь KB_GAPS_CHAT_ID/KB_GAPS_TOPIC_ID')
-        return  # вопросы не помечаем опубликованными — уйдут в следующий раз
-    store.mark_gaps_posted([gid for gid, _ in rows])
-    store.add_event('gaps', f'Опубликовано вопросов без ответа: {len(rows)}')
+    """Еженедельный пост «помогите сообществу» — топ вопросов без ответа,
+    каждой области в её же чат (вопрос про B4 в Huawei-чате никому не
+    поможет). Обсуждение подберёт ночной инжест, авто-ответ закроет петлю."""
+    for space in GAPS_SPACES:
+        rows = store.unposted_gaps(3, space=space.slug)
+        if not rows:
+            continue
+        lines = [f'{i}. {q}' for i, (_, q) in enumerate(rows, 1)]
+        text = ('Помогите сообществу! Я не смог ответить на эти вопросы:\n\n'
+                + '\n'.join(lines)
+                + '\n\nОбсудите в чате — ночью я прочитаю обсуждение и отвечу '
+                  'авторам вопросов.')
+        try:
+            await client.send_message(space.gaps_chat, text[:4000],
+                                      reply_to=space.gaps_topic or None)
+        except Exception as e:
+            if not _is_mute_error(e):
+                raise
+            # это конфиг, а не случайность: чинится правкой gaps_chat/gaps_topic
+            logger.info('weekly gaps post skipped — cannot write to %s/%s',
+                        space.gaps_chat, space.gaps_topic)
+            store.add_event('error', f'Пост «помогите сообществу» не ушёл: топик '
+                                     f'{space.gaps_chat}/{space.gaps_topic} '
+                                     f'закрыт — поправь настройки области '
+                                     f'«{space.label}»')
+            continue  # вопросы не помечаем опубликованными — уйдут в следующий раз
+        store.mark_gaps_posted([gid for gid, _ in rows])
+        store.add_event('gaps', f'Опубликовано вопросов без ответа '
+                                f'({space.label}): {len(rows)}')
 
 
 def _seconds_to_next_hour() -> float:
@@ -649,7 +650,7 @@ async def gaps_loop() -> None:
                     and store.get_state('gaps_check_date') != today):
                 await auto_answer_gaps()
                 store.set_state('gaps_check_date', today)
-            if (GAPS_CHAT_ID and now.weekday() == GAPS_POST_WEEKDAY
+            if (GAPS_SPACES and now.weekday() == GAPS_POST_WEEKDAY
                     and now.hour == GAPS_POST_HOUR
                     and store.get_state('gaps_post_week') != week):
                 await post_gaps()
@@ -669,7 +670,7 @@ async def handler(event):
     text = (event.raw_text or '').strip()
     low = text.lower()
     if low.startswith(('/help', '/start')):
-        await _reply_temp(event, user_help(_bot_username))
+        await _reply_temp(event, user_help(_bot_username, SPACES))
         return
     if low.startswith('/fw'):
         await _handle_fw(event, text)  # без кулдауна: дёшево, без LLM

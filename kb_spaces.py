@@ -32,9 +32,11 @@ _SELECTOR_RE = re.compile(r'(?:(?<=\s)|^)#([A-Za-z0-9][A-Za-z0-9_-]*)(?=\s|$)')
 CATALOGS = ('huawei', 'none')
 SCOPES = ('home', 'all')
 
-# Персона неявного пространства = текущий системный промпт: включение
-# пространств не должно менять тон уже работающего бота
+# Персона и подсказки неявного пространства = то, что зашито в промптах до
+# появления пространств: включение пространств не меняет ни тон ответов,
+# ни качество разворота сленга в терминологию Huawei
 _DEFAULT_PERSONA = 'инженеров по оборудованию Huawei'
+_DEFAULT_HINTS = 'оборудование Huawei: VRP, CloudEngine, AirEngine, версии V200R0xx'
 
 
 def parse_chat_topics(raw) -> dict[int, set[int]]:
@@ -86,6 +88,33 @@ class Space:
         return set(self.answer)
 
 
+@dataclass(frozen=True)
+class Scope:
+    """Область поиска для одного вопроса — всё, что о ней нужно знать
+    отвечающему коду: где искать, можно ли расширяться и как подписать ответ.
+
+    Собирается только в Spaces.resolve(): правила «указатель важнее чата»,
+    «чат без привязки ищет везде» и «своё пространство с фолбэком» живут
+    там, а не расползаются по обработчикам бота."""
+    space: Space | None          # None — искать по всем пространствам
+    fallback: bool = False       # пусто в своём пространстве -> повтор по всем
+    explicit: bool = False       # область названа указателем (#b4 / #all)
+    multi: bool = False          # пространств в системе больше одного
+
+    @property
+    def slug(self) -> str | None:
+        """Аргумент store.search(space=…): None — по всем."""
+        return self.space.slug if self.space else None
+
+    @property
+    def label(self) -> str:
+        return self.space.label if self.space else 'все области'
+
+    @property
+    def hints(self) -> str:
+        return self.space.hints if self.space else ''
+
+
 class Spaces:
     """Набор пространств; первое в конфиге — по умолчанию (получает
     чанки без явной метки и данные, созданные до появления пространств)."""
@@ -124,6 +153,28 @@ class Spaces:
                 else:
                     out.setdefault(chat, set()).update(topics)
         return out
+
+    def resolve(self, chat_id: int, text: str) -> tuple[Scope, str]:
+        """(область поиска, текст без указателя) для входящего вопроса.
+
+        Указатель важнее всего: «#b4 …» — только B4, «#all …» — везде, и в
+        обоих случаях фолбэка нет (человек сказал, где искать). Иначе —
+        домашнее пространство чата с фолбэком на все области; чат без
+        привязки (личка админа, чужой чат) ищет везде сразу."""
+        tag, rest = self.parse_selector(text)
+        multi = len(self.all) > 1
+        if not multi:
+            # одно пространство: «везде» и «в своём» — одно и то же, но
+            # искать по конкретному разделу vec0 дешевле полного скана
+            return Scope(self.default, multi=False), rest
+        if tag == ALL:
+            return Scope(None, explicit=True, multi=True), rest
+        if tag:
+            return Scope(self._by_slug[tag], explicit=True, multi=True), rest
+        home = self.for_chat(chat_id)
+        if home is None or home.default_scope == 'all':
+            return Scope(None, multi=True), rest
+        return Scope(home, fallback=True, multi=True), rest
 
     def parse_selector(self, text: str) -> tuple[str | None, str]:
         """«#b4 как настроить» -> ('b4', 'как настроить'); «#all …» -> ('all', …);
@@ -180,6 +231,7 @@ def _implicit_space(env) -> Space:
     return Space(
         slug=slug, title=env.get('KB_SPACE_TITLE', ''),
         persona=env.get('KB_PERSONA', '').strip() or _DEFAULT_PERSONA,
+        hints=env.get('KB_HINTS', '').strip() or _DEFAULT_HINTS,
         chats=chats, answer=answer or {c: set() for c in chats},
         folder=env.get('DOWNLOAD_FOLDER', './downloads'), catalog='huawei',
         download_chats=_csv_ints(env.get('CHAT_IDS', '')),
@@ -276,6 +328,30 @@ default_scope = "all"
         assert sp.parse_selector('тег#b4 внутри слова') == (None, 'тег#b4 внутри слова')
         assert sp.parse_selector('  без указателя ') == (None, 'без указателя')
         assert sp.get('nope') is None
+
+        # область поиска: указатель важнее чата, чат без привязки — везде
+        sc, q = sp.resolve(-1001, 'как обновить R025')
+        assert (sc.slug, sc.fallback, sc.explicit, q) == (
+            'huawei', True, False, 'как обновить R025'), sc
+        sc, q = sp.resolve(-1001, '#b4 а тут как')
+        assert (sc.slug, sc.fallback, sc.explicit, q) == (
+            'b4', False, True, 'а тут как'), sc
+        sc, _ = sp.resolve(-1001, '#all что угодно')
+        assert sc.slug is None and sc.explicit and not sc.fallback
+        sc, _ = sp.resolve(777, 'вопрос из лички админа')
+        assert sc.slug is None and not sc.explicit and sc.multi
+        # default_scope='all' у b4: свой чат ищет сразу везде
+        assert sp.resolve(-2001, 'вопрос')[0].slug is None
+        assert sp.resolve(-1001, 'вопрос')[0].label == 'Huawei'
+        assert sp.resolve(-1001, '#all x')[0].label == 'все области'
+
+        # одиночная установка: всегда своё единственное пространство —
+        # ни фолбэка, ни пометок, ни глобального скана
+        one = load_spaces(path='/nonexistent.toml', env={'KB_CHAT_IDS': '-1001'})
+        for text, chat in (('вопрос', -1001), ('#all вопрос', -1001),
+                           ('вопрос', 777)):
+            sc, _ = one.resolve(chat, text)
+            assert sc.slug == 'main' and not sc.fallback and not sc.multi, (text, sc)
         # каталог вместо файла = файла нет
         os.mkdir(os.path.join(tmp, 'dir.toml'))
         assert load_spaces(path=os.path.join(tmp, 'dir.toml'),

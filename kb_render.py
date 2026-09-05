@@ -33,7 +33,20 @@ def fmt_event(ts: str, kind: str, text: str, cost: float) -> str:
     return line
 
 
-def user_help(bot_username: str = '') -> str:
+def spaces_help(spaces) -> str:
+    """Блок про области знаний — только когда их больше одной: в одиночной
+    установке выбирать нечего и лишняя строка в справке только путает."""
+    if len(spaces.all) < 2:
+        return ''
+    names = '\n'.join(f'  #{s.slug} — {s.label}' for s in spaces.all)
+    return ('\n🗂 Области знаний (по умолчанию отвечаю по области этого чата,\n'
+            '  а в личке — по всем сразу):\n'
+            f'{names}\n'
+            '  #all — искать во всех областях\n'
+            '• Указатель ставится в самом вопросе: «#b4 как включить DoH».\n')
+
+
+def user_help(bot_username: str = '', spaces=None) -> str:
     mention = f'@{bot_username}' if bot_username else '@<имя бота>'
     return (
         '🤖 Хранитель знаний чата. Что умею:\n'
@@ -42,6 +55,7 @@ def user_help(bot_username: str = '') -> str:
         f'• /ask <вопрос> — или просто упомяни меня: {mention} <вопрос>\n'
         '• Ответь реплаем на мой ответ — продолжу диалог с учётом контекста\n'
         '  (можно уточнять: «а на R024?», «подробнее про DFS»).\n'
+        + (spaces_help(spaces) if spaces is not None else '') +
         '• Под ответом кнопки 👍/👎 — оценки делают базу лучше.\n'
         '• Если ответа не нашлось — вопрос запоминается; как только в чате\n'
         '  появится обсуждение, я сам отвечу реплаем.\n'
@@ -192,6 +206,12 @@ def render_grouped(rows: list, query: str, model_query: str = '',
 def render_sources(report: dict) -> str:
     """Инвентарь базы для команды /sources: из чего бот берёт ответы."""
     out = [f'📚 В базе {report["chunks"]} фрагментов знаний.', '']
+
+    spaces = report.get('spaces') or []
+    if len(spaces) > 1:   # в одиночной установке строка «main: всё» бесполезна
+        out.append('🗂 Области знаний')
+        out += [f'  #{slug or "—"}: {n} фрагментов' for slug, n in spaces]
+        out.append('')
 
     if report['chats']:
         out.append('💬 Чаты')

@@ -76,12 +76,12 @@ class FakeEvent:
 
 
 def _selftest() -> None:
-    # разбор «чат:топик»
-    p = B._parse_chat_topics
-    assert p('') == {}
-    assert p('-100123') == {-100123: set()}
-    assert p(' -1001111:15 , -1001111:22 ,-1002222 ') == {
-        -1001111: {15, 22}, -1002222: set()}
+    # гейт собран из пространств: без spaces.toml — одно неявное из env
+    assert B.SPACES.slugs == ('main',), B.SPACES.slugs
+    assert B.ANSWER_TOPICS == {-1001111: {15}, -1002222: set()}, B.ANSWER_TOPICS
+    # область поиска одиночной установки — всегда своё пространство
+    scope, q = B.SPACES.resolve(CHAT, 'вопрос')
+    assert (scope.slug, scope.multi, q) == ('main', False, 'вопрос'), scope
 
     # гейт: свой топик, чужой топик, General, чат без ограничений, чужой чат
     _no_closed_topics()

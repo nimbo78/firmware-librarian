@@ -856,12 +856,18 @@ class SqliteVecStore:
             'WHERE found=0 AND gap_closed=0 '
             'ORDER BY id DESC LIMIT ?', (limit,)).fetchall()
 
-    def unposted_gaps(self, limit: int = 3) -> list[tuple]:
-        """Открытые пробелы, ещё не публиковавшиеся в чате."""
+    def unposted_gaps(self, limit: int = 3, space: str | None = None) -> list[tuple]:
+        """Открытые пробелы, ещё не публиковавшиеся в чате. space — только
+        вопросы этой области: пост «помогите сообществу» идёт в чат своего
+        пространства, и чужие вопросы там никому не помогут."""
+        sql = ('SELECT id, question FROM qa_log '
+               'WHERE (found=0 OR rating<0) AND gap_closed=0 AND gap_posted=0')
+        args: tuple = ()
+        if space is not None:
+            sql += ' AND space=?'
+            args = (space,)
         return self.db.execute(
-            'SELECT id, question FROM qa_log '
-            'WHERE (found=0 OR rating<0) AND gap_closed=0 AND gap_posted=0 '
-            'ORDER BY id DESC LIMIT ?', (limit,)).fetchall()
+            sql + ' ORDER BY id DESC LIMIT ?', args + (limit,)).fetchall()
 
     def mark_gaps_posted(self, ids: list[int]) -> None:
         if not ids:
