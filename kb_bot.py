@@ -204,7 +204,7 @@ async def _handle_sw(event, text: str) -> None:
     parts = text.split(maxsplit=1)
     arg = parts[1].strip() if len(parts) > 1 else ''
     if not arg:
-        await _reply_temp('Укажи модель: /sw S5735-S (можно с веткой: '
+        await _reply_temp(event, 'Укажи модель: /sw S5735-S (можно с веткой: '
                           '/sw S5735-S R024)')
         return
     model_query, version_tokens = split_query(arg)
@@ -213,11 +213,11 @@ async def _handle_sw(event, text: str) -> None:
         rows = [r for r in rows
                 if all(t in (r[1] or '').upper() for t in version_tokens)]
     if not rows:
-        await _reply_temp(f'По «{arg}» в каталоге пусто. Попробуй /fw {arg} '
+        await _reply_temp(event, f'По «{arg}» в каталоге пусто. Попробуй /fw {arg} '
                           f'(там есть LLM-подбор) или /download <начало имени>.')
         return
     out, buttons, _ = render_grouped(rows, arg, model_query)
-    await _reply_temp(out[:4000], link_preview=False, buttons=buttons or None)
+    await _reply_temp(event, out[:4000], link_preview=False, buttons=buttons or None)
 
 
 DOWNLOAD_BATCH_LIMIT = 12
@@ -230,7 +230,7 @@ async def _handle_download(event, text: str) -> None:
     parts = text.split(maxsplit=1)
     prefix = parts[1].strip() if len(parts) > 1 else ''
     if len(prefix) < 8:
-        await _reply_temp('Дай начало имени файла (минимум 8 символов): '
+        await _reply_temp(event, 'Дай начало имени файла (минимум 8 символов): '
                           '/download iMasterNCEServerInstall_V100R022C00SPC908')
         return
     rows = store.files_by_prefix(prefix, limit=DOWNLOAD_BATCH_LIMIT + 1)
@@ -241,16 +241,16 @@ async def _handle_download(event, text: str) -> None:
             on_disk.append((name, path))
     if not on_disk:
         if rows:
-            await _reply_temp('Файлы с таким именем есть в каталоге, но на '
+            await _reply_temp(event, 'Файлы с таким именем есть в каталоге, но на '
                               'диске NAS их нет — качай по ссылкам из /fw.')
         else:
-            await _reply_temp(f'Ничего не начинается с «{prefix[:60]}».')
+            await _reply_temp(event, f'Ничего не начинается с «{prefix[:60]}».')
         return
     truncated = len(on_disk) > DOWNLOAD_BATCH_LIMIT
     on_disk = on_disk[:DOWNLOAD_BATCH_LIMIT]
     note = (f' (первые {DOWNLOAD_BATCH_LIMIT}, уточни префикс для остальных)'
             if truncated else '')
-    await _reply_temp(f'Отправляю {len(on_disk)} файл(ов){note} — большие '
+    await _reply_temp(event, f'Отправляю {len(on_disk)} файл(ов){note} — большие '
                       f'идут долго…')
     logger.info('Download batch "%s": %d files to %s (asked by %s)',
                 prefix[:60], len(on_disk), event.chat_id, event.sender_id)
@@ -264,7 +264,7 @@ async def _handle_download(event, text: str) -> None:
         except Exception as e:
             logger.warning('download batch send failed for %s: %s', name, e)
     if sent < len(on_disk):
-        await _reply_temp(f'Отправлено {sent} из {len(on_disk)} — остальные '
+        await _reply_temp(event, f'Отправлено {sent} из {len(on_disk)} — остальные '
                           f'не ушли, детали в логах.')
 
 
@@ -273,7 +273,7 @@ async def _handle_fw(event, text: str) -> None:
     arg = parts[1].strip() if len(parts) > 1 else ''
     if not arg:
         nav_text, nav_buttons = nav_root_view(store)
-        await _reply_temp(nav_text, buttons=nav_buttons or None)
+        await _reply_temp(event, nav_text, buttons=nav_buttons or None)
         return
     # 'S5735-S-V2 R025': версия отдельным словом — фильтр, а не часть модели
     model_query, version_tokens = split_query(arg)
@@ -325,7 +325,7 @@ async def _handle_fw(event, text: str) -> None:
                     [Button.inline(f'📎 {name[:40]}', f'g:{doc_id}'.encode())])
         text_out += '\n'.join(lines)
     # пометка LLM — в начале: хвост может обрезаться лимитом 4096
-    await _reply_temp((llm_note + text_out)[:4000],
+    await _reply_temp(event, (llm_note + text_out)[:4000],
                       link_preview=False, buttons=buttons or None)
 
 
@@ -561,7 +561,7 @@ async def handler(event):
     text = (event.raw_text or '').strip()
     low = text.lower()
     if low.startswith(('/help', '/start')):
-        await _reply_temp(user_help(_bot_username))
+        await _reply_temp(event, user_help(_bot_username))
         return
     if low.startswith('/fw'):
         await _handle_fw(event, text)  # без кулдауна: дёшево, без LLM
@@ -573,7 +573,7 @@ async def handler(event):
         # кулдаун: пачка до 12 больших файлов — лёгкий вектор флуда в группе
         now = time.monotonic()
         if now - _last_ask.get(event.sender_id, 0.0) < COOLDOWN_SECONDS:
-            await _reply_temp('Подожди немного перед следующей пачкой файлов.')
+            await _reply_temp(event, 'Подожди немного перед следующей пачкой файлов.')
             return
         _last_ask[event.sender_id] = now
         await _handle_download(event, text)
@@ -590,11 +590,11 @@ async def handler(event):
             return
         question = text  # follow-up без команды
     if not question:
-        await _reply_temp('Напиши вопрос после команды: /ask как прошить ONT')
+        await _reply_temp(event, 'Напиши вопрос после команды: /ask как прошить ONT')
         return
     now = time.monotonic()
     if now - _last_ask.get(event.sender_id, 0.0) < COOLDOWN_SECONDS:
-        await _reply_temp('Подожди немного перед следующим вопросом.')
+        await _reply_temp(event, 'Подожди немного перед следующим вопросом.')
         return
     _last_ask[event.sender_id] = now
     await _send_answer(event, question, parent_qa_id=parent_qa)

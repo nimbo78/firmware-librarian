@@ -18,7 +18,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Бэкфилл истории в базу знаний — см. процедуру в разделе «База знаний».
 - Отладочный поиск по базе: `docker compose run --rm librarian python kb_search.py "вопрос"`.
 - Локальные конвейеры без Telegram (архивы/HedEx/PDF/экстракция; сессию не трогает, качалку можно не гасить): `docker compose run --rm librarian python kb_backfill.py --local-only`.
-- Тестов, линтеров и CI в репозитории нет (кроме selftest в `kb_store.py`).
+- Селфтесты (без Telegram и OpenAI): `python kb_store.py`, `kb_firmware.py`, `kb_render.py`, `kb_hedex.py`, `kb_archive.py`. Групповые команды бота — `python kb_bot_check.py` (отдельный файл: kb_bot на импорте читает env и открывает базу, поэтому окружение задаётся ДО импорта; подменяет event и прогоняет обработчики без сети). Линтеров и CI нет.
 
 ## Переменные окружения
 

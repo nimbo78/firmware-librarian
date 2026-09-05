@@ -333,6 +333,7 @@ kb_bot.py                   answer-бот: клиент, обработчики,
 kb_answer.py                поиск, промпты и сборка ответа (+тестируем отдельно)
 kb_render.py                вёрстка каталога и навигация (+selftest)
 kb_search.py                отладочный поиск по базе без LLM
+kb_bot_check.py             прогон групповых команд бота на подставном событии
 docker-compose.yml          два сервиса, общий том /volume1/docker/tg-kb
 Dockerfile                  python:3.13-slim + tzdata
 .env.example                шаблон переменных окружения
