@@ -102,9 +102,11 @@ views {
     downloader -> kbdb 'минутный тик: настал час или взведён ingest_request'
     downloader -> telegram 'iter_messages от last_seen_id, названия топиков'
     downloader -> openai 'vision/whisper для медиа (по флагам, с кэшем), эмбеддинги новых чанков'
-    downloader -> kbdb 'upsert чанков, сдвиг state; каталог: md5-линковка, сироты из журнала, reparse имён'
+    downloader -> kbdb 'upsert чанков, сдвиг state'
+    downloader -> downloads 'пост-инжест конвейер (kb_pipeline): PDF, архивы (.hdx наружу), HedEx'
+    downloader -> kbdb 'каталог: md5-линковка, сироты из журнала, reparse имён; чанки документации'
     downloader -> openai 'LLM-экстракция: имена/подписи файлов без связок, таксономия серий'
-    downloader -> kbdb 'firmware (medium) + devices; событие «N записей ждут /review»; backup'
+    downloader -> kbdb 'firmware (medium) + devices; событие «N записей ждут /review»; backup раз в KB_BACKUP_DAYS'
   }
 
   dynamic view flow_fw {
