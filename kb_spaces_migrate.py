@@ -56,6 +56,115 @@ def _vec_dim(db: sqlite3.Connection) -> int:
     return len(row[0]) // 4
 
 
+def _rebuild_indexes(db: sqlite3.Connection, dim: int, n: int, log) -> None:
+    """Пересобирает chunks_vec (partition key) и chunks_fts из chunks.
+
+    Векторы читаются из существующей таблицы и перекладываются как есть —
+    переэмбеддинга нет. Используется и первичной миграцией, и
+    переименованием области (partition key в vec0 не обновляется UPDATE'ом)."""
+    t0 = time.monotonic()
+    with db:
+        db.execute('DROP TABLE IF EXISTS chunks_vec_new')
+        db.execute(vec_ddl(dim, 'chunks_vec_new'))
+    moved, last = 0, 0
+    while True:
+        rows = db.execute(
+            'SELECT v.rowid, c.space, v.embedding FROM chunks_vec v '
+            'JOIN chunks c ON c.rowid = v.rowid '
+            'WHERE v.rowid > ? ORDER BY v.rowid LIMIT ?',
+            (last, BATCH)).fetchall()
+        if not rows:
+            break
+        with db:
+            db.executemany(
+                'INSERT INTO chunks_vec_new(rowid, space, embedding) '
+                'VALUES(?,?,?)', rows)
+        last, moved = rows[-1][0], moved + len(rows)
+        log(f'  вектора: {moved}/{n}')
+    with db:
+        db.execute('DROP TABLE chunks_vec')
+    _rename_vec(db, 'chunks_vec_new', 'chunks_vec', dim)
+    log(f'  вектора перенесены за {time.monotonic() - t0:.0f} с')
+
+    t0 = time.monotonic()
+    with db:
+        db.execute('DROP TABLE IF EXISTS chunks_fts')
+        db.execute(fts_ddl())
+    indexed, last = 0, 0
+    while True:
+        rows = db.execute(
+            'SELECT rowid, text, space FROM chunks WHERE rowid > ? '
+            'ORDER BY rowid LIMIT ?', (last, BATCH)).fetchall()
+        if not rows:
+            break
+        with db:
+            db.executemany(
+                'INSERT INTO chunks_fts(rowid, text, space) VALUES(?,?,?)', rows)
+        last, indexed = rows[-1][0], indexed + len(rows)
+        log(f'  полнотекст: {indexed}/{n}')
+    log(f'  FTS пересобран за {time.monotonic() - t0:.0f} с')
+
+
+def rename_space(db_path: str, old: str, new: str, log=print) -> int:
+    """Переименовать область во ВСЕЙ базе: chunks/files/qa_log, ключи state
+    обработанных документов и векторные разделы.
+
+    Нужно, когда spaces.toml заводят после миграции и первую секцию
+    называют не так, как область по умолчанию в базе (её имя — в state
+    spaces_default). Без этого поиск по «новой» области нашёл бы пустоту.
+    Запускать при остановленных сервисах."""
+    db = _connect(db_path)
+    try:
+        moved = db.execute('SELECT count(*) FROM chunks WHERE space=?',
+                           (old,)).fetchone()[0]
+        if not moved and db.execute(
+                'SELECT count(*) FROM files WHERE space=?', (old,)).fetchone()[0] == 0:
+            log(f'Строк области «{old}» в базе нет — нечего переименовывать.')
+            return 0
+        default = db.execute(
+            "SELECT value FROM state WHERE key='spaces_default'").fetchone()
+        default = default[0] if default else old
+        log(f'Переименование «{old}» -> «{new}»: чанков {moved}')
+        with db:
+            for table in ('chunks', 'files', 'qa_log'):
+                cur = db.execute(f'UPDATE {table} SET space=? WHERE space=?',
+                                 (new, old))
+                log(f'  {table}: {cur.rowcount} строк')
+        # ключи state документов: у области по умолчанию — исторический вид
+        # без имени, у остальных — с именем. Смена «кто по умолчанию» их
+        # переименовывает (см. SqliteVecStore.doc_key)
+        new_default = new if default == old else default
+        renamed = 0
+        for prefix in ('pdf_ingested', 'hedex_ingested', 'archive_scanned'):
+            for key, value in db.execute(
+                    'SELECT key, value FROM state WHERE key LIKE ?',
+                    (prefix + ':%',)).fetchall():
+                rest = key[len(prefix) + 1:]
+                head, sep, tail = rest.partition(':')
+                key_space, md5 = (head, tail) if sep else (default, rest)
+                if key_space != old:
+                    continue
+                fresh = (f'{prefix}:{md5}' if new == new_default
+                         else f'{prefix}:{new}:{md5}')
+                if fresh == key:
+                    continue
+                with db:
+                    db.execute('DELETE FROM state WHERE key=?', (key,))
+                    db.execute('INSERT OR REPLACE INTO state(key, value) '
+                               'VALUES(?,?)', (fresh, value))
+                renamed += 1
+        if renamed:
+            log(f'  ключей обработанных документов: {renamed}')
+        _rebuild_indexes(db, _vec_dim(db), moved, log)
+        with db:
+            db.execute('INSERT OR REPLACE INTO state(key, value) VALUES(?,?)',
+                       ('spaces_default', new_default))
+        log('Готово. Запускай сервисы обратно.')
+        return moved
+    finally:
+        db.close()
+
+
 def migrate(db_path: str, space: str, log=print) -> bool:
     """True — база мигрирована сейчас, False — уже была в новой схеме."""
     db = _connect(db_path)
@@ -90,55 +199,16 @@ def migrate(db_path: str, space: str, log=print) -> bool:
                                  (space,))
                 log(f'  {table}: помечено {cur.rowcount} строк')
 
-        # 2. Векторная таблица заново, с partition key. Читаем из старой
-        # порциями и пишем в новую — эмбеддинги не пересчитываются.
-        t0 = time.monotonic()
-        with db:
-            db.execute('DROP TABLE IF EXISTS chunks_vec_new')
-            db.execute(vec_ddl(dim, 'chunks_vec_new'))
-        moved, last = 0, 0
-        while True:
-            rows = db.execute(
-                'SELECT v.rowid, c.space, v.embedding FROM chunks_vec v '
-                'JOIN chunks c ON c.rowid = v.rowid '
-                'WHERE v.rowid > ? ORDER BY v.rowid LIMIT ?',
-                (last, BATCH)).fetchall()
-            if not rows:
-                break
-            with db:
-                db.executemany(
-                    'INSERT INTO chunks_vec_new(rowid, space, embedding) '
-                    'VALUES(?,?,?)', rows)
-            last, moved = rows[-1][0], moved + len(rows)
-            log(f'  вектора: {moved}/{n}')
-        with db:
-            db.execute('DROP TABLE chunks_vec')
-        _rename_vec(db, 'chunks_vec_new', 'chunks_vec', dim)
-        log(f'  вектора перенесены за {time.monotonic() - t0:.0f} с')
-
-        # 3. FTS заново: колонка space + переиндексация текстов
-        t0 = time.monotonic()
-        with db:
-            db.execute('DROP TABLE IF EXISTS chunks_fts')
-            db.execute(fts_ddl())
-        indexed, last = 0, 0
-        while True:
-            rows = db.execute(
-                'SELECT rowid, text, space FROM chunks WHERE rowid > ? '
-                'ORDER BY rowid LIMIT ?', (last, BATCH)).fetchall()
-            if not rows:
-                break
-            with db:
-                db.executemany(
-                    'INSERT INTO chunks_fts(rowid, text, space) VALUES(?,?,?)',
-                    rows)
-            last, indexed = rows[-1][0], indexed + len(rows)
-            log(f'  полнотекст: {indexed}/{n}')
-        log(f'  FTS пересобран за {time.monotonic() - t0:.0f} с')
+        # 2. Векторная таблица заново (partition key) + 3. FTS с колонкой space
+        _rebuild_indexes(db, dim, n, log)
 
         with db:
             db.execute('INSERT OR REPLACE INTO state(key, value) VALUES(?,?)',
                        ('schema_spaces', SCHEMA_SPACES))
+            # чьё имя носят строки без явной метки: startup-guard хранилища
+            # сверяет его с конфигом, чтобы поиск не ушёл в пустую область
+            db.execute('INSERT OR REPLACE INTO state(key, value) VALUES(?,?)',
+                       ('spaces_default', space))
         log('Готово. Запускай сервисы обратно.')
         return True
     finally:
@@ -160,6 +230,15 @@ def main() -> None:
     db_path = os.getenv('KB_DB_PATH', './kb/kb.sqlite')
     if not os.path.exists(db_path):
         raise SystemExit(f'Базы нет: {db_path}')
+    if '--rename-space' in sys.argv:
+        i = sys.argv.index('--rename-space')
+        try:
+            old, new = sys.argv[i + 1], sys.argv[i + 2]
+        except IndexError:
+            raise SystemExit('Использование: kb_spaces_migrate.py '
+                             '--rename-space <старое> <новое>')
+        rename_space(db_path, old, new)
+        return
     space = load_spaces().default.slug
     migrate(db_path, space)
 
@@ -239,6 +318,28 @@ def _selftest() -> None:
             store.upsert_chunks([Chunk(-1001, 0, '', '2026-02-02', '2026-02-02',
                                        9, 9, '', 'новый чанк', vec(2))])
             assert dict(store.count_by_space()) == {'huawei': 6}
+            store.set_state('pdf_ingested:' + 'a' * 32, 'manual.pdf')
+        finally:
+            store.close()
+
+        # конфиг переименовали, а база помечена по-старому — не поднимаемся
+        try:
+            SqliteVecStore(path, dim, default_space='b4')
+            raise AssertionError('ожидали отказ при расхождении областей')
+        except RuntimeError as e:
+            assert 'rename-space' in str(e), e
+
+        # ...и чиним это переименованием: строки, ключи state и разделы vec0
+        assert rename_space(path, 'huawei', 'b4', log=quiet.append) == 6
+        store = SqliteVecStore(path, dim, default_space='b4')
+        try:
+            assert dict(store.count_by_space()) == {'b4': 6}
+            hits = store.search('прошивку', vec(1), space='b4')
+            assert hits and all(h.space == 'b4' for h in hits), hits
+            assert store.search('прошивку', vec(1), space='huawei') == []
+            # область по умолчанию сменилась -> ключ документа снова без имени
+            assert store.get_state('pdf_ingested:' + 'a' * 32) == 'manual.pdf'
+            assert store.get_state('spaces_default') == 'b4'
         finally:
             store.close()
     print('kb_spaces_migrate selftest: OK')

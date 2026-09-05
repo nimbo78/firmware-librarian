@@ -112,8 +112,14 @@ class SqliteVecStore:
         # Базу одновременно пишет качалка (ночной ingest) и читает kb-bot
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('PRAGMA busy_timeout=5000')
-        self._init_schema()
-        self._ensure_spaces_schema()
+        try:
+            self._init_schema()
+            self._ensure_spaces_schema()
+        except Exception:
+            # не оставляем открытый коннект после неудачного конструктора:
+            # на Windows он держит файл, а вызывающему закрывать нечего
+            self.db.close()
+            raise
 
     def _init_schema(self) -> None:
         with self.db:
@@ -255,6 +261,7 @@ class SqliteVecStore:
         мигрирует только kb_spaces_migrate.py при остановленных сервисах —
         пересборка векторов на 2 ГБ идёт минуты и не место ей в старте бота."""
         if self.get_state('schema_spaces') == SCHEMA_SPACES:
+            self._check_default_space()
             return
         if self.count() == 0:
             with self.db:
@@ -262,13 +269,35 @@ class SqliteVecStore:
                 self.db.execute('DROP TABLE IF EXISTS chunks_fts')
                 self.db.execute(vec_ddl(self.embed_dim))
                 self.db.execute(fts_ddl())
-                self.db.execute(
-                    'INSERT OR REPLACE INTO state(key, value) VALUES(?,?)',
-                    ('schema_spaces', SCHEMA_SPACES))
+                for key, value in (('schema_spaces', SCHEMA_SPACES),
+                                   ('spaces_default', self.default_space)):
+                    self.db.execute(
+                        'INSERT OR REPLACE INTO state(key, value) VALUES(?,?)',
+                        (key, value))
             return
         raise RuntimeError(
             f'{self.db_path}: база создана до пространств знаний. Останови оба '
             f'сервиса и прогони kb_spaces_migrate.py (см. SPACES_PLAN.md)')
+
+    def _check_default_space(self) -> None:
+        """Область по умолчанию в конфиге обязана совпадать с той, чьё имя
+        носят строки без явной метки.
+
+        Классическая ловушка: базу мигрировали как «main», потом завели
+        spaces.toml с первой секцией [huawei] — и поиск по своей области
+        стал бы возвращать пустоту при живых данных. Лучше не подняться."""
+        stored = self.get_state('spaces_default')
+        if stored is None:
+            self.set_state('spaces_default', self.default_space)
+            return
+        if stored == self.default_space:
+            return
+        raise RuntimeError(
+            f'{self.db_path}: данные помечены областью «{stored}», а в конфиге '
+            f'первая область — «{self.default_space}». Переименуй секцию в '
+            f'spaces.toml обратно в «{stored}» либо переименуй область в базе: '
+            f'kb_spaces_migrate.py --rename-space {stored} {self.default_space} '
+            f'(при остановленных сервисах)')
 
     def upsert_chunks(self, chunks: list[Chunk]) -> None:
         with self.db:
