@@ -264,6 +264,46 @@ def load_spaces(path: str | None = None, env=None) -> Spaces:
     return Spaces([_space_from_table(slug, tbl) for slug, tbl in data.items()])
 
 
+def _toml_str(value: str) -> str:
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def dump_toml(spaces: Spaces) -> str:
+    """Текущая конфигурация областей в виде spaces.toml.
+
+    Нужна ровно для одного: завести файл, ничего не потеряв. Пока файла
+    нет, вся настройка живёт в .env, и переписывание её руками — способ
+    молча потерять топик ответа или расширение качалки."""
+    out: list[str] = []
+    for s in spaces.all:
+        out.append(f'[{s.slug}]')
+        # у неявной области названия нет — подсказываем, но не выдумываем
+        out.append(f'title   = {_toml_str(s.title)}' if s.title
+                   else '# title   = "Huawei"   # как область называть в справке')
+        out.append(f'persona = {_toml_str(s.persona)}')
+        if s.hints:
+            out.append(f'hints   = {_toml_str(s.hints)}')
+        out.append('chats   = [' + ', '.join(str(c) for c in s.chats) + ']')
+        answer = [f'"{chat}:{t}"' if t else f'"{chat}"'
+                  for chat, topics in sorted(s.answer.items())
+                  for t in (sorted(topics) or [0])]
+        out.append('answer  = [' + ', '.join(answer) + ']')
+        if s.folder:
+            out.append(f'folder  = {_toml_str(s.folder)}')
+        out.append(f'catalog = {_toml_str(s.catalog)}')
+        if s.download_chats:
+            chats = ', '.join(str(c) for c in s.download_chats)
+            exts = ', '.join(_toml_str(e) for e in s.download_extensions)
+            out.append(f'download = {{ chats = [{chats}], '
+                       f'extensions = [{exts}] }}')
+        if s.gaps_chat:
+            out.append(f'gaps_chat  = {s.gaps_chat}')
+            out.append(f'gaps_topic = {s.gaps_topic}')
+        out.append(f'default_scope = {_toml_str(s.default_scope)}')
+        out.append('')
+    return '\n'.join(out)
+
+
 def _selftest() -> None:
     import tempfile
 
@@ -360,6 +400,16 @@ answer = []
         assert sp.resolve(-1001, 'вопрос')[0].label == 'Huawei'
         assert sp.resolve(-1001, '#all x')[0].label == 'все области'
 
+        # --dump печатает конфигурацию, которую load_spaces читает обратно
+        # без потерь: это единственный безопасный способ переехать с .env
+        dumped = os.path.join(tmp, 'dumped.toml')
+        with open(dumped, 'w', encoding='utf-8') as f:
+            f.write(dump_toml(sp))
+        again = load_spaces(path=dumped)
+        assert again.slugs == sp.slugs, (again.slugs, sp.slugs)
+        for a, b in zip(again.all, sp.all):
+            assert a == b, (a, b)
+
         # одиночная установка: всегда своё единственное пространство —
         # ни фолбэка, ни пометок, ни глобального скана
         one = load_spaces(path='/nonexistent.toml', env={'KB_CHAT_IDS': '-1001'})
@@ -391,4 +441,11 @@ answer = []
 
 
 if __name__ == '__main__':
-    _selftest()
+    import sys
+
+    if '--dump' in sys.argv:
+        # kb_spaces.py --dump > spaces.toml — перенести настройку из .env
+        # в файл без ручного переписывания
+        print(dump_toml(load_spaces()))
+    else:
+        _selftest()
