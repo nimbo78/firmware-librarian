@@ -286,14 +286,16 @@ def document_filename(msg) -> str | None:
 
 
 def record_file(store, msg, file_name: str, topic_name: str = '',
-                md5: str = '') -> None:
-    """Каталогизировать документ: метаданные в files + разбор имени в firmware."""
+                md5: str = '', space: str = '') -> None:
+    """Каталогизировать документ: метаданные в files + разбор имени в firmware.
+    space — пространство знаний чата (kb_spaces); пусто = по умолчанию."""
     doc = msg.document
     store.upsert_file(
         doc_id=doc.id, name=file_name, size=getattr(doc, 'size', 0) or 0,
         md5=md5, chat_id=msg.chat_id or 0, msg_id=msg.id,
         caption=(msg.raw_text or '')[:500], topic_name=topic_name,
-        date=f'{msg.date:%Y-%m-%d}', kind=classify_name(file_name))
+        date=f'{msg.date:%Y-%m-%d}', kind=classify_name(file_name),
+        space=space)
     models, version, version_key = parse_firmware_name(file_name)
     for model in models:
         store.upsert_firmware(doc.id, model, version, version_key)

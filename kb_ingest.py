@@ -422,7 +422,7 @@ def build_chunks(chat_id: int, records: list, topic_names: dict[int, str]) -> li
 
 async def ingest_chat(tg_client, store, chat_id: int, min_id: int | None = None,
                       progress=None, max_cost: float | None = None,
-                      enrich_media: bool = True) -> IngestStats:
+                      enrich_media: bool = True, space: str = '') -> IngestStats:
     """Инжест сообщений chat_id от last_seen_id (или явного min_id) до конца.
 
     progress(stage, done, total, cost) — колбэк прогресса ('media' | 'embed').
@@ -484,7 +484,8 @@ async def ingest_chat(tg_client, store, chat_id: int, min_id: int | None = None,
         part = new_chunks[i:i + EMBED_BATCH]
         vectors = await embed_texts([c.text for c in part])
         for c, v in zip(part, vectors):
-            c.embedding = v
+            # space — пространство знаний чата (kb_spaces); пусто = по умолчанию
+            c.embedding, c.space = v, space
         store.upsert_chunks(part)
         stats.cost += embed_cost([c.text for c in part])
         stats.new_chunks += len(part)

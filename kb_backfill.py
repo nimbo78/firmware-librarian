@@ -21,6 +21,10 @@
 голосовые, PDF) с учётом включённых флагов KB_VISION/KB_VOICE/KB_PDF.
 --max-cost N останавливает боевой прогон при достижении N$; всё обработанное
 кэшируется, повторный запуск после пополнения продолжит без двойной оплаты.
+
+Пространства знаний (kb_spaces): по умолчанию обрабатываются все, --space b4
+сужает прогон до одной области — так новое пространство заводится, не трогая
+уже проинжещенные.
 """
 from __future__ import annotations
 
@@ -34,6 +38,7 @@ from telethon import TelegramClient
 from kb_ingest import (BudgetExceeded, EMBED_PRICE_PER_MTOK, VISION_COST_PER_IMAGE,
                        WHISPER_PRICE_PER_MIN, enrich_chat_media, ingest_chat,
                        pdf_enabled, scan_chat, vision_enabled, voice_enabled)
+from kb_spaces import Spaces, load_spaces
 from kb_store import open_store
 from tg_conn import proxy_kwargs
 
@@ -60,9 +65,9 @@ def _progress(stage: str, done: int, total: int, cost: float) -> None:
               f'потрачено ~${cost:.2f}', flush=True)
 
 
-async def _dry_run(client, chat_ids: list[int], download_folder: str) -> None:
+async def _dry_run(client, spaces) -> None:
     total = 0.0
-    for chat_id in chat_ids:
+    for chat_id in [c for s in spaces.all for c in s.chats]:
         print(f'Сканирую {chat_id} — вся история, на большом чате это '
               f'минуты/десятки минут...', flush=True)
         st = await scan_chat(client, chat_id, progress=lambda n: print(
@@ -79,50 +84,53 @@ async def _dry_run(client, chat_ids: list[int], download_folder: str) -> None:
         print(f'  картинок: {st.images} -> vision ~${vision:.2f}{mark}')
         mark = '' if voice_enabled() else ' (KB_VOICE выключен — не считается)'
         print(f'  голосовых: {st.voice_seconds // 60} мин -> whisper ~${voice:.2f}{mark}')
-    if pdf_enabled():
-        from kb_pdf import scan_pdfs
-        files, pages = scan_pdfs(download_folder)
-        # ~1800 символов на страницу мануала — грубая оценка
-        pdf_cost = pages * 1800 / 3 / 1e6 * EMBED_PRICE_PER_MTOK
-        total += pdf_cost
-        print(f'PDF в {download_folder}: {files} файлов, {pages} страниц '
-              f'-> эмбеддинги ~${pdf_cost:.2f}')
-    else:
-        print('PDF: KB_PDF выключен — не считается')
     from kb_archive import archive_enabled
-    if archive_enabled():
-        from kb_archive import scan_archives
-        files, chars = scan_archives(open_store(), download_folder)
-        arc_cost = chars / 3 / 1e6 * EMBED_PRICE_PER_MTOK
-        total += arc_cost
-        print(f'Архивы в {download_folder}: новых {files} '
-              f'-> эмбеддинги ~${arc_cost:.2f} (грубая оценка по листингам)')
-    else:
-        print('Архивы: KB_ARCHIVE выключен — не считается')
     from kb_hedex import hedex_enabled
-    if hedex_enabled():
-        from kb_hedex import scan_hdx
-        files, chars = scan_hdx(open_store(), download_folder)
-        hedex_cost = chars / 3 / 1e6 * EMBED_PRICE_PER_MTOK
-        total += hedex_cost
-        print(f'HedEx в {download_folder}: новых пакетов {files} '
-              f'-> эмбеддинги ~${hedex_cost:.2f} (без кросс-версионного '
-              f'дедупа — реально будет меньше)')
-    else:
+    if not pdf_enabled():
+        print('PDF: KB_PDF выключен — не считается')
+    if not archive_enabled():
+        print('Архивы: KB_ARCHIVE выключен — не считается')
+    if not hedex_enabled():
         print('HedEx: KB_HEDEX выключен — не считается')
+    store = open_store()
+    for space in spaces.all:
+        if not space.folder:
+            continue
+        if pdf_enabled():
+            from kb_pdf import scan_pdfs
+            files, pages = scan_pdfs(space.folder)
+            # ~1800 символов на страницу мануала — грубая оценка
+            pdf_cost = pages * 1800 / 3 / 1e6 * EMBED_PRICE_PER_MTOK
+            total += pdf_cost
+            print(f'PDF в {space.folder}: {files} файлов, {pages} страниц '
+                  f'-> эмбеддинги ~${pdf_cost:.2f}')
+        if archive_enabled():
+            from kb_archive import scan_archives
+            files, chars = scan_archives(store, space.folder, space=space.slug)
+            arc_cost = chars / 3 / 1e6 * EMBED_PRICE_PER_MTOK
+            total += arc_cost
+            print(f'Архивы в {space.folder}: новых {files} '
+                  f'-> эмбеддинги ~${arc_cost:.2f} (грубая оценка по листингам)')
+        if hedex_enabled():
+            from kb_hedex import scan_hdx
+            files, chars = scan_hdx(store, space.folder, space=space.slug)
+            hedex_cost = chars / 3 / 1e6 * EMBED_PRICE_PER_MTOK
+            total += hedex_cost
+            print(f'HedEx в {space.folder}: новых пакетов {files} '
+                  f'-> эмбеддинги ~${hedex_cost:.2f} (без кросс-версионного '
+                  f'дедупа — реально будет меньше)')
     print(f'\nИтого оценка: ~${total:.2f}')
     print('Подсказка: --max-cost N остановит боевой прогон при достижении N$.')
 
 
-async def _local_only(download_folder: str, max_cost: float | None) -> None:
+async def _local_only(spaces, max_cost: float | None) -> None:
     """--local-only: без подключения к Telegram (сессию не трогает, качалку
     можно не гасить) — весь пост-инжест конвейер kb_pipeline. Нужен только
     ключ эмбеддингов/OpenAI. Гонки с ночным джобом безопасны (state/md5),
     но осмысленнее не пересекаться по времени."""
     from kb_pipeline import run_post_ingest
     store = open_store()
-    spent, stopped = await run_post_ingest(store, download_folder,
-                                           budget=max_cost,
+    spent, stopped = await run_post_ingest(store, spaces, budget=max_cost,
                                            progress=_progress, report='print')
     print(f'\nЧанков в базе: {store.count()}. Потрачено: ~${spent:.2f}')
     if stopped:
@@ -133,10 +141,14 @@ async def _local_only(download_folder: str, max_cost: float | None) -> None:
                     f'{store.count()}', spent)
 
 
-async def _backfill(client, chat_ids: list[int], download_folder: str,
-                    max_cost: float | None,
-                    extra_chat_ids: list[int]) -> None:
+async def _backfill(client, spaces, max_cost: float | None) -> None:
     store = open_store()
+    # чат -> пространство; чаты качалки вне chats каталогизируем без инжеста
+    # в RAG — иначе их файлы невидимы для /fw и кнопок 📎
+    chat_space = {c: s for s in spaces.all for c in s.chats}
+    chat_ids = list(chat_space)
+    extra = {c: s for s in spaces.all for c in s.download_chats
+             if c not in chat_space}
     spent = 0.0
     stopped = False
     media_wanted = vision_enabled() or voice_enabled()
@@ -151,7 +163,8 @@ async def _backfill(client, chat_ids: list[int], download_folder: str,
         try:
             stats = await ingest_chat(client, store, chat_id, min_id=0,
                                       progress=_progress, max_cost=remaining(),
-                                      enrich_media=False)
+                                      enrich_media=False,
+                                      space=chat_space[chat_id].slug)
         except BudgetExceeded as e:
             spent += e.cost
             stopped = True
@@ -163,10 +176,10 @@ async def _backfill(client, chat_ids: list[int], download_folder: str,
     # Каталогизация документов из чатов качалки, не входящих в KB_CHAT_IDS:
     # без инжеста в RAG, только files/firmware — иначе файлы, скачанные из
     # «не-KB» чатов, невидимы для /fw и кнопок 📎
-    if not stopped and extra_chat_ids:
+    if not stopped and extra:
         from kb_firmware import document_filename, record_file
         from kb_ingest import fetch_topic_names, message_topic_id
-        for chat_id in extra_chat_ids:
+        for chat_id, space in extra.items():
             print(f'Каталог (без инжеста): {chat_id}...', flush=True)
             topics = await fetch_topic_names(client, chat_id)
             recorded = 0
@@ -177,7 +190,8 @@ async def _backfill(client, chat_ids: list[int], download_folder: str,
                 if not fname:
                     continue
                 record_file(store, msg, fname,
-                            topics.get(message_topic_id(msg), ''))
+                            topics.get(message_topic_id(msg), ''),
+                            space=space.slug)
                 recorded += 1
             print(f'  документов закаталогизировано: {recorded}')
     # Этап 2: vision/whisper — только наполнение кэша, чанки не трогаем
@@ -203,7 +217,8 @@ async def _backfill(client, chat_ids: list[int], download_folder: str,
             try:
                 stats = await ingest_chat(client, store, chat_id, min_id=0,
                                           progress=_progress,
-                                          max_cost=remaining())
+                                          max_cost=remaining(),
+                                          space=chat_space[chat_id].slug)
             except BudgetExceeded as e:
                 spent += e.cost
                 stopped = True
@@ -214,11 +229,11 @@ async def _backfill(client, chat_ids: list[int], download_folder: str,
         # общий пост-инжест конвейер: каталог -> PDF -> архивы -> HedEx ->
         # экстракция -> бэкап (kb_pipeline, тот же путь, что у ночного джоба)
         from kb_pipeline import run_post_ingest
-        extra, stopped = await run_post_ingest(store, download_folder,
-                                               budget=remaining(),
-                                               progress=_progress,
-                                               report='print')
-        spent += extra
+        more, stopped = await run_post_ingest(store, spaces,
+                                              budget=remaining(),
+                                              progress=_progress,
+                                              report='print')
+        spent += more
     else:
         store.backup()
     print(f'\nЧанков в базе: {store.count()}. Потрачено в этом прогоне: ~${spent:.2f}')
@@ -245,23 +260,31 @@ async def main() -> None:
                         help='только локальные конвейеры (архивы, HedEx, PDF, '
                              'экстракция) — БЕЗ подключения к Telegram: сессию '
                              'не трогает, качалку можно не останавливать')
+    parser.add_argument('--space', default='', metavar='SLUG',
+                        help='обработать только одну область знаний '
+                             '(по умолчанию — все из spaces.toml)')
     args = parser.parse_args()
+
+    spaces = load_spaces()
+    if args.space:
+        one = spaces.get(args.space)
+        if one is None:
+            raise SystemExit(f'нет области «{args.space}»; есть: '
+                             + ', '.join(spaces.slugs))
+        spaces = Spaces([one])
 
     if args.local_only:
         if args.dry_run:
             raise SystemExit('--local-only несовместим с --dry-run: оценка '
                              'печатается самими конвейерами')
-        await _local_only(os.getenv('DOWNLOAD_FOLDER', './downloads'),
-                          args.max_cost)
+        await _local_only(spaces, args.max_cost)
         return
 
     api_id = int(_require('TELEGRAM_API_ID'))
     api_hash = _require('TELEGRAM_API_HASH')
-    chat_ids = [int(x) for x in _require('KB_CHAT_IDS').split(',') if x.strip()]
-    download_folder = os.getenv('DOWNLOAD_FOLDER', './downloads')
-    # чаты качалки вне KB: каталогизируем документы без инжеста в RAG
-    dl_chat_ids = {int(x) for x in os.getenv('CHAT_IDS', '').split(',') if x.strip()}
-    extra_chat_ids = sorted(dl_chat_ids - set(chat_ids))
+    if not any(s.chats for s in spaces.all):
+        raise SystemExit('ни одна область не задаёт чаты-источники '
+                         '(KB_CHAT_IDS или chats в spaces.toml)')
 
     client = TelegramClient(
         'bot', api_id, api_hash,
@@ -283,10 +306,9 @@ async def main() -> None:
     print('Подключился.', flush=True)
     try:
         if args.dry_run:
-            await _dry_run(client, chat_ids, download_folder)
+            await _dry_run(client, spaces)
         else:
-            await _backfill(client, chat_ids, download_folder, args.max_cost,
-                            extra_chat_ids)
+            await _backfill(client, spaces, args.max_cost)
     finally:
         await client.disconnect()
 

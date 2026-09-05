@@ -19,7 +19,7 @@ RUN apt-get update \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-COPY librarian.py tg_conn.py kb_store.py kb_ingest.py kb_render.py kb_answer.py kb_pipeline.py kb_firmware.py kb_extract.py kb_pdf.py kb_hedex.py kb_archive.py kb_backfill.py kb_bot.py kb_search.py kb_reembed.py ./
+COPY librarian.py tg_conn.py kb_store.py kb_ingest.py kb_render.py kb_answer.py kb_pipeline.py kb_firmware.py kb_extract.py kb_pdf.py kb_hedex.py kb_archive.py kb_backfill.py kb_bot.py kb_search.py kb_reembed.py kb_spaces.py kb_spaces_migrate.py ./
 COPY bot.session bot.session
 
 CMD ["python", "librarian.py"]

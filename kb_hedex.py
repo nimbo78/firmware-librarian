@@ -204,7 +204,7 @@ def hdx_chunks(path: str, md5: str) -> tuple[dict, list[tuple[Chunk, str]]]:
     return info, out
 
 
-def scan_hdx(store, folder: str) -> tuple[int, int]:
+def scan_hdx(store, folder: str, space: str = '') -> tuple[int, int]:
     """Для dry-run: (новых пакетов, оценка символов текста). Без распаковки
     страниц — по размерам HTML внутри zip и доле текста в разметке."""
     files = 0
@@ -212,7 +212,7 @@ def scan_hdx(store, folder: str) -> tuple[int, int]:
     for name in list_hdx(folder):
         path = os.path.join(folder, name)
         md5 = file_md5(store, path)
-        if store.get_state(f'hedex_ingested:{md5}'):
+        if store.get_state(store.doc_key('hedex_ingested', md5, space)):
             continue
         try:
             z = zipfile.ZipFile(path)
@@ -234,8 +234,10 @@ def _version_key(version: str) -> str:
 
 
 async def ingest_hdx(store, folder: str, progress=None,
-                     max_cost: float | None = None) -> tuple[int, int, float]:
+                     max_cost: float | None = None,
+                     space: str = '') -> tuple[int, int, float]:
     """Инжест новых .hdx из folder. Возвращает (пакетов, чанков, стоимость $).
+    space — пространство знаний, которому принадлежит папка (kb_spaces).
 
     Пакеты сортируются по версии от новых к старым: при кросс-версионном
     дедупе общая страница достаётся новейшей документации."""
@@ -245,7 +247,7 @@ async def ingest_hdx(store, folder: str, progress=None,
     for name in list_hdx(folder):
         path = os.path.join(folder, name)
         md5 = file_md5(store, path)
-        if store.get_state(f'hedex_ingested:{md5}'):
+        if store.get_state(store.doc_key('hedex_ingested', md5, space)):
             continue
         try:
             with zipfile.ZipFile(path) as z:
@@ -276,14 +278,15 @@ async def ingest_hdx(store, folder: str, progress=None,
             part = new_chunks[i:i + EMBED_BATCH]
             vectors = await embed_texts([c.text for c in part])
             for c, v in zip(part, vectors):
-                c.embedding = v
+                c.embedding, c.space = v, space
             store.upsert_chunks(part)
             cost += embed_cost([c.text for c in part])
             if progress and (i // EMBED_BATCH) % 10 == 0:
                 progress('hedex', files, i + len(part), cost)
             if max_cost is not None and cost >= max_cost:
                 raise BudgetExceeded(cost)
-        store.set_state(f'hedex_ingested:{md5}', os.path.basename(path))
+        store.set_state(store.doc_key('hedex_ingested', md5, space),
+                        os.path.basename(path))
         files += 1
         chunks_total += len(new_chunks)
         if progress:

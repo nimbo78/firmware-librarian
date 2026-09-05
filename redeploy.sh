@@ -13,6 +13,11 @@ if [ ! -f .env ]; then
     exit 1
 fi
 
+# Пустой spaces.toml = «областей не настроено», всё берётся из .env.
+# Файл обязан существовать: без него docker создаст на его месте КАТАЛОГ
+# (bind-mount несуществующего пути) и намусорит в репозитории.
+[ -e spaces.toml ] || : > spaces.toml
+
 if [ ! -f bot.session ]; then
     echo "ERROR: bot.session not found — без неё контейнер заблокируется на запросе телефона" >&2
     exit 1

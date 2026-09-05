@@ -37,3 +37,7 @@ fromChat/
 
 # --- Артефакты браузерных превью (playwright MCP) ---
 .playwright-mcp/
+
+# --- Конфиг областей знаний: содержит id чатов, как и .env ---
+# (шаблон — spaces.toml.example; пустой файл создаёт redeploy.sh)
+spaces.toml

@@ -433,6 +433,18 @@ class SqliteVecStore:
             out.add(hashlib.sha1(body.encode('utf-8')).hexdigest())
         return out
 
+    def doc_key(self, prefix: str, md5: str, space: str = '') -> str:
+        """Ключ state обработанного документа («pdf_ingested», «hedex_ingested»,
+        «archive_scanned»).
+
+        Для пространства по умолчанию — исторический вид `<prefix>:<md5>`:
+        иначе весь уже обработанный корпус выглядел бы новым и был бы
+        переиндексирован за деньги. Остальные пространства получают своё
+        имя в ключе — один и тот же файл в двух папках инжестится в оба."""
+        space = space or self.default_space
+        return (f'{prefix}:{md5}' if space == self.default_space
+                else f'{prefix}:{space}:{md5}')
+
     def get_state(self, key: str, default: str | None = None) -> str | None:
         row = self.db.execute('SELECT value FROM state WHERE key=?', (key,)).fetchone()
         return row[0] if row else default

@@ -244,18 +244,20 @@ def _implicit_space(env) -> Space:
 
 
 def load_spaces(path: str | None = None, env=None) -> Spaces:
-    """spaces.toml, если он есть, иначе одно неявное пространство из env.
+    """spaces.toml, если он есть и не пуст, иначе одно неявное из env.
 
-    Каталог вместо файла (docker создаёт пустую папку под несуществующий
-    bind-mount) считается отсутствием файла, а не ошибкой."""
+    Пустой файл и каталог вместо файла (docker создаёт папку под
+    несуществующий bind-mount) означают «области не настроены»: одиночная
+    установка не должна падать из-за примонтированной пустышки."""
     env = os.environ if env is None else env
     path = path or env.get('KB_SPACES_FILE', '') or 'spaces.toml'
-    if not os.path.isfile(path):
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
         return Spaces([_implicit_space(env)])
     with open(path, 'rb') as f:
         data = tomllib.load(f)
     if not data:
-        raise ValueError(f'{path}: ни одного пространства')
+        # файл есть, но в нём одни комментарии — тоже «не настроено»
+        return Spaces([_implicit_space(env)])
     return Spaces([_space_from_table(slug, tbl) for slug, tbl in data.items()])
 
 
@@ -358,7 +360,7 @@ default_scope = "all"
                            env={}).default.slug == 'main'
         # кривые конфиги — понятные ошибки
         for body in ('[all]\nchats=[1]', '[Huawei]\nchats=[1]',
-                     '[x]\ncatalog="mikrotik"', '[x]\ndefault_scope="везде"', ''):
+                     '[x]\ncatalog="mikrotik"', '[x]\ndefault_scope="везде"'):
             with open(path, 'w', encoding='utf-8') as f:
                 f.write(body)
             try:
@@ -366,6 +368,12 @@ default_scope = "all"
                 raise AssertionError(f'ожидали ValueError: {body!r}')
             except ValueError:
                 pass
+        # пустой файл и файл из одних комментариев = «области не настроены»,
+        # а не ошибка: docker монтирует пустышку, падать из-за неё нельзя
+        for body in ('', '# только комментарий\n'):
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(body)
+            assert load_spaces(path=path, env={}).default.slug == 'main'
     print('kb_spaces selftest: OK')
 
 

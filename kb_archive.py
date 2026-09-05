@@ -489,7 +489,7 @@ def list_archives(folder: str) -> list[str]:
     return sorted(out)
 
 
-def scan_archives(store, folder: str) -> tuple[int, int]:
+def scan_archives(store, folder: str, space: str = '') -> tuple[int, int]:
     """Для dry-run: (новых архивов, оценка символов текста). Быстрый путь:
     zip/rar листаются (central directory), tar/7z оцениваются в 5% размера."""
     journal = _load_md5_journal(folder)
@@ -498,7 +498,7 @@ def scan_archives(store, folder: str) -> tuple[int, int]:
     for rel in list_archives(folder):
         path = os.path.join(folder, rel)
         md5 = journal.get(os.path.basename(rel)) or file_md5(store, path)
-        if store.get_state(f'archive_scanned:{md5}'):
+        if store.get_state(store.doc_key('archive_scanned', md5, space)):
             continue
         files += 1
         low = rel.lower()
@@ -537,9 +537,10 @@ def _process_archive_sync(path: str, arc_name: str, md5: str,
 
 
 async def process_archives(store, folder: str, progress=None,
-                           max_cost: float | None = None
-                           ) -> tuple[int, int, float]:
+                           max_cost: float | None = None,
+                           space: str = '') -> tuple[int, int, float]:
     """Полный проход: листинг + каталог + текст в RAG + извлечение .hdx.
+    space — пространство знаний, которому принадлежит папка (kb_spaces).
     Возвращает (архивов, чанков, стоимость $). Работа с store — только
     из основного потока (sqlite-коннект не потокобезопасен)."""
     import asyncio
@@ -558,7 +559,7 @@ async def process_archives(store, folder: str, progress=None,
             # хэширование гигабайтов — в поток: в event loop оно глушит Telethon
             md5 = await asyncio.to_thread(_file_md5, path)
             store.remember_md5(path, md5)
-        if store.get_state(f'archive_scanned:{md5}'):
+        if store.get_state(store.doc_key('archive_scanned', md5, space)):
             continue
         try:
             members, chunks, _ = await asyncio.to_thread(
@@ -579,12 +580,12 @@ async def process_archives(store, folder: str, progress=None,
             part = new_chunks[i:i + EMBED_BATCH]
             vectors = await embed_texts([c.text for c in part])
             for c, v in zip(part, vectors):
-                c.embedding = v
+                c.embedding, c.space = v, space
             store.upsert_chunks(part)
             cost += embed_cost([c.text for c in part])
             if max_cost is not None and cost >= max_cost:
                 raise BudgetExceeded(cost)
-        store.set_state(f'archive_scanned:{md5}', arc_name)
+        store.set_state(store.doc_key('archive_scanned', md5, space), arc_name)
         done += 1
         chunks_total += len(new_chunks)
         if progress:

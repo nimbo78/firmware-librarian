@@ -33,9 +33,14 @@ services:
       KB_BACKUP_DAYS: ${KB_BACKUP_DAYS:-7}
       KB_VISION_MODEL: ${KB_VISION_MODEL:-gpt-5-mini}
       KB_ADMIN_IDS: ${KB_ADMIN_IDS:-}
+      KB_SPACES_FILE: /app/spaces.toml
     volumes:
       - /volume1/public/Repository/Hardware/Huawei/fromChat:/app/downloads
       - /volume1/docker/tg-kb:/app/kb
+      # Области знаний. Файла может не быть — тогда одна область из .env
+      # (см. spaces.toml.example). Папка каждой новой области — отдельный
+      # том рядом с /app/downloads, путь совпадает с folder в spaces.toml
+      - ./spaces.toml:/app/spaces.toml:ro
     logging: &default-logging
       driver: json-file
       options:
@@ -71,8 +76,10 @@ services:
       ANSWER_MODEL: ${ANSWER_MODEL:-gpt-5-mini}
       KB_WEB: ${KB_WEB:-0}
       KB_CLEANUP_MINUTES: ${KB_CLEANUP_MINUTES:-0}
+      KB_SPACES_FILE: /app/spaces.toml
     volumes:
       - /volume1/docker/tg-kb:/app/kb
       # read-only: бот только отдаёт файлы по кнопке 📎 в /fw, пишет — качалка
       - /volume1/public/Repository/Hardware/Huawei/fromChat:/app/downloads:ro
+      - ./spaces.toml:/app/spaces.toml:ro
     logging: *default-logging

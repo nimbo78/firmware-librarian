@@ -9,6 +9,7 @@ from datetime import datetime
 from telethon import TelegramClient, errors, events
 from telethon.tl.types import DocumentAttributeFilename
 
+from kb_spaces import load_spaces
 from tg_conn import proxy_kwargs
 
 
@@ -21,16 +22,19 @@ def _require(name: str) -> str:
 
 API_ID = int(_require('TELEGRAM_API_ID'))
 API_HASH = _require('TELEGRAM_API_HASH')
-CHAT_IDS = {int(x) for x in _require('CHAT_IDS').split(',') if x.strip()}
-FILE_EXTENSIONS = {
-    e.strip().lower()
-    for e in os.getenv('FILE_EXTENSIONS', 'pdf,jpg,png').split(',')
-    if e.strip()
-}
-DOWNLOAD_FOLDER = os.getenv('DOWNLOAD_FOLDER', './downloads')
+_require('CHAT_IDS')  # без spaces.toml качалке нужен хотя бы один чат
+
+# Пространства знаний (kb_spaces): без spaces.toml — одно неявное из env,
+# то есть прежнее поведение. Скачивание идёт по download_chats пространства
+# в его же папку, инжест — по chats.
+SPACES = load_spaces()
+# чат -> пространство, из которого качаем файлы (у чата одно пространство)
+DOWNLOAD_SPACES = {chat: s for s in SPACES.all for chat in s.download_chats}
+CHAT_IDS = set(DOWNLOAD_SPACES)
+KB_CHAT_SPACES = {chat: s for s in SPACES.all for chat in s.chats}
 
 # База знаний: чаты для ночного инжеста (пусто — подсистема выключена)
-KB_CHAT_IDS = {int(x) for x in os.getenv('KB_CHAT_IDS', '').split(',') if x.strip()}
+KB_CHAT_IDS = set(KB_CHAT_SPACES)
 INGEST_HOUR = int(os.getenv('INGEST_HOUR', '5'))
 KB_ADMIN_IDS = {int(x) for x in os.getenv('KB_ADMIN_IDS', '').split(',') if x.strip()}
 
@@ -56,13 +60,13 @@ def _kb_event(kind: str, text: str, cost: float = 0.0) -> None:
         logger.debug('kb event skipped: %s', e)
 
 
-def _kb_record_file(message, file_name: str) -> None:
+def _kb_record_file(message, file_name: str, space: str = '') -> None:
     """Каталог файлов: метаданные документа + разбор имени прошивки."""
     if not (KB_CHAT_IDS or KB_ADMIN_IDS):
         return
     try:
         from kb_firmware import record_file
-        record_file(_kb_store_lazy(), message, file_name)
+        record_file(_kb_store_lazy(), message, file_name, space=space)
     except Exception as e:
         logger.debug('kb file record skipped: %s', e)
 
@@ -79,8 +83,10 @@ def _kb_set_file_md5(message, file_md5: str) -> None:
 if not CHAT_IDS:
     raise ValueError('CHAT_IDS must contain at least one chat id')
 
-downloaded_files_log = os.path.join(DOWNLOAD_FOLDER, 'downloaded_files.txt')
-os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+# Журнал дедупликации лежит в папке пространства: у каждой папки свой
+# (файл с одним именем в разных пространствах — разные файлы)
+for _space in {s.slug: s for s in DOWNLOAD_SPACES.values()}.values():
+    os.makedirs(_space.folder, exist_ok=True)
 
 # %(name)s подписывает источник: telethon.network.* — сетевой слой Telegram,
 # downloader/kb_* — наши модули (иначе непонятно, чей варнинг)
@@ -94,11 +100,16 @@ logging.getLogger('telethon').setLevel(logging.WARNING)
 _MD5_RE = re.compile(r'^[0-9a-f]{32}$')
 
 
-def load_downloaded_files() -> dict:
+def journal_path(folder: str) -> str:
+    return os.path.join(folder, 'downloaded_files.txt')
+
+
+def load_downloaded_files(folder: str) -> dict:
     result: dict = {}
-    if not os.path.exists(downloaded_files_log):
+    log = journal_path(folder)
+    if not os.path.exists(log):
         return result
-    with open(downloaded_files_log, 'r', encoding='utf-8') as f:
+    with open(log, 'r', encoding='utf-8') as f:
         for line in f.read().splitlines():
             if not line:
                 continue
@@ -114,12 +125,20 @@ def load_downloaded_files() -> dict:
     return result
 
 
-downloaded_files = load_downloaded_files()
+# Журнал на папку: у каждого пространства свой (файл с тем же именем в
+# другом пространстве — другой файл, дедуплицировать их вместе нельзя)
+_journals: dict[str, dict] = {}
 
 
-def save_downloaded_file(file_name: str, file_md5: str) -> None:
-    downloaded_files[file_name] = file_md5
-    with open(downloaded_files_log, 'a', encoding='utf-8') as f:
+def downloaded_files(folder: str) -> dict:
+    if folder not in _journals:
+        _journals[folder] = load_downloaded_files(folder)
+    return _journals[folder]
+
+
+def save_downloaded_file(folder: str, file_name: str, file_md5: str) -> None:
+    downloaded_files(folder)[file_name] = file_md5
+    with open(journal_path(folder), 'a', encoding='utf-8') as f:
         f.write(f'{file_md5},{file_name}\n')
 
 
@@ -145,8 +164,11 @@ client = TelegramClient(
 
 @client.on(events.NewMessage)
 async def handler(event):
-    in_download = event.chat_id in CHAT_IDS
-    if not (in_download or event.chat_id in KB_CHAT_IDS):
+    # чат может быть и качаемым, и источником знаний: dl_space — откуда
+    # качаем (None = только каталогизируем), space — чьё это знание
+    dl_space = DOWNLOAD_SPACES.get(event.chat_id)
+    space = dl_space or KB_CHAT_SPACES.get(event.chat_id)
+    if space is None:
         return
 
     if not (event.message.media and hasattr(event.message.media, 'document')):
@@ -166,21 +188,23 @@ async def handler(event):
 
     # Каталог: метаданные ВСЕХ документов из наблюдаемых чатов (включая
     # расширения, которые не скачиваем, — прошивки ищутся по /fw без файла)
-    _kb_record_file(event.message, file_name)
+    _kb_record_file(event.message, file_name, space=space.slug)
 
-    if not in_download:
+    if dl_space is None:
         return
 
     if '.' not in file_name:
         return
     file_extension = file_name.rsplit('.', 1)[-1].lower()
-    if file_extension not in FILE_EXTENSIONS:
+    if file_extension not in dl_space.download_extensions:
         return
 
-    file_path = os.path.join(DOWNLOAD_FOLDER, file_name)
+    folder = dl_space.folder
+    file_path = os.path.join(folder, file_name)
 
-    if file_name in downloaded_files and os.path.exists(file_path):
-        if downloaded_files[file_name] == calculate_md5(file_path):
+    journal = downloaded_files(folder)
+    if file_name in journal and os.path.exists(file_path):
+        if journal[file_name] == calculate_md5(file_path):
             logger.info('File %s already downloaded with the same MD5 hash.', file_name)
             return
 
@@ -197,7 +221,7 @@ async def handler(event):
         return
 
     file_md5 = calculate_md5(file_path)
-    save_downloaded_file(file_name, file_md5)
+    save_downloaded_file(folder, file_name, file_md5)
     logger.info('Downloaded %s to %s', file_name, file_path)
     _kb_set_file_md5(event.message, file_md5)
     size_mb = os.path.getsize(file_path) / 1e6
@@ -219,7 +243,9 @@ async def kb_ingest_loop() -> None:
     from kb_store import open_store
     store = open_store()
     logger.info('KB ingest scheduled daily at %02d:00 for chats %s '
-                '(+ /ingest по запросу)', INGEST_HOUR, sorted(KB_CHAT_IDS))
+                '(+ /ingest по запросу)', INGEST_HOUR,
+                ', '.join(f'{c} [{s.slug}]'
+                          for c, s in sorted(KB_CHAT_SPACES.items())))
     while True:
         await asyncio.sleep(60)
         now = datetime.now()
@@ -249,9 +275,10 @@ async def kb_ingest_loop() -> None:
             store.set_state('ingest_done_date', today)
         if on_demand:
             logger.info('KB ingest: on-demand run requested via /ingest')
-        for chat_id in KB_CHAT_IDS:
+        for chat_id, space in KB_CHAT_SPACES.items():
             try:
-                stats = await ingest_chat(client, store, chat_id)
+                stats = await ingest_chat(client, store, chat_id,
+                                          space=space.slug)
                 logger.info('KB ingest %s: %d messages -> %d new chunks, '
                             'media %d, ~$%.2f', chat_id, stats.messages,
                             stats.new_chunks, stats.media_items, stats.cost)
@@ -289,7 +316,7 @@ async def kb_ingest_loop() -> None:
             # каталог -> PDF -> архивы -> HedEx -> экстракция -> бэкап;
             # шаги изолированы внутри, отчёт — событиями админу
             from kb_pipeline import run_post_ingest
-            await run_post_ingest(store, DOWNLOAD_FOLDER,
+            await run_post_ingest(store, SPACES,
                                   progress=_pipeline_progress)
         except Exception as e:
             logger.warning('KB post-ingest pipeline failed: %s', e)

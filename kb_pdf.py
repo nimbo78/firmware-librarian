@@ -99,15 +99,17 @@ def _pdf_chunks(path: str, name: str, md5: str) -> list[Chunk]:
 
 
 async def ingest_pdfs(store, folder: str, progress=None,
-                      max_cost: float | None = None) -> tuple[int, int, float]:
-    """Инжест новых PDF из folder. Возвращает (файлов, чанков, стоимость $)."""
+                      max_cost: float | None = None,
+                      space: str = '') -> tuple[int, int, float]:
+    """Инжест новых PDF из folder. Возвращает (файлов, чанков, стоимость $).
+    space — пространство знаний, которому принадлежит папка (kb_spaces)."""
     files = 0
     chunks_total = 0
     cost = 0.0
     for name in _list_pdfs(folder):
         path = os.path.join(folder, name)
         md5 = file_md5(store, path)
-        if store.get_state(f'pdf_ingested:{md5}'):
+        if store.get_state(store.doc_key('pdf_ingested', md5, space)):
             continue
         try:
             chunks = _pdf_chunks(path, name, md5)
@@ -120,12 +122,12 @@ async def ingest_pdfs(store, folder: str, progress=None,
             part = new_chunks[i:i + EMBED_BATCH]
             vectors = await embed_texts([c.text for c in part])
             for c, v in zip(part, vectors):
-                c.embedding = v
+                c.embedding, c.space = v, space
             store.upsert_chunks(part)
             cost += embed_cost([c.text for c in part])
             if max_cost is not None and cost >= max_cost:
                 raise BudgetExceeded(cost)
-        store.set_state(f'pdf_ingested:{md5}', name)
+        store.set_state(store.doc_key('pdf_ingested', md5, space), name)
         files += 1
         chunks_total += len(new_chunks)
         if progress:
