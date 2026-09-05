@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 GAP_SECONDS = 30 * 60    # пауза, разрывающая беседу на отдельные чанки
 CHUNK_MAX_CHARS = 4000   # ~1200 токенов для русского текста
 EMBED_BATCH = 96
+EMBED_MAX_CHARS = 8000   # потолок одного входа эмбеддера (лимит модели — 8192 токена)
 
 # Оценки стоимости для расчёта бюджета (реальные цены могут меняться).
 # Цена эмбеддингов берётся по EMBED_MODEL из карты; для модели не из карты
@@ -136,8 +137,13 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
     kwargs = {} if os.getenv('EMBED_API_BASE', '').strip() else {'dimensions': dim}
     out: list[list[float]] = []
     for i in range(0, len(texts), EMBED_BATCH):
-        # обрезка — страховка от лимита 8192 токена на один вход
-        batch = [t[:20000] for t in texts[i:i + EMBED_BATCH]]
+        # Страховка от лимита 8192 токена на один вход. 20000 симв. было
+        # мало: на технической документации выходит ~1.9 симв./токен, то
+        # есть ~10500 токенов — прод падал с HTTP 400. EMBED_MAX_CHARS
+        # безопасен даже при 1 симв./токен (CJK). Режется только то, что
+        # уходит в эмбеддер: в базе чанк остаётся целиком (нужен LLM как
+        # контекст), а сверхдлинные чанки и так рубит split_text.
+        batch = [t[:EMBED_MAX_CHARS] for t in texts[i:i + EMBED_BATCH]]
         resp = await client.embeddings.create(model=model, input=batch, **kwargs)
         got = len(resp.data[0].embedding)
         if got != dim:

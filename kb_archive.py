@@ -39,7 +39,7 @@ import re
 import zipfile
 
 from kb_firmware import _load_md5_journal, classify_name, parse_firmware_name
-from kb_hedex import _split_body, page_text
+from kb_hedex import page_text, split_text
 from kb_store import Chunk
 
 logger = logging.getLogger(__name__)
@@ -431,7 +431,7 @@ def archive_text_chunks(path: str, md5: str, arc_name: str,
                     text = text.strip()
                     if len(text) < 80:  # пустышки не инжестим
                         continue
-                    body_parts = _split_body(text)
+                    body_parts = split_text(text, CHUNK_CHARS)
                     add(label, [(f' (часть {n})' if len(body_parts) > 1 else '',
                                  p) for n, p in enumerate(body_parts, 1)])
             except Exception as e:

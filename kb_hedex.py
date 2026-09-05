@@ -125,20 +125,43 @@ def page_text(html: str) -> str:
     return '\n'.join(ln for ln in lines if ln)
 
 
-def _split_body(body: str) -> list[str]:
-    if len(body) <= PAGE_CHUNK_CHARS:
-        return [body]
+def split_text(text: str, limit: int = PAGE_CHUNK_CHARS) -> list[str]:
+    """Режет текст на куски НЕ ДЛИННЕЕ limit символов.
+
+    Гарантия «не длиннее» держится и на сверхдлинной ОДИНОЧНОЙ строке:
+    в HTML документации переносов может не быть вовсе (широкая таблица
+    в один <tr>, абзац-простыня), и такую строку надо рубить принудительно.
+    Прежняя версия клала её в кусок целиком — чанк на 28 тыс. символов
+    уезжал в эмбеддер, провайдер отвечал HTTP 400 («8193 > 8192 токенов»)
+    и ронял весь шаг конвейера.
+
+    На текстах без сверхдлинных строк результат совпадает с прежним —
+    границы существующих чанков не сдвигаются (иначе поменялись бы их id
+    и вся документация переэмбеддилась бы заново).
+    """
     parts: list[str] = []
     buf: list[str] = []
     size = 0
-    for line in body.split('\n'):
-        if buf and size + len(line) > PAGE_CHUNK_CHARS:
+
+    def flush() -> None:
+        nonlocal buf, size
+        if buf:
             parts.append('\n'.join(buf))
             buf, size = [], 0
+
+    for line in text.split('\n'):
+        while len(line) > limit:
+            flush()
+            cut = line.rfind(' ', limit - 200, limit)  # по возможности по слову
+            if cut <= 0:
+                cut = limit
+            parts.append(line[:cut])
+            line = line[cut:].lstrip()
+        if buf and size + len(line) > limit:
+            flush()
         buf.append(line)
         size += len(line) + 1
-    if buf:
-        parts.append('\n'.join(buf))
+    flush()
     return parts
 
 
@@ -169,7 +192,7 @@ def hdx_chunks(path: str, md5: str) -> tuple[dict, list[tuple[Chunk, str]]]:
             continue
         crumb = ' → '.join(crumbs[-BREADCRUMB_LEVELS:]) or url
         topic_name = f'{label} — {crumb}'[:200]
-        for part in _split_body(body):
+        for part in split_text(body):
             seq += 1
             body_sha = hashlib.sha1(part.encode('utf-8')).hexdigest()
             out.append((Chunk(
@@ -361,9 +384,28 @@ def _selftest() -> None:
         vs = ['V200R023C00', 'V200R025C00', 'V200R024C10']
         assert sorted(vs, key=_version_key, reverse=True)[0] == 'V200R025C00'
 
-        buf = io.StringIO()
-        assert _split_body('x' * 10) == ['x' * 10]
-        del buf
+        # РЕГРЕССИЯ: сверхдлинная ОДИНОЧНАЯ строка обязана рубиться.
+        # В HTML документации переносов может не быть вовсе (широкая
+        # таблица в один <tr>), и такой кусок уезжал в эмбеддер целиком —
+        # провайдер отвечал HTTP 400 «8193 > 8192 токенов» и ронял шаг.
+        assert split_text('x' * 10) == ['x' * 10]
+        wide = 'ячейка данных ' * 3000            # ~42000 симв., без переносов
+        parts = split_text(wide)
+        assert all(len(p) <= PAGE_CHUNK_CHARS for p in parts), \
+            [len(p) for p in parts]
+        assert len(parts) >= 10, len(parts)
+        assert ''.join(p.replace(' ', '') for p in parts) == \
+            wide.replace(' ', ''), 'рубка не должна терять содержимое'
+        # смесь: короткие строки + одна гигантская, порядок сохраняется
+        mixed = split_text('начало\n' + 'q' * 9000 + '\nконец')
+        assert all(len(p) <= PAGE_CHUNK_CHARS for p in mixed), mixed
+        # хвост длинной строки склеивается со следующей короткой —
+        # содержимое не теряется и порядок сохраняется
+        assert mixed[0] == 'начало', mixed[0]
+        assert mixed[-1].endswith('конец'), mixed[-1][-20:]
+        # страница целиком: заголовок + тело влезают в лимит эмбеддера
+        for c, _ in pairs:
+            assert len(c.text) <= PAGE_CHUNK_CHARS + 300, len(c.text)
     print('kb_hedex selftest: OK')
 
 
