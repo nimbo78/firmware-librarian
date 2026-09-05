@@ -15,11 +15,11 @@ import re
 import time
 from datetime import datetime, timedelta
 
-from telethon import Button, TelegramClient, events
+from telethon import Button, TelegramClient, errors, events
 
 from kb_answer import answer_question, fw_llm_match
 from kb_firmware import split_query
-from kb_ingest import message_topic_id, openai_client
+from kb_ingest import fetch_topics, message_topic_id, openai_client
 from kb_render import (ADMIN_HELP_EXTRA, fmt_event, msg_link,
                        nav_category_view, nav_files_view, nav_model_view,
                        nav_root_view, render_grouped, render_sources,
@@ -81,6 +81,12 @@ _msg_clicks: dict[tuple[int, int], int] = {}
 # (когда удалять, chat_id, msg_id) — очередь уборки за собой
 _cleanup: list[tuple[float, int, int]] = []
 
+# Закрытые топики форума: {chat_id: (когда протухнет, {закрытые топики})}.
+# Спрашивать статусы на каждое сообщение нельзя — лишний RPC и повод для
+# флуд-лимита; топики закрывают редко, устаревание на минуты безвредно.
+TOPIC_CACHE_TTL = 600
+_closed_topics: dict[int, tuple[float, set[int]]] = {}
+
 
 # %(name)s подписывает источник: telethon.network.* — сетевой слой Telegram,
 # kb_bot/kb_* — наши модули (иначе непонятно, чей варнинг)
@@ -98,14 +104,62 @@ _last_ask: dict[int, float] = {}
 _bot_username = ''
 
 
-def _topic_allowed(event) -> bool:
-    """Разрешён ли ответ в этом топике форума (см. _parse_chat_topics)."""
+# Ошибки «сюда писать нельзя»: ретраить бессмысленно, трейсбек ничего не
+# лечит. TOPIC_CLOSED своего класса в telethon 1.44 не имеет — прилетает
+# generic BadRequestError с message='TOPIC_CLOSED', поэтому проверяем и текст.
+_MUTE_ERRORS = (errors.ChatWriteForbiddenError, errors.TopicDeletedError,
+                errors.ChatAdminRequiredError, errors.UserBannedInChannelError)
+_MUTE_MESSAGES = ('TOPIC_CLOSED', 'TOPIC_DELETED')
+
+
+def _is_mute_error(e: BaseException) -> bool:
+    """Отказ вида «топик закрыт / писать запрещено», а не сбой сети."""
+    if isinstance(e, _MUTE_ERRORS):
+        return True
+    msg = getattr(e, 'message', '') or ''
+    return isinstance(e, errors.RPCError) and any(m in msg for m in _MUTE_MESSAGES)
+
+
+def _remember_closed(chat_id: int, topic_id: int) -> None:
+    """Отказ отправки — свежайшее знание о топике: кладём в тот же кэш,
+    чтобы следующие сообщения отсекались гейтом до дорогой работы."""
+    until, closed = _closed_topics.get(
+        chat_id, (time.monotonic() + TOPIC_CACHE_TTL, set()))
+    _closed_topics[chat_id] = (until, closed | {topic_id})
+
+
+async def _closed_in(chat_id: int) -> set[int]:
+    """Закрытые топики чата; ответ Telegram кэшируется на TOPIC_CACHE_TTL.
+
+    Обычная группа (и отказ Telegram в списке топиков — боту метод могут
+    и не дать) выглядит как «закрытых нет»: гейт пропускает всё, отказ
+    ловится уже на отправке в _reply. Пустой ответ тоже кэшируется —
+    иначе неудачный запрос повторялся бы на каждое сообщение."""
+    hit = _closed_topics.get(chat_id)
+    if hit is not None and hit[0] > time.monotonic():
+        return hit[1]
+    try:
+        topics = await fetch_topics(client, chat_id)
+    except Exception as e:            # сеть отвалилась — не молчим из-за этого
+        logger.debug('topics fetch failed for %s: %s', chat_id, e)
+        return hit[1] if hit else set()
+    closed = {tid for tid, (_, is_closed) in topics.items() if is_closed}
+    _closed_topics[chat_id] = (time.monotonic() + TOPIC_CACHE_TTL, closed)
+    return closed
+
+
+async def _topic_allowed(event) -> bool:
+    """Разрешён ли ответ в этом топике форума (см. _parse_chat_topics).
+
+    Закрытый топик приравнен к чужому: писать в него всё равно не выйдет,
+    а промолчать до генерации ответа дешевле, чем после."""
     topics = ANSWER_TOPICS.get(event.chat_id)
     if topics is None:
         return False
-    if not topics:
-        return True
-    return message_topic_id(event.message) in topics
+    topic_id = message_topic_id(event.message)
+    if topics and topic_id not in topics:
+        return False
+    return topic_id not in await _closed_in(event.chat_id)
 
 
 def _schedule_cleanup(msg) -> None:
@@ -119,10 +173,31 @@ def _schedule_cleanup(msg) -> None:
                          msg.chat_id, msg.id))
 
 
+async def _reply(event, *args, **kwargs):
+    """event.reply, который молчит, если в топик писать нельзя.
+
+    Закрытый топик — штатная ситуация (модератор закрыл обсуждение, а чат
+    всё ещё в KB_ANSWER_CHAT_IDS), поэтому вместо трейсбека одна строка в
+    лог и None вместо сообщения. Гейт узнаёт об этом из того же кэша."""
+    try:
+        return await event.reply(*args, **kwargs)
+    except Exception as e:
+        if not _is_mute_error(e):
+            raise
+        topic_id = message_topic_id(event.message)
+        _remember_closed(event.chat_id, topic_id)
+        logger.info('cannot write to %s/%s (%s) — reply skipped',
+                    event.chat_id, topic_id,
+                    getattr(e, 'message', '') or type(e).__name__)
+        return None
+
+
 async def _reply_temp(event, *args, **kwargs):
     """Служебный ответ: сам удалится, чтобы не копиться в топике.
     Заодно убирается и команда пользователя — если бот админ в группе."""
-    msg = await event.reply(*args, **kwargs)
+    msg = await _reply(event, *args, **kwargs)
+    if msg is None:
+        return None       # в закрытый топик не написали — убирать нечего
     _schedule_cleanup(msg)
     _schedule_cleanup(event.message)
     return msg
@@ -163,9 +238,9 @@ async def _send_answer(event, question: str, parent_qa_id: int = 0) -> None:
     from kb_ingest import check_embed_cfg
     if check_embed_cfg(store):
         # база на другой модели эмбеддингов: поиск был бы мусорным
-        await event.reply('База знаний переэмбеддируется (сменилась модель '
-                          'эмбеддингов) — вопросы временно недоступны. '
-                          'Админ: kb_reembed.py.')
+        await _reply(event, 'База знаний переэмбеддируется (сменилась модель '
+                     'эмбеддингов) — вопросы временно недоступны. '
+                     'Админ: kb_reembed.py.')
         return
     dialog = store.qa_dialog(parent_qa_id) if parent_qa_id else []
     logger.info('Question from %s in %s%s: %s',
@@ -175,7 +250,7 @@ async def _send_answer(event, question: str, parent_qa_id: int = 0) -> None:
         answer, found = await answer_question(store, question, dialog=dialog)
     except Exception as e:
         logger.warning('Answer failed: %s', e)
-        await event.reply('Не получилось получить ответ, попробуй позже.')
+        await _reply(event, 'Не получилось получить ответ, попробуй позже.')
         return
     qa_id = store.log_qa(event.chat_id or 0, event.sender_id or 0,
                          question, answer, found,
@@ -183,7 +258,13 @@ async def _send_answer(event, question: str, parent_qa_id: int = 0) -> None:
                          parent_qa_id=parent_qa_id)
     buttons = [[Button.inline('👍', f'r:{qa_id}:1'.encode()),
                 Button.inline('👎', f'r:{qa_id}:-1'.encode())]]
-    sent = await event.reply(answer, link_preview=False, buttons=buttons)
+    sent = await _reply(event, answer, link_preview=False, buttons=buttons)
+    if sent is None:
+        # qa_log пишется до отправки: запись останется без answer_msg_id.
+        # Само по себе безвредно, но расход в /status должен быть объясним
+        logger.warning('answer for qa_id=%s generated but not delivered '
+                       '(topic closed): %s', qa_id, question[:80])
+        return
     # реплай на это сообщение = продолжение диалога
     store.set_qa_answer_msg(qa_id, sent.id)
 
@@ -263,6 +344,11 @@ async def _handle_download(event, text: str) -> None:
                                    force_document=True)
             sent += 1
         except Exception as e:
+            if _is_mute_error(e):  # топик закрыли прямо во время пачки
+                _remember_closed(event.chat_id, message_topic_id(event.message))
+                logger.info('download batch stopped: cannot write to %s (%s)',
+                            event.chat_id, getattr(e, 'message', '') or e)
+                return
             logger.warning('download batch send failed for %s: %s', name, e)
     if sent < len(on_disk):
         await _reply_temp(event, f'Отправлено {sent} из {len(on_disk)} — остальные '
@@ -494,7 +580,14 @@ async def auto_answer_gaps() -> int:
                                              reply_to=msg_id,
                                              buttons=buttons,
                                              link_preview=False)
-        except Exception:
+        except Exception as e:
+            if _is_mute_error(e):
+                # топик закрыт: пробел закрываем, иначе каждую ночь платим
+                # за генерацию ответа, который некуда доставить
+                store.mark_gap_closed(qa_id)
+                logger.info('gap %s not delivered — cannot write to %s (%s)',
+                            qa_id, chat_id, getattr(e, 'message', '') or e)
+                continue
             # исходное сообщение могли удалить — отвечаем без реплая, с цитатой
             text = f'По вопросу «{question[:200]}»:\n\n{answer}'
             sent = await client.send_message(chat_id, text[:4000],
@@ -519,8 +612,19 @@ async def post_gaps() -> None:
             + '\n'.join(lines)
             + '\n\nОбсудите в чате — ночью я прочитаю обсуждение и отвечу '
               'авторам вопросов.')
-    await client.send_message(GAPS_CHAT_ID, text[:4000],
-                              reply_to=GAPS_TOPIC_ID or None)
+    try:
+        await client.send_message(GAPS_CHAT_ID, text[:4000],
+                                  reply_to=GAPS_TOPIC_ID or None)
+    except Exception as e:
+        if not _is_mute_error(e):
+            raise
+        # это конфиг, а не случайность: чинится правкой KB_GAPS_* в .env
+        logger.info('weekly gaps post skipped — cannot write to %s/%s',
+                    GAPS_CHAT_ID, GAPS_TOPIC_ID)
+        store.add_event('error', f'Пост «помогите сообществу» не ушёл: топик '
+                                 f'{GAPS_CHAT_ID}/{GAPS_TOPIC_ID} закрыт — '
+                                 f'поправь KB_GAPS_CHAT_ID/KB_GAPS_TOPIC_ID')
+        return  # вопросы не помечаем опубликованными — уйдут в следующий раз
     store.mark_gaps_posted([gid for gid, _ in rows])
     store.add_event('gaps', f'Опубликовано вопросов без ответа: {len(rows)}')
 
@@ -560,8 +664,8 @@ async def handler(event):
         if event.sender_id in ADMIN_IDS:
             await handle_admin(event)
         return  # личка не-админов игнорируется
-    if not _topic_allowed(event):
-        return          # чужой чат или топик, где бота не ждут
+    if not await _topic_allowed(event):
+        return          # чужой чат, закрытый топик или топик, где бота не ждут
     text = (event.raw_text or '').strip()
     low = text.lower()
     if low.startswith(('/help', '/start')):
@@ -730,9 +834,19 @@ async def on_getfile(event):
         elif len(_msg_clicks) > 500:  # не копим счётчики вечно
             _msg_clicks.clear()
     except Exception as e:
-        logger.warning('getfile failed: %s', e)
+        note = 'Не получилось отправить файл'
+        if _is_mute_error(e):
+            # кнопки живут в старых сообщениях: топик мог закрыться после
+            # публикации каталога — говорим об этом всплывашкой, без трейсбека.
+            # Топик в кэш не кладём: у CallbackQuery нет message, а тянуть его
+            # ради этого — лишний RPC; гейт узнает при обновлении кэша
+            logger.info('attach button: cannot write to %s (%s)',
+                        event.chat_id, getattr(e, 'message', '') or e)
+            note = 'Топик закрыт — файл сюда не отправить'
+        else:
+            logger.warning('getfile failed: %s', e)
         try:
-            await event.answer('Не получилось отправить файл', alert=True)
+            await event.answer(note, alert=True)
         except Exception:
             pass
 

@@ -333,8 +333,13 @@ async def enrich_chat_media(tg_client, store, chat_id: int, progress=None,
     return done, cost
 
 
-async def fetch_topic_names(tg_client, chat_id: int) -> dict[int, str]:
-    names: dict[int, str] = {}
+async def fetch_topics(tg_client, chat_id: int) -> dict[int, tuple[str, bool]]:
+    """{topic_id: (заголовок, закрыт ли)} — один RPC на страницу топиков.
+
+    Пустой словарь = у чата нет форума (или Telegram не ответил). Вызывающий
+    обязан трактовать это как «ограничений нет»: в обычной группе закрытых
+    топиков не бывает, и молчать из-за неудачного запроса нельзя."""
+    topics: dict[int, tuple[str, bool]] = {}
     offset_topic = 0
     try:
         while True:
@@ -343,13 +348,19 @@ async def fetch_topic_names(tg_client, chat_id: int) -> dict[int, str]:
                 offset_topic=offset_topic, limit=100))
             for t in res.topics:
                 if hasattr(t, 'title'):  # у ForumTopicDeleted нет title
-                    names[t.id] = t.title
+                    topics[t.id] = (t.title, bool(getattr(t, 'closed', False)))
             if len(res.topics) < 100:
                 break
             offset_topic = res.topics[-1].id
     except (errors.RPCError, TypeError, ValueError):
         return {}  # чат без топиков
-    return names
+    return topics
+
+
+async def fetch_topic_names(tg_client, chat_id: int) -> dict[int, str]:
+    """Только заголовки — инжесту статус закрытости не нужен."""
+    return {tid: title for tid, (title, _)
+            in (await fetch_topics(tg_client, chat_id)).items()}
 
 
 def message_topic_id(msg) -> int:
