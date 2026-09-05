@@ -329,7 +329,9 @@ kb_pdf.py                   инжест текстового слоя скач�
 kb_hedex.py                 инжест документации Huawei HedEx .hdx (KB_HEDEX=1)
 kb_archive.py               просмотр архивов: каталог + текст в RAG (KB_ARCHIVE=1)
 kb_backfill.py              бэкфилл истории (--dry-run, --max-cost)
-kb_bot.py                   answer-бот (/ask, @mention)
+kb_bot.py                   answer-бот: клиент, обработчики, циклы
+kb_answer.py                поиск, промпты и сборка ответа (+тестируем отдельно)
+kb_render.py                вёрстка каталога и навигация (+selftest)
 kb_search.py                отладочный поиск по базе без LLM
 docker-compose.yml          два сервиса, общий том /volume1/docker/tg-kb
 Dockerfile                  python:3.13-slim + tzdata

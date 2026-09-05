@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Проект **firmware-librarian** (бывший telegram-file-downloader; compose-проект зафиксирован `name:` в docker-compose.yml). Два сервиса в одном docker-compose на NAS Synology DS720+:
 
 1. **Качалка** ([librarian.py](librarian.py)) — Telethon user-клиент, слушает чаты `CHAT_IDS`, скачивает документы с подходящим расширением, дедуплицирует по имени + MD5, складывает на том NAS. Плюс ночной инжест базы знаний (см. ниже).
-2. **KB-бот** ([kb_bot.py](kb_bot.py)) — бот (токен BotFather), отвечает на `/ask` и `@упоминание` в чатах `KB_ANSWER_CHAT_IDS`, используя RAG по истории чатов: гибридный поиск sqlite-vec + FTS5, ответы через OpenAI API.
+2. **KB-бот** ([kb_bot.py](kb_bot.py) — клиент и обработчики; поиск и сборка ответа в [kb_answer.py](kb_answer.py), вёрстка каталога и навигация в [kb_render.py](kb_render.py): оба импортируются БЕЗ переменных окружения Telegram и принимают хранилище параметром, поэтому покрыты селфтестами) — бот (токен BotFather), отвечает на `/ask` и `@упоминание` в чатах `KB_ANSWER_CHAT_IDS`, используя RAG по истории чатов: гибридный поиск sqlite-vec + FTS5, ответы через OpenAI API.
 
 ## Команды
 
