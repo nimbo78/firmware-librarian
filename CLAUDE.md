@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Docker: `docker compose up --build` (Compose V2 — без дефиса). Переменные окружения подтягиваются из `.env` рядом с `docker-compose.yml`.
 - Передеплой на NAS: [`./redeploy.sh`](redeploy.sh) — проверяет наличие `.env` и `bot.session`, делает `down --remove-orphans` + `up --build -d` + выводит статус и последние 30 строк логов.
 - Selftest хранилища (не требует Telegram и OpenAI): `pip install sqlite-vec && python kb_store.py`.
-- Миграция базы под области знаний (разово, при остановленных сервисах): `docker compose stop librarian kb-bot` → `docker compose run --rm librarian python kb_spaces_migrate.py` → `docker compose start librarian kb-bot`.
+- Миграция базы под области знаний (разово, при остановленных сервисах): `touch spaces.toml` (**обязательно ДО любой compose-команды**: том `./spaces.toml` монтируется в оба сервиса, а bind-mount несуществующего файла падает — `Bind mount failed: ... does not exist`; `redeploy.sh` создаёт файл сам, но миграция идёт раньше него) → `docker compose stop librarian kb-bot` → `docker compose run --rm librarian python kb_spaces_migrate.py` → `docker compose start librarian kb-bot`.
 - Бэкфилл истории в базу знаний — см. процедуру в разделе «База знаний».
 - Отладочный поиск по базе: `docker compose run --rm librarian python kb_search.py "вопрос"`.
 - Локальные конвейеры без Telegram (архивы/HedEx/PDF/экстракция; сессию не трогает, качалку можно не гасить): `docker compose run --rm librarian python kb_backfill.py --local-only`.
