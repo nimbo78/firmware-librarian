@@ -88,6 +88,11 @@ def _selftest() -> None:
     asyncio.run(B.handler(ev))
     assert ev.sent and 'Хранитель знаний' in ev.sent[0], ev.sent
 
+    # инвентарь базы: команда обязана отвечать и на пустой базе
+    ev = FakeEvent('/sources')
+    asyncio.run(B.handler(ev))
+    assert ev.sent and 'пуст' in ev.sent[0], ev.sent
+
     quiet = FakeEvent('/help', CHAT, 99)
     asyncio.run(B.handler(quiet))
     assert not quiet.sent, 'в запрещённом топике бот обязан молчать'

@@ -22,7 +22,8 @@ from kb_firmware import split_query
 from kb_ingest import message_topic_id, openai_client
 from kb_render import (ADMIN_HELP_EXTRA, fmt_event, msg_link,
                        nav_category_view, nav_files_view, nav_model_view,
-                       nav_root_view, render_grouped, user_help)
+                       nav_root_view, render_grouped, render_sources,
+                       user_help)
 from kb_store import open_store
 from tg_conn import proxy_kwargs
 
@@ -376,6 +377,9 @@ async def handle_admin(event) -> None:
         else:
             cur = 'on' if store.get_state('admin_notify', '1') == '1' else 'off'
             await event.reply(f'Сейчас: {cur}. Используй /notify on или /notify off.')
+    elif low.startswith('/sources'):
+        await event.reply(render_sources(store.sources_report(limit=25))[:4000],
+                          link_preview=False)
     elif low.startswith('/gaps'):
         rows = store.gaps(15)
         if not rows:
@@ -568,6 +572,10 @@ async def handler(event):
         return
     if low.startswith('/sw'):
         await _handle_sw(event, text)
+        return
+    if low.startswith('/sources'):
+        await _reply_temp(event, render_sources(store.sources_report())[:4000],
+                          link_preview=False)
         return
     if low.startswith('/download'):
         # кулдаун: пачка до 12 больших файлов — лёгкий вектор флуда в группе

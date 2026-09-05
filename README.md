@@ -345,6 +345,7 @@ Selftest хранилища (без сети вообще): `python kb_store.py`
 | Выключить бота | `docker compose stop kb-bot` |
 | Бэкфилл | см. «Установка и первый запуск», шаг 5 |
 | Поиск по базе | `docker compose run --rm librarian python kb_search.py "вопрос"` |
+| Что в базе | `/sources` в чате или в личке бота |
 
 ### Переменные окружения
 

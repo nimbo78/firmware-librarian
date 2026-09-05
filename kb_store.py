@@ -793,6 +793,43 @@ class SqliteVecStore:
         with self.db:
             self.db.execute('UPDATE qa_log SET gap_closed=1 WHERE id=?', (qa_id,))
 
+    def sources_report(self, limit: int = 12) -> dict:
+        """Инвентарь базы: что именно проиндексировано и сколько это чанков.
+
+        Виды источников различаются конвенцией (см. Chunk/ScoredChunk):
+        chat_id<0 — Telegram-чаты; chat_id>0 и topic_id=1 — страницы HedEx,
+        где topic_name = «продукт версия — крошки»; chat_id>0 и topic_id=0 —
+        PDF и текст из архивов, где topic_name = имя файла."""
+        q = self.db.execute
+        chats = q('SELECT chat_id, count(*), min(date_from), max(date_to) '
+                  'FROM chunks WHERE chat_id < 0 GROUP BY chat_id '
+                  'ORDER BY count(*) DESC').fetchall()
+        hedex = q("SELECT substr(topic_name, 1, instr(topic_name, ' — ') - 1) AS pkg, "
+                  "count(*) FROM chunks WHERE chat_id > 0 AND topic_id = 1 "
+                  "AND instr(topic_name, ' — ') > 0 "
+                  "GROUP BY pkg ORDER BY 2 DESC").fetchall()
+        docs = q('SELECT topic_name, count(*) FROM chunks '
+                 'WHERE chat_id > 0 AND topic_id = 0 '
+                 'GROUP BY topic_name ORDER BY 2 DESC').fetchall()
+
+        def state_count(prefix: str) -> int:
+            return q('SELECT count(*) FROM state WHERE key LIKE ?',
+                     (prefix + '%',)).fetchone()[0]
+
+        return {
+            'chats': chats,
+            'hedex': hedex[:limit],
+            'hedex_total': len(hedex),
+            'docs': docs[:limit],
+            'docs_total': len(docs),
+            'processed': {
+                'hedex': state_count('hedex_ingested:'),
+                'pdf': state_count('pdf_ingested:'),
+                'archive': state_count('archive_scanned:'),
+            },
+            'chunks': self.count(),
+        }
+
     def kb_stats(self) -> dict:
         """Сводка для /status. events_cost уже включает медиа-затраты
         инжест-прогонов (media_cost — деталь, не слагаемое)."""

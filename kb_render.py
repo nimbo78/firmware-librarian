@@ -45,6 +45,8 @@ def user_help(bot_username: str = '') -> str:
         '• Под ответом кнопки 👍/👎 — оценки делают базу лучше.\n'
         '• Если ответа не нашлось — вопрос запоминается; как только в чате\n'
         '  появится обсуждение, я сам отвечу реплаем.\n'
+        '• /sources — из чего я беру ответы: какие чаты, пакеты\n'
+        '  документации, PDF и архивы уже проиндексированы.\n'
         '\n'
         '📦 Каталог прошивок и документации:\n'
         '• /fw — навигация по разделам, как на support.huawei.com\n'
@@ -61,7 +63,8 @@ def user_help(bot_username: str = '') -> str:
 
 ADMIN_HELP_EXTRA = (
     '\n\n🔧 Команды администратора (только в личке):\n'
-    '/status — база, стоимость, курсоры инжеста (+кнопка инжеста)\n'
+    '/status — база, стоимость, текущий шаг конвейера (+кнопка инжеста)\n'
+    '/sources — инвентарь базы: чаты, пакеты HedEx, PDF, архивы\n'
     '/events — последние 20 событий\n'
     '/gaps — вопросы без ответа или с 👎\n'
     '/review — подтвердить связки каталога (есть «принять все»)\n'
@@ -186,6 +189,40 @@ def render_grouped(rows: list, query: str, model_query: str = '',
     return '\n'.join(out), buttons, seen
 
 
+def render_sources(report: dict) -> str:
+    """Инвентарь базы для команды /sources: из чего бот берёт ответы."""
+    out = [f'📚 В базе {report["chunks"]} фрагментов знаний.', '']
+
+    if report['chats']:
+        out.append('💬 Чаты')
+        for chat_id, n, first, last in report['chats']:
+            out.append(f'  {chat_id}: {n} фрагментов, {first} — {last}')
+        out.append('')
+
+    if report['hedex']:
+        out.append(f'📘 Документация HedEx ({report["hedex_total"]} пакетов)')
+        for pkg, n in report['hedex']:
+            out.append(f'  {pkg} — {n} страниц')
+        if report['hedex_total'] > len(report['hedex']):
+            out.append(f'  …и ещё {report["hedex_total"] - len(report["hedex"])}')
+        out.append('')
+
+    if report['docs']:
+        out.append(f'📄 Документы и архивы ({report["docs_total"]})')
+        for name, n in report['docs']:
+            out.append(f'  {name[:64]} — {n}')
+        if report['docs_total'] > len(report['docs']):
+            out.append(f'  …и ещё {report["docs_total"] - len(report["docs"])}')
+        out.append('')
+
+    p = report['processed']
+    out.append(f'Обработано: HedEx {p["hedex"]} · PDF {p["pdf"]} · '
+               f'архивов {p["archive"]}')
+    if not report['chats'] and not report['hedex'] and not report['docs']:
+        return 'База пока пуста — источники появятся после первого инжеста.'
+    return '\n'.join(out)
+
+
 def nav_tree(store) -> dict:
     """Категория -> {модель -> {rkey(9 симв. version_key) -> (счётчик, метка)}}.
     Метка ветки берётся из сырой версии (version_branch_label), не из ключа."""
@@ -277,7 +314,7 @@ def _selftest() -> None:
     import os
     import tempfile
 
-    from kb_store import open_store
+    from kb_store import Chunk, open_store
 
     with tempfile.TemporaryDirectory() as tmp:
         os.environ['KB_DB_PATH'] = os.path.join(tmp, 'kb.sqlite')
@@ -330,6 +367,30 @@ def _selftest() -> None:
 
         # пустой каталог не роняет вёрстку
         assert render_grouped([], 'нетмодели')[0].startswith('По запросу')
+
+        # инвентарь базы: пустая база честно об этом говорит, непустая
+        # перечисляет источники по видам
+        assert 'пуста' in render_sources(store.sources_report())
+        store.upsert_chunks([Chunk(
+            chat_id=-1001234, topic_id=0, topic_name='тема',
+            date_from='2026-01-01', date_to='2026-02-01', msg_first=1,
+            msg_last=3, authors='инж', text='обсуждение в чате',
+            embedding=[1.0, 0, 0, 0])])
+        store.upsert_chunks([Chunk(
+            chat_id=777, topic_id=1, topic_name='WLAN V200R025C00 — Security',
+            date_from='2026-06-01', date_to='2026-06-01', msg_first=1,
+            msg_last=1, authors='', text='страница документации',
+            embedding=[1.0, 0, 0, 0])])
+        store.upsert_chunks([Chunk(
+            chat_id=888, topic_id=0, topic_name='guide.pdf',
+            date_from='2026-06-01', date_to='2026-06-01', msg_first=1,
+            msg_last=2, authors='', text='страница PDF',
+            embedding=[1.0, 0, 0, 0])])
+        report = render_sources(store.sources_report())
+        assert '-1001234' in report and '2026-01-01' in report, report
+        assert 'WLAN V200R025C00' in report, 'пакет HedEx без крошек в отчёте'
+        assert 'guide.pdf' in report, report
+        assert 'Обработано' in report
 
         assert msg_link(-1001234567890, 42) == 'https://t.me/c/1234567890/42'
         assert msg_link(12345, 42) is None, 'у синтетических чатов ссылок нет'
