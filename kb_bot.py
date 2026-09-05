@@ -716,6 +716,10 @@ async def handle_admin(event) -> None:
             f'На подтверждение (/review): {s["pending_review"]}',
             f'Уведомления: {notify}',
         ]
+        # шаги архивов/HedEx идут часами — показываем, чем занят конвейер
+        running = store.get_state('pipeline_status', '')
+        if running:
+            lines.insert(0, f'⏳ Сейчас идёт: {running}')
         cursors = store.state_items('last_seen_id:')
         if cursors:
             lines.append('Курсоры инжеста (chat: msg_id):')

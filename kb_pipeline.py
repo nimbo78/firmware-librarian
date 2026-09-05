@@ -18,6 +18,7 @@ PDF -> архивы -> HedEx -> LLM-экстракция -> бэкап. Конв
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,15 @@ async def run_post_ingest(store, download_folder: str, *,
         else:
             print(f'{text}, ~${cost:.2f}')
 
+    def status(text: str) -> None:
+        """Текущее состояние конвейера -> команда /status в личке бота.
+        Шаги архивов и HedEx идут часами; без этого снаружи выглядит,
+        будто ничего не происходит."""
+        try:
+            store.set_state('pipeline_status', text)
+        except Exception:
+            pass
+
     def fail(kind: str, text: str) -> None:
         logger.warning('%s step failed: %s', kind, text)
         if to_events:
@@ -51,6 +61,8 @@ async def run_post_ingest(store, download_folder: str, *,
 
     # 1. Каталог: привязка md5 из журнала, перепарс имён после улучшения
     # регулярок, авто-снятие medium-связок, подтверждение серий
+    started = datetime.now()
+    status(f'каталог, начат в {started:%H:%M}')
     try:
         from kb_firmware import (auto_resolve_firmware, link_local_files,
                                  reparse_files)
@@ -96,6 +108,7 @@ async def run_post_ingest(store, download_folder: str, *,
                                 (hedex_enabled(), 'hedex', _hedex)):
         if not enabled:
             continue
+        status(f'{kind}, начат в {datetime.now():%H:%M}')
         try:
             n, cost, text = await step()
             spent += cost
@@ -103,11 +116,13 @@ async def run_post_ingest(store, download_folder: str, *,
                 note(kind, text, cost)
         except BudgetExceeded as e:
             spent += e.cost
+            status('')
             return spent, True
         except Exception as e:
             fail(kind, f'Шаг {kind} упал: {e}')
 
     # 5. LLM-экстракция подписей + серии; очередь /review
+    status(f'LLM-экстракция, начата в {datetime.now():%H:%M}')
     try:
         from kb_extract import run_extraction
         fw, dev, cost = await run_extraction(store)
@@ -127,8 +142,12 @@ async def run_post_ingest(store, download_folder: str, *,
         fail('extract', f'LLM-экстракция упала: {e}')
 
     # 6. Бэкап: VACUUM INTO (горячее копирование файла с WAL небезопасно)
+    status(f'бэкап, начат в {datetime.now():%H:%M}')
     try:
         store.backup()
     except Exception as e:
         fail('backup', f'Бэкап базы знаний упал: {e}')
+    mins = (datetime.now() - started).total_seconds() / 60
+    logger.info('пост-инжест конвейер завершён за %.0f мин, ~$%.2f', mins, spent)
+    status('')
     return spent, False

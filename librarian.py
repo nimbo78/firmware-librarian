@@ -3,6 +3,7 @@ import hashlib
 import logging
 import os
 import re
+import time
 from datetime import datetime
 
 from telethon import TelegramClient, errors, events
@@ -261,11 +262,35 @@ async def kb_ingest_loop() -> None:
             except Exception as e:
                 logger.warning('KB ingest failed for %s: %s', chat_id, e)
                 store.add_event('error', f'Инжест {chat_id} упал: {e}')
+        # Прогресс длинных шагов: в логи и в state (его показывает /status).
+        # Троттлинг — состояние обновляется не чаще раза в 20 секунд.
+        _last_note = [0.0]
+        _labels = {'pdf': 'PDF', 'archive': 'архивы', 'hedex': 'HedEx',
+                   'embed': 'эмбеддинги', 'media': 'медиа'}
+
+        def _pipeline_progress(kind, done, total, cost):
+            now = time.monotonic()
+            if now - _last_note[0] < 20:
+                return
+            _last_note[0] = now
+            msg = f'{_labels.get(kind, kind)}: обработано {done}'
+            if total:
+                msg += f', чанков {total}'
+            if cost:
+                msg += f', ~${cost:.2f}'
+            logger.info('KB pipeline: %s', msg)
+            try:
+                store.set_state('pipeline_status',
+                                f'{datetime.now():%H:%M} {msg}')
+            except Exception as e:
+                logger.debug('pipeline status skipped: %s', e)
+
         try:
             # каталог -> PDF -> архивы -> HedEx -> экстракция -> бэкап;
             # шаги изолированы внутри, отчёт — событиями админу
             from kb_pipeline import run_post_ingest
-            await run_post_ingest(store, DOWNLOAD_FOLDER)
+            await run_post_ingest(store, DOWNLOAD_FOLDER,
+                                  progress=_pipeline_progress)
         except Exception as e:
             logger.warning('KB post-ingest pipeline failed: %s', e)
             store.add_event('error', f'Пост-инжест конвейер упал: {e}')

@@ -16,7 +16,7 @@ import os
 from datetime import datetime
 
 from kb_ingest import (BudgetExceeded, EMBED_BATCH, embed_cost, embed_texts)
-from kb_store import Chunk
+from kb_store import Chunk, file_md5
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +106,7 @@ async def ingest_pdfs(store, folder: str, progress=None,
     cost = 0.0
     for name in _list_pdfs(folder):
         path = os.path.join(folder, name)
-        md5 = _file_md5(path)
+        md5 = file_md5(store, path)
         if store.get_state(f'pdf_ingested:{md5}'):
             continue
         try:

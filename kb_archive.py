@@ -40,7 +40,7 @@ import zipfile
 
 from kb_firmware import _load_md5_journal, classify_name, parse_firmware_name
 from kb_hedex import page_text, split_text
-from kb_store import Chunk
+from kb_store import Chunk, file_md5
 
 logger = logging.getLogger(__name__)
 
@@ -497,7 +497,7 @@ def scan_archives(store, folder: str) -> tuple[int, int]:
     chars = 0
     for rel in list_archives(folder):
         path = os.path.join(folder, rel)
-        md5 = journal.get(os.path.basename(rel)) or _file_md5(path)
+        md5 = journal.get(os.path.basename(rel)) or file_md5(store, path)
         if store.get_state(f'archive_scanned:{md5}'):
             continue
         files += 1
@@ -553,9 +553,11 @@ async def process_archives(store, folder: str, progress=None,
     for rel in list_archives(folder):
         path = os.path.join(folder, rel)
         arc_name = os.path.basename(rel)
-        md5 = journal.get(arc_name)
+        md5 = journal.get(arc_name) or store.cached_md5(path)
         if not md5:
+            # хэширование гигабайтов — в поток: в event loop оно глушит Telethon
             md5 = await asyncio.to_thread(_file_md5, path)
+            store.remember_md5(path, md5)
         if store.get_state(f'archive_scanned:{md5}'):
             continue
         try:

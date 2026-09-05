@@ -47,6 +47,27 @@ class ScoredChunk:
     topic_id: int = 0
 
 
+def hash_file(path: str) -> str:
+    h = hashlib.md5()
+    with open(path, 'rb') as f:
+        for block in iter(lambda: f.read(1 << 16), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def file_md5(store, path: str) -> str:
+    """MD5 файла с кэшем по (размер, mtime) — см. SqliteVecStore.cached_md5.
+    Синхронная версия для не-async вызовов; в async-коде кэш проверяется
+    отдельно, а само хэширование уходит в asyncio.to_thread (иначе чтение
+    гигабайтов блокирует event loop и Telethon теряет соединение)."""
+    md5 = store.cached_md5(path)
+    if md5:
+        return md5
+    md5 = hash_file(path)
+    store.remember_md5(path, md5)
+    return md5
+
+
 def _f32(vec) -> bytes:
     return struct.pack(f'{len(vec)}f', *vec)
 
@@ -336,6 +357,38 @@ class SqliteVecStore:
     def get_state(self, key: str, default: str | None = None) -> str | None:
         row = self.db.execute('SELECT value FROM state WHERE key=?', (key,)).fetchone()
         return row[0] if row else default
+
+    def cached_md5(self, path: str) -> str | None:
+        """MD5 файла из кэша, если он не менялся (размер + mtime), иначе None.
+
+        Зачем: идемпотентность конвейеров построена на MD5, и без кэша
+        КАЖДЫЙ ночной прогон перечитывал все .hdx/PDF/архивы целиком
+        только ради проверки «не обработано ли уже» — минуты IO и, хуже
+        того, вымывание базы знаний из кэша страниц (после этого холодный
+        поиск занимает секунды вместо десятых долей)."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        row = self.db.execute('SELECT value FROM state WHERE key=?',
+                              (f'filemd5:{path}',)).fetchone()
+        if not row:
+            return None
+        try:
+            size, mtime, md5 = row[0].split(':', 2)
+        except ValueError:
+            return None
+        if int(size) == st.st_size and int(mtime) == int(st.st_mtime):
+            return md5
+        return None
+
+    def remember_md5(self, path: str, md5: str) -> None:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return
+        self.set_state(f'filemd5:{path}',
+                       f'{st.st_size}:{int(st.st_mtime)}:{md5}')
 
     def set_state(self, key: str, value: str) -> None:
         with self.db:
@@ -1013,6 +1066,34 @@ def _selftest() -> None:
         assert any(r[1] == 'V200R024SPH1B0' for r in rows666), rows666
 
         # смена модели эмбеддингов: reset_vectors + set_vector (kb_reembed)
+        # кэш MD5: повторный вызов не перечитывает файл, изменение — сбрасывает
+        import kb_store as _ks
+        probe = os.path.join(tmp, 'probe.bin')
+        with open(probe, 'wb') as f:
+            f.write(b'x' * 1024)
+        calls = []
+        real_hash = _ks.hash_file
+
+        def counting_hash(path):
+            calls.append(path)
+            return real_hash(path)
+
+        _ks.hash_file = counting_hash
+        try:
+            first = _ks.file_md5(store, probe)
+            second = _ks.file_md5(store, probe)
+            assert first == second and len(calls) == 1, calls
+            os.utime(probe, (0, 0))          # mtime изменился -> пересчёт
+            third = _ks.file_md5(store, probe)
+            assert third == first and len(calls) == 2, calls
+            with open(probe, 'wb') as f:     # другое содержимое и размер
+                f.write(b'y' * 2048)
+            fourth = _ks.file_md5(store, probe)
+            assert fourth != first and len(calls) == 3, calls
+            assert store.cached_md5(os.path.join(tmp, 'нет.bin')) is None
+        finally:
+            _ks.hash_file = real_hash
+
         # листинг архивов + поиск doc_id по md5 (kb_archive)
         store.upsert_archive_files('a' * 32, [('inner/S5735.cc', 100),
                                               ('rn.pdf', 5)])

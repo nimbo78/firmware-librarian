@@ -30,7 +30,7 @@ import re
 import xml.etree.ElementTree as ET
 import zipfile
 
-from kb_store import Chunk
+from kb_store import Chunk, file_md5
 
 logger = logging.getLogger(__name__)
 
@@ -211,7 +211,7 @@ def scan_hdx(store, folder: str) -> tuple[int, int]:
     chars = 0
     for name in list_hdx(folder):
         path = os.path.join(folder, name)
-        md5 = _file_md5(path)
+        md5 = file_md5(store, path)
         if store.get_state(f'hedex_ingested:{md5}'):
             continue
         try:
@@ -244,7 +244,7 @@ async def ingest_hdx(store, folder: str, progress=None,
     todo: list[tuple[str, str, str]] = []  # (version, path, md5)
     for name in list_hdx(folder):
         path = os.path.join(folder, name)
-        md5 = _file_md5(path)
+        md5 = file_md5(store, path)
         if store.get_state(f'hedex_ingested:{md5}'):
             continue
         try:
