@@ -18,9 +18,25 @@ PDF -> архивы -> HedEx -> LLM-экстракция -> бэкап. Конв
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+
+def _backup_due(store) -> bool:
+    """Пора ли делать резервную копию (не чаще раза в KB_BACKUP_DAYS дней)."""
+    days = int(os.getenv('KB_BACKUP_DAYS', '7') or 7)
+    if days <= 0:
+        return True
+    last = store.get_state('backup_date', '')
+    if not last:
+        return True
+    try:
+        done = datetime.strptime(last, '%Y-%m-%d')
+    except ValueError:
+        return True
+    return (datetime.now() - done).days >= days
 
 
 async def run_post_ingest(store, download_folder: str, *,
@@ -141,12 +157,17 @@ async def run_post_ingest(store, download_folder: str, *,
     except Exception as e:
         fail('extract', f'LLM-экстракция упала: {e}')
 
-    # 6. Бэкап: VACUUM INTO (горячее копирование файла с WAL небезопасно)
-    status(f'бэкап, начат в {datetime.now():%H:%M}')
-    try:
-        store.backup()
-    except Exception as e:
-        fail('backup', f'Бэкап базы знаний упал: {e}')
+    # 6. Бэкап: VACUUM INTO (горячее копирование файла с WAL небезопасно).
+    # Копия весит как сама база (185 тыс. чанков — это 2.1 ГБ), поэтому не
+    # каждую ночь: KB_BACKUP_DAYS, по умолчанию раз в неделю. Потеря базы
+    # некритична — она пересобирается из Telegram и файлов на томе.
+    if _backup_due(store):
+        status(f'бэкап, начат в {datetime.now():%H:%M}')
+        try:
+            store.backup()
+            store.set_state('backup_date', datetime.now().strftime('%Y-%m-%d'))
+        except Exception as e:
+            fail('backup', f'Бэкап базы знаний упал: {e}')
     mins = (datetime.now() - started).total_seconds() / 60
     logger.info('пост-инжест конвейер завершён за %.0f мин, ~$%.2f', mins, spent)
     status('')
