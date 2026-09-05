@@ -27,6 +27,9 @@ class Chunk:
     authors: str
     text: str
     embedding: list | None = None
+    # пространство знаний (kb_spaces): пусто = пространство по умолчанию
+    # хранилища — так живут вызывающие, написанные до появления пространств
+    space: str = ''
 
     @property
     def id(self) -> str:
@@ -45,6 +48,7 @@ class ScoredChunk:
     # 0 или id топика Telegram; конвенция для синтетических чатов (chat_id>0):
     # 0 — PDF (kb_pdf), 1 — HedEx-документация (kb_hedex)
     topic_id: int = 0
+    space: str = ''
 
 
 def hash_file(path: str) -> str:
@@ -72,11 +76,34 @@ def _f32(vec) -> bytes:
     return struct.pack(f'{len(vec)}f', *vec)
 
 
+# Версия схемы пространств (state schema_spaces). База, созданная раньше,
+# открывается только после kb_spaces_migrate.py — см. _ensure_spaces_schema.
+SCHEMA_SPACES = '1'
+
+
+def vec_ddl(dim: int, table: str = 'chunks_vec') -> str:
+    """vec0 с partition key по пространству: KNN внутри пространства сканирует
+    только его строки (замер: в 2.6 раза быстрее полного при трёх
+    пространствах), глобальный поиск не меняется. Единственное место DDL —
+    им же пользуется миграция."""
+    return (f'CREATE VIRTUAL TABLE IF NOT EXISTS {table} '
+            f'USING vec0(space TEXT PARTITION KEY, embedding float[{dim}])')
+
+
+def fts_ddl(table: str = 'chunks_fts') -> str:
+    # space UNINDEXED: хранится рядом с текстом для фильтра в том же MATCH-запросе
+    return (f'CREATE VIRTUAL TABLE IF NOT EXISTS {table} '
+            f"USING fts5(text, space UNINDEXED, "
+            f"tokenize='unicode61 remove_diacritics 2')")
+
+
 class SqliteVecStore:
-    def __init__(self, db_path: str, embed_dim: int):
+    def __init__(self, db_path: str, embed_dim: int, default_space: str = 'main'):
         import sqlite_vec
         self.db_path = db_path
         self.embed_dim = embed_dim
+        # куда попадают чанки/файлы/вопросы без явной метки пространства
+        self.default_space = default_space
         os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
         self.db = sqlite3.connect(db_path)
         self.db.enable_load_extension(True)
@@ -86,6 +113,7 @@ class SqliteVecStore:
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.execute('PRAGMA busy_timeout=5000')
         self._init_schema()
+        self._ensure_spaces_schema()
 
     def _init_schema(self) -> None:
         with self.db:
@@ -101,14 +129,11 @@ class SqliteVecStore:
                     msg_last INTEGER NOT NULL,
                     authors TEXT NOT NULL DEFAULT '',
                     text TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    space TEXT NOT NULL DEFAULT ''
                 )''')
-            self.db.execute(
-                f'CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec '
-                f'USING vec0(embedding float[{self.embed_dim}])')
-            self.db.execute(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts "
-                "USING fts5(text, tokenize='unicode61 remove_diacritics 2')")
+            self.db.execute(vec_ddl(self.embed_dim))
+            self.db.execute(fts_ddl())
             self.db.execute(
                 'CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT NOT NULL)')
             # Кэш vision/whisper-обработки медиа: ретрай бэкфилла не платит дважды
@@ -146,7 +171,8 @@ class SqliteVecStore:
                     topic_name TEXT NOT NULL DEFAULT '',
                     date TEXT NOT NULL DEFAULT '',
                     llm_done INTEGER NOT NULL DEFAULT 0,
-                    kind TEXT NOT NULL DEFAULT ''
+                    kind TEXT NOT NULL DEFAULT '',
+                    space TEXT NOT NULL DEFAULT ''
                 )''')
             # Листинг содержимого архивов (kb_archive): что лежит внутри
             # zip/rar/7z/tar — для каталога по внутренностям и показа состава
@@ -196,10 +222,15 @@ class SqliteVecStore:
                     rating INTEGER NOT NULL DEFAULT 0,
                     msg_id INTEGER NOT NULL DEFAULT 0,
                     gap_posted INTEGER NOT NULL DEFAULT 0,
-                    gap_closed INTEGER NOT NULL DEFAULT 0
+                    gap_closed INTEGER NOT NULL DEFAULT 0,
+                    space TEXT NOT NULL DEFAULT ''
                 )''')
         # Миграции старых баз (ALTER падает, если колонка есть)
         for stmt in (
+            # пространства знаний (kb_spaces); vec/fts мигрирует kb_spaces_migrate
+            "ALTER TABLE chunks ADD COLUMN space TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE files ADD COLUMN space TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE qa_log ADD COLUMN space TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE files ADD COLUMN llm_done INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE files ADD COLUMN kind TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE qa_log ADD COLUMN msg_id INTEGER NOT NULL DEFAULT 0",
@@ -216,14 +247,38 @@ class SqliteVecStore:
             except sqlite3.OperationalError:
                 pass
 
+    def _ensure_spaces_schema(self) -> None:
+        """vec/fts обязаны быть в схеме с пространствами (partition key и
+        колонка space) — иначе поиск по пространству молча стал бы глобальным.
+
+        Пустая база пересоздаётся на месте (терять нечего); базу с данными
+        мигрирует только kb_spaces_migrate.py при остановленных сервисах —
+        пересборка векторов на 2 ГБ идёт минуты и не место ей в старте бота."""
+        if self.get_state('schema_spaces') == SCHEMA_SPACES:
+            return
+        if self.count() == 0:
+            with self.db:
+                self.db.execute('DROP TABLE IF EXISTS chunks_vec')
+                self.db.execute('DROP TABLE IF EXISTS chunks_fts')
+                self.db.execute(vec_ddl(self.embed_dim))
+                self.db.execute(fts_ddl())
+                self.db.execute(
+                    'INSERT OR REPLACE INTO state(key, value) VALUES(?,?)',
+                    ('schema_spaces', SCHEMA_SPACES))
+            return
+        raise RuntimeError(
+            f'{self.db_path}: база создана до пространств знаний. Останови оба '
+            f'сервиса и прогони kb_spaces_migrate.py (см. SPACES_PLAN.md)')
+
     def upsert_chunks(self, chunks: list[Chunk]) -> None:
         with self.db:
             for c in chunks:
                 if c.embedding is None or len(c.embedding) != self.embed_dim:
                     raise ValueError(
                         f'chunk {c.id}: embedding отсутствует или неверной размерности')
+                space = c.space or self.default_space
                 fields = (c.chat_id, c.topic_id, c.topic_name, c.date_from, c.date_to,
-                          c.msg_first, c.msg_last, c.authors, c.text)
+                          c.msg_first, c.msg_last, c.authors, c.text, space)
                 row = self.db.execute(
                     'SELECT rowid FROM chunks WHERE id = ?', (c.id,)).fetchone()
                 if row:
@@ -232,20 +287,23 @@ class SqliteVecStore:
                     self.db.execute('''
                         UPDATE chunks SET chat_id=?, topic_id=?, topic_name=?,
                             date_from=?, date_to=?, msg_first=?, msg_last=?,
-                            authors=?, text=?
+                            authors=?, text=?, space=?
                         WHERE rowid=?''', fields + (rowid,))
                     self.db.execute('DELETE FROM chunks_vec WHERE rowid=?', (rowid,))
                     self.db.execute('DELETE FROM chunks_fts WHERE rowid=?', (rowid,))
                 else:
                     cur = self.db.execute('''
                         INSERT INTO chunks(id, chat_id, topic_id, topic_name,
-                            date_from, date_to, msg_first, msg_last, authors, text)
-                        VALUES(?,?,?,?,?,?,?,?,?,?)''', (c.id,) + fields)
+                            date_from, date_to, msg_first, msg_last, authors, text,
+                            space)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?)''', (c.id,) + fields)
                     rowid = cur.lastrowid
-                self.db.execute('INSERT INTO chunks_vec(rowid, embedding) VALUES(?,?)',
-                                (rowid, _f32(c.embedding)))
-                self.db.execute('INSERT INTO chunks_fts(rowid, text) VALUES(?,?)',
-                                (rowid, c.text))
+                self.db.execute(
+                    'INSERT INTO chunks_vec(rowid, space, embedding) VALUES(?,?,?)',
+                    (rowid, space, _f32(c.embedding)))
+                self.db.execute(
+                    'INSERT INTO chunks_fts(rowid, text, space) VALUES(?,?,?)',
+                    (rowid, c.text, space))
 
     def existing_ids(self, ids: list[str]) -> set[str]:
         out: set[str] = set()
@@ -266,18 +324,23 @@ class SqliteVecStore:
         (даже при совпадении размерности), только переэмбеддить всё."""
         with self.db:
             self.db.execute('DROP TABLE IF EXISTS chunks_vec')
-            self.db.execute(
-                f'CREATE VIRTUAL TABLE chunks_vec '
-                f'USING vec0(embedding float[{new_dim}])')
+            self.db.execute(vec_ddl(new_dim))
         self.embed_dim = new_dim
 
     def set_vector(self, rowid: int, embedding: list) -> None:
         if len(embedding) != self.embed_dim:
             raise ValueError('embedding размерности не совпадает со схемой')
+        # пространство — из чанка: вектор обязан лежать в его разделе
+        row = self.db.execute(
+            'SELECT space FROM chunks WHERE rowid=?', (rowid,)).fetchone()
+        space = (row[0] if row and row[0] else self.default_space)
         with self.db:
+            # не INSERT OR REPLACE: vec0 с partition key его не принимает
+            # («UNIQUE constraint failed on chunks_vec primary key»)
+            self.db.execute('DELETE FROM chunks_vec WHERE rowid=?', (rowid,))
             self.db.execute(
-                'INSERT OR REPLACE INTO chunks_vec(rowid, embedding) '
-                'VALUES(?,?)', (rowid, _f32(embedding)))
+                'INSERT INTO chunks_vec(rowid, space, embedding) '
+                'VALUES(?,?,?)', (rowid, space, _f32(embedding)))
 
     def chunk_hashes(self, ids: list[str]) -> dict:
         """id -> sha1(text) для существующих чанков: инжест переэмбеддит
@@ -307,24 +370,34 @@ class SqliteVecStore:
         return len(stale)
 
     def search(self, query_text: str, query_vector: list | None, top_k: int = 8,
-               candidates: int = 24) -> list[ScoredChunk]:
+               candidates: int = 24, space: str | None = None) -> list[ScoredChunk]:
+        """Гибридный поиск. space=None — по всем пространствам; slug — только
+        внутри него (KNN сканирует один раздел vec0, FTS фильтрует по колонке)."""
         # query_vector=None — FTS-only режим (деградация при недоступности
         # эмбеддинг-провайдера: фолбэк на другую модель невозможен)
         vec_ids: list[int] = []
         if query_vector is not None:
-            vec_ids = [r[0] for r in self.db.execute(
-                'SELECT rowid, distance FROM chunks_vec WHERE embedding MATCH ? AND k = ? '
-                'ORDER BY distance', (_f32(query_vector), candidates))]
+            sql = ('SELECT rowid, distance FROM chunks_vec '
+                   'WHERE embedding MATCH ? AND k = ?')
+            args: tuple = (_f32(query_vector), candidates)
+            if space is not None:
+                sql += ' AND space = ?'
+                args += (space,)
+            vec_ids = [r[0] for r in self.db.execute(sql + ' ORDER BY distance', args)]
         # Пользовательский текст нельзя отдавать в MATCH сырым: синтаксис FTS5
         # падает на кавычках/минусах, поэтому только слова, каждое в кавычках.
         fts_ids: list[int] = []
         tokens = re.findall(r'\w+', query_text.lower())[:12]
         if tokens:
             fts_query = ' OR '.join(f'"{t}"' for t in tokens)
+            sql = 'SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ?'
+            args = (fts_query,)
+            if space is not None:
+                sql += ' AND space = ?'
+                args += (space,)
             try:
                 fts_ids = [r[0] for r in self.db.execute(
-                    'SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? '
-                    'ORDER BY rank LIMIT ?', (fts_query, candidates))]
+                    sql + ' ORDER BY rank LIMIT ?', args + (candidates,))]
             except sqlite3.OperationalError:
                 fts_ids = []
         # Reciprocal Rank Fusion
@@ -337,11 +410,17 @@ class SqliteVecStore:
         out = []
         for rowid, score in best:
             row = self.db.execute(
-                'SELECT chat_id, topic_name, date_from, msg_first, text, topic_id '
-                'FROM chunks WHERE rowid=?', (rowid,)).fetchone()
+                'SELECT chat_id, topic_name, date_from, msg_first, text, topic_id, '
+                'space FROM chunks WHERE rowid=?', (rowid,)).fetchone()
             if row:
                 out.append(ScoredChunk(score, *row))
         return out
+
+    def count_by_space(self) -> list[tuple[str, int]]:
+        """[(space, чанков)] по убыванию — для /status, /sources и миграции."""
+        return self.db.execute(
+            'SELECT space, count(*) FROM chunks GROUP BY space '
+            'ORDER BY 2 DESC, 1').fetchall()
 
     def doc_text_hashes(self) -> set[str]:
         """sha1 ТЕЛА (текст без первой строки-заголовка) всех HedEx-чанков —
@@ -442,12 +521,13 @@ class SqliteVecStore:
 
     def upsert_file(self, doc_id: int, name: str, size: int, md5: str,
                     chat_id: int, msg_id: int, caption: str,
-                    topic_name: str, date: str, kind: str = '') -> None:
+                    topic_name: str, date: str, kind: str = '',
+                    space: str = '') -> None:
         with self.db:
             self.db.execute('''
                 INSERT INTO files(doc_id, name, size, md5, chat_id, msg_id,
-                                  caption, topic_name, date, kind)
-                VALUES(?,?,?,?,?,?,?,?,?,?)
+                                  caption, topic_name, date, kind, space)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(doc_id) DO UPDATE SET
                     md5 = CASE WHEN excluded.md5 != ''
                                THEN excluded.md5 ELSE files.md5 END,
@@ -458,7 +538,8 @@ class SqliteVecStore:
                     kind = CASE WHEN excluded.kind != ''
                                 THEN excluded.kind ELSE files.kind END
                 ''', (doc_id, name, size, md5, chat_id, msg_id,
-                      caption, topic_name, date, kind))
+                      caption, topic_name, date, kind,
+                      space or self.default_space))
 
     def set_file_md5(self, doc_id: int, md5: str) -> None:
         with self.db:
@@ -709,13 +790,14 @@ class SqliteVecStore:
 
     def log_qa(self, chat_id: int, user_id: int, question: str,
                answer: str, found: bool, msg_id: int = 0,
-               parent_qa_id: int = 0) -> int:
+               parent_qa_id: int = 0, space: str = '') -> int:
         with self.db:
             cur = self.db.execute(
                 'INSERT INTO qa_log(chat_id, user_id, question, answer, '
-                'found, msg_id, parent_qa_id) VALUES(?,?,?,?,?,?,?)',
+                'found, msg_id, parent_qa_id, space) VALUES(?,?,?,?,?,?,?,?)',
                 (chat_id, user_id, question[:500], answer[:1000],
-                 1 if found else 0, msg_id, parent_qa_id))
+                 1 if found else 0, msg_id, parent_qa_id,
+                 space or self.default_space))
             return cur.lastrowid
 
     def set_qa_answer_msg(self, qa_id: int, answer_msg_id: int) -> None:
@@ -817,6 +899,7 @@ class SqliteVecStore:
                      (prefix + '%',)).fetchone()[0]
 
         return {
+            'spaces': self.count_by_space(),
             'chats': chats,
             'hedex': hedex[:limit],
             'hedex_total': len(hedex),
@@ -875,8 +958,10 @@ class SqliteVecStore:
 def open_store():
     backend = os.getenv('KB_BACKEND', 'sqlite').lower()
     if backend == 'sqlite':
+        from kb_spaces import load_spaces
         return SqliteVecStore(os.getenv('KB_DB_PATH', './kb/kb.sqlite'),
-                              int(os.getenv('EMBED_DIM', '512')))
+                              int(os.getenv('EMBED_DIM', '512')),
+                              default_space=load_spaces().default.slug)
     raise ValueError(f'Неизвестный KB_BACKEND: {backend}')
 
 
@@ -917,6 +1002,28 @@ def _selftest() -> None:
         hits = store.search('прошивка MA5608T', None, top_k=3)
         assert any('MA5608T' in h.text for h in hits), hits
 
+        # ── пространства знаний ─────────────────────────────────────────
+        assert all(h.space == 'main' for h in hits), 'без метки — пространство по умолчанию'
+        store.upsert_chunks([Chunk(
+            -2002, 1, 'Обход', '2026-02-01', '2026-02-01', 5, 9, 'max',
+            'Топик «Обход»\n[2026-02-01 09:00] max: прошивка mihomo на роутере',
+            vec(3), space='b4')])
+        assert dict(store.count_by_space()) == {'main': 3, 'b4': 1}
+        # скоуп: одно пространство видит только своё, глобальный — всё
+        assert [h.space for h in store.search('прошивка', vec(3), space='b4')] == ['b4']
+        assert all(h.space == 'main'
+                   for h in store.search('прошивка', vec(0), space='main'))
+        spaces_seen = {h.space for h in store.search('прошивка', vec(3), top_k=8)}
+        assert spaces_seen == {'main', 'b4'}, spaces_seen
+        # то же для FTS-only пути
+        assert [h.space for h in store.search('mihomo', None, space='b4')] == ['b4']
+        assert store.search('mihomo', None, space='main') == []
+        # переэмбеддинг одного чанка не выкидывает его из своего раздела
+        b4_rowid = store.db.execute(
+            "SELECT rowid FROM chunks WHERE space='b4'").fetchone()[0]
+        store.set_vector(b4_rowid, vec(4))
+        assert [h.space for h in store.search('mihomo', vec(4), space='b4')] == ['b4']
+
         store.set_state('last_seen_id:-1001234', '35')
         assert store.get_state('last_seen_id:-1001234') == '35'
         assert store.get_state('nope', 'def') == 'def'
@@ -931,7 +1038,7 @@ def _selftest() -> None:
         assert chunks[0].id in h and 'нет-такого' not in h
         assert store.prune_chunks(-1001234, [c.id for c in chunks]) == 0
         assert store.prune_chunks(-1001234, [chunks[0].id, chunks[1].id]) == 1
-        assert store.count() == 2
+        assert store.count() == 3, 'чанк другого чата (space=b4) не трогается'
         assert store.prune_chunks(-999, ['x']) == 0  # чужой чат не трогается
 
         store.add_event('download', 'Скачан test.pdf (1.0 МБ)')
@@ -1069,7 +1176,9 @@ def _selftest() -> None:
         assert len(store.gaps()) == 1  # закрытый пробел ушёл из /gaps
 
         s = store.kb_stats()
-        assert s['chunks'] == 2 and s['downloads_24h'] == 1  # 2: один чанк убрал prune
+        # 3 чанка: два main (один убрал prune) и один b4
+        assert s['chunks'] == 3 and s['downloads_24h'] == 1
+        assert dict(store.sources_report()['spaces']) == {'main': 2, 'b4': 1}
         assert abs(s['events_cost'] - 0.12) < 1e-9
         # 6 моделей: MA5608T, S5700, S5735-L, MA5800, TEST1, MA5900 (авто-review)
         assert s['files'] == 5 and s['fw_models'] == 6, (s['files'], s['fw_models'])
