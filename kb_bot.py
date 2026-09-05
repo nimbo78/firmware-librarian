@@ -17,9 +17,12 @@ from datetime import datetime, timedelta
 
 from telethon import Button, TelegramClient, events
 
-from kb_firmware import (OS_NAMES, PRODUCT_CATEGORIES, product_category,
-                         split_query, version_branch_label)
-from kb_ingest import embed_texts, openai_client
+from kb_answer import answer_question, fw_llm_match
+from kb_firmware import split_query
+from kb_ingest import openai_client
+from kb_render import (ADMIN_HELP_EXTRA, fmt_event, msg_link,
+                       nav_category_view, nav_files_view, nav_model_view,
+                       nav_root_view, render_grouped, user_help)
 from kb_store import open_store
 from tg_conn import proxy_kwargs
 
@@ -32,15 +35,12 @@ ANSWER_CHAT_IDS = {int(x) for x in os.getenv('KB_ANSWER_CHAT_IDS', '').split(','
 # команды в личке и уведомления. Бот не может написать первым — админ
 # должен один раз нажать Start.
 ADMIN_IDS = {int(x) for x in os.getenv('KB_ADMIN_IDS', '').split(',') if x.strip()}
-ANSWER_MODEL = os.getenv('ANSWER_MODEL', 'gpt-5-mini')
 # KB_WEB=1: ответы могут дополняться веб-поиском (Responses API + web_search);
 # контекст чата приоритетен, веб-источники — отдельным блоком 🌐
-KB_WEB = os.getenv('KB_WEB', '0') == '1'
 SESSION = os.getenv('KB_BOT_SESSION', 'kb_bot')
 # Том загрузок качалки (read-only в compose): отсюда бот шлёт файлы по кнопке 📎
 DOWNLOAD_FOLDER = os.getenv('DOWNLOAD_FOLDER', './downloads')
 COOLDOWN_SECONDS = 30
-TOP_K = 8
 NOTIFY_POLL_SECONDS = 60
 
 # Петля «вопросы без ответа»: авто-ответ через час после ночного инжеста
@@ -56,58 +56,6 @@ GAPS_POST_HOUR = 10
 MSG_CLICKS_TO_DELETE = 3
 _msg_clicks: dict[tuple[int, int], int] = {}
 
-
-def _user_help() -> str:
-    mention = f'@{_bot_username}' if _bot_username else '@<имя бота>'
-    return (
-        '🤖 Хранитель знаний чата. Что умею:\n'
-        '\n'
-        '❓ Вопросы по базе знаний (история чата + документация):\n'
-        f'• /ask <вопрос> — или просто упомяни меня: {mention} <вопрос>\n'
-        '• Ответь реплаем на мой ответ — продолжу диалог с учётом контекста\n'
-        '  (можно уточнять: «а на R024?», «подробнее про DFS»).\n'
-        '• Под ответом кнопки 👍/👎 — оценки делают базу лучше.\n'
-        '• Если ответа не нашлось — вопрос запоминается; как только в чате\n'
-        '  появится обсуждение, я сам отвечу реплаем.\n'
-        '\n'
-        '📦 Каталог прошивок и документации:\n'
-        '• /fw — навигация по разделам, как на support.huawei.com\n'
-        '• /fw <модель> [версия] — поиск: /fw S5735-S R024, /fw 5735\n'
-        '• /sw <модель> — сводка по веткам софта\n'
-        '• /download <начало имени> — все файлы с этим префиксом подряд\n'
-        '  (включая .asc/.p7s для проверки подписи и многотомники)\n'
-        '• В выдаче: софт по веткам от новых к старым (💿 образ, 🩹 патчи),\n'
-        '  документация и прочее — блоком 📖 в конце.\n'
-        '• Кнопка 📎 присылает файл прямо в чат (до 2 ГБ).\n'
-        '  После трёх отправок с одного списка он удаляется — не мусорим.'
-    )
-
-
-ADMIN_HELP_EXTRA = (
-    '\n\n🔧 Команды администратора (только в личке):\n'
-    '/status — база, стоимость, курсоры инжеста (+кнопка инжеста)\n'
-    '/events — последние 20 событий\n'
-    '/gaps — вопросы без ответа или с 👎\n'
-    '/review — подтвердить связки каталога (есть «принять все»)\n'
-    '/ingest — внеплановый инжест сейчас (не ждать ночи)\n'
-    '/notify on|off — уведомления о событиях в личку\n'
-    'Любой другой текст в личке — вопрос к базе знаний.'
-)
-
-SYSTEM_PROMPT = (
-    'Ты — ассистент telegram-чата инженеров по оборудованию Huawei. '
-    'Отвечай по-русски, кратко и по делу, опираясь только на приведённый '
-    'контекст из истории чата и документации. Ссылайся на фрагменты '
-    'номерами в квадратных скобках, например [1]. Если ответа в контексте '
-    'нет — прямо скажи об этом, не выдумывай.\n\n'
-    'Формат — сообщение в Telegram, а не статья: короткие абзацы или '
-    'списки вместо простыни, **жирным** — ключевые выводы и номера версий, '
-    '`моноширинным` — команды CLI и имена файлов. Заголовков и таблиц не '
-    'делай — Telegram их не рендерит. Пара уместных эмодзи приветствуется '
-    '(⚠️ грабли, ✅ рабочее решение, 🔧 команда), но без ёлки. Тон — свой '
-    'инженер в чате: живой, разговорный, сленг и лёгкий вайб ок, но '
-    'техническая точность всегда важнее прикола.'
-)
 
 # %(name)s подписывает источник: telethon.network.* — сетевой слой Telegram,
 # kb_bot/kb_* — наши модули (иначе непонятно, чей варнинг)
@@ -125,13 +73,6 @@ _last_ask: dict[int, float] = {}
 _bot_username = ''
 
 
-def _msg_link(chat_id: int, msg_id: int) -> str | None:
-    s = str(chat_id)
-    if s.startswith('-100'):
-        return f'https://t.me/c/{s[4:]}/{msg_id}'
-    return None
-
-
 def _extract_question(text: str) -> str | None:
     m = re.match(r'^/ask(@\w+)?\s*(.*)$', text, re.IGNORECASE | re.DOTALL)
     if m:
@@ -141,148 +82,6 @@ def _extract_question(text: str) -> str | None:
         if mention.lower() in text.lower():
             return re.sub(re.escape(mention), '', text, flags=re.IGNORECASE).strip()
     return None
-
-
-async def _expand_query(question: str) -> list[str]:
-    """Разворот сленга в термины: «зеркалка на 5735» → «port mirroring
-    S5735», «SPAN настройка зеркалирования». Пара альтернативных
-    формулировок ловит жаргон лучше любой смены модели эмбеддингов
-    (качество приоритетнее стоимости — решение владельца)."""
-    try:
-        oa = openai_client()
-        resp = await oa.chat.completions.create(
-            model=ANSWER_MODEL,
-            response_format={'type': 'json_object'},
-            messages=[{'role': 'user', 'content':
-                'Вопрос из чата про оборудование Huawei:\n' + question[:300] +
-                '\n\nСгенерируй 2 альтернативные поисковые формулировки: '
-                'разверни сленг/жаргон в официальные термины и добавь '
-                'англоязычный вариант с терминологией Huawei. '
-                'Верни JSON {"queries": ["...", "..."]}.'}])
-        data = json.loads(resp.choices[0].message.content or '{}')
-        out = [str(q).strip() for q in data.get('queries', [])
-               if str(q).strip()]
-        return out[:2]
-    except Exception as e:
-        logger.warning('query expansion failed: %s', e)
-        return []
-
-
-async def _search_expanded(question: str, extra: list[str] = ()) -> list:
-    """Поиск по вопросу + расширенным формулировкам, слияние через RRF
-    (тот же приём, что внутри store.search для вектора+FTS).
-    extra — доп. варианты (вопросы из диалога: follow-up «а на R024?» сам
-    по себе не несёт сущностей, их держит предыдущий вопрос)."""
-    variants = [question] + list(extra) + await _expand_query(question)
-    if len(variants) > 1:
-        logger.info('Query expansion: %s', ' | '.join(variants[1:]))
-    try:
-        vectors = await embed_texts(variants)
-    except Exception as e:
-        # эмбеддинг-провайдер лёг — деградируем до FTS-only, а не падаем:
-        # фолбэк на другую модель невозможен (вектора несравнимы)
-        logger.warning('embedding failed, FTS-only search: %s', e)
-        vectors = [None] * len(variants)
-    scores: dict[tuple, float] = {}
-    by_key: dict[tuple, object] = {}
-    for variant, vec in zip(variants, vectors):
-        for rank, h in enumerate(store.search(variant, vec, top_k=TOP_K)):
-            key = (h.chat_id, h.msg_first)
-            by_key.setdefault(key, h)
-            scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank)
-    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-    return [by_key[k] for k, _ in ranked[:TOP_K]]
-
-
-async def _answer_with_web(system: str, user: str, oa) -> tuple[str, list[str]]:
-    """Ответ через Responses API с веб-поиском. Возвращает (текст, веб-URL)."""
-    resp = await oa.responses.create(
-        model=ANSWER_MODEL,
-        tools=[{'type': 'web_search'}],
-        input=[{'role': 'system', 'content': system},
-               {'role': 'user', 'content': user}])
-    text = (getattr(resp, 'output_text', '') or '').strip()
-    if not text:
-        raise RuntimeError('empty web answer')
-    urls: list[str] = []
-    for item in getattr(resp, 'output', None) or []:
-        for part in getattr(item, 'content', None) or []:
-            for ann in getattr(part, 'annotations', None) or []:
-                url = getattr(ann, 'url', None)
-                if url and url not in urls:
-                    urls.append(url)
-    return text, urls[:5]
-
-
-WEB_PROMPT_EXTRA = (
-    ' Тебе доступен веб-поиск: используй его, чтобы дополнить или проверить '
-    'ответ (официальная документация Huawei, release notes, CVE), но опыт '
-    'из контекста чата приоритетен — он отражает реальную эксплуатацию.'
-)
-
-
-async def answer_question(question: str,
-                          dialog: list[tuple[str, str]] = ()) -> tuple[str, bool]:
-    """(текст ответа, нашлось ли что-то в базе) — found=False копится в /gaps.
-    dialog — предыдущие обмены (вопрос, ответ) при follow-up реплаем."""
-    oa = openai_client()
-    hits = await _search_expanded(question, extra=[q for q, _ in dialog])
-    if not hits and not KB_WEB:
-        return 'В базе знаний пока ничего не нашлось по этому вопросу.', False
-    ctx_parts = []
-    src_lines = []  # выровнено с нумерацией контекста: src_lines[i-1] = [i]
-    for i, h in enumerate(hits, 1):
-        where = f'топик «{h.topic_name}», {h.date_from}' if h.topic_name else h.date_from
-        ctx_parts.append(f'[{i}] ({where})\n{h.text}')
-        link = _msg_link(h.chat_id, h.msg_first)
-        if link:
-            src_lines.append(f'[{i}] {link}')
-        elif h.chat_id > 0 and h.topic_id == 1:
-            # HedEx-чанк (kb_hedex.py): topic_name = «продукт версия — раздел»
-            src_lines.append(f'[{i}] документация: {h.topic_name}')
-        elif h.chat_id > 0:
-            # PDF-чанк: синтетический положительный chat_id (см. kb_pdf.py)
-            src_lines.append(f'[{i}] файл «{h.topic_name}», стр. {h.msg_first}')
-        else:
-            src_lines.append(f'[{i}] обсуждение в чате, {h.date_from}')
-    context = ('Контекст:\n\n' + '\n\n'.join(ctx_parts)
-               if ctx_parts else 'Контекст из чата пуст.')
-    dialog_block = ''
-    if dialog:
-        turns = [f'Вопрос: {q}\nТвой ответ: {a[:800]}' for q, a in dialog]
-        dialog_block = ('Предыдущий диалог (пользователь ответил на твоё '
-                        'последнее сообщение — вопрос ниже продолжает его):\n'
-                        + '\n\n'.join(turns) + '\n\n')
-    user_msg = f'{dialog_block}{context}\n\nВопрос: {question}'
-    answer = ''
-    web_urls: list[str] = []
-    if KB_WEB:
-        try:
-            answer, web_urls = await _answer_with_web(
-                SYSTEM_PROMPT + WEB_PROMPT_EXTRA, user_msg, oa)
-        except Exception as e:
-            logger.warning('web answer failed, fallback to plain: %s', e)
-    if not answer:
-        if not hits:
-            return ('В базе знаний пока ничего не нашлось по этому '
-                    'вопросу.', False)
-        # temperature/max_tokens не передаём: модели класса gpt-5 их не принимают
-        resp = await oa.chat.completions.create(
-            model=ANSWER_MODEL,
-            messages=[{'role': 'system', 'content': SYSTEM_PROMPT},
-                      {'role': 'user', 'content': user_msg}])
-        answer = (resp.choices[0].message.content or '').strip()
-    # В списке источников — только те, на которые LLM сослался в тексте:
-    # иначе либо висячие [7] без ссылки, либо простыня из всех top-8
-    cited = {int(n) for n in re.findall(r'\[(\d+)\]', answer)
-             if 1 <= int(n) <= len(src_lines)}
-    shown = ([src_lines[n - 1] for n in sorted(cited)]
-             if cited else src_lines[:3])
-    if shown:
-        answer += '\n\nИсточники:\n' + '\n'.join(shown)
-    if web_urls:
-        answer += '\n\n🌐 Веб:\n' + '\n'.join(web_urls)
-    return answer[:4000], bool(hits)  # лимит сообщения Telegram — 4096
 
 
 async def _send_answer(event, question: str, parent_qa_id: int = 0) -> None:
@@ -300,7 +99,7 @@ async def _send_answer(event, question: str, parent_qa_id: int = 0) -> None:
                 event.sender_id, event.chat_id,
                 ' (follow-up)' if dialog else '', question[:100])
     try:
-        answer, found = await answer_question(question, dialog=dialog)
+        answer, found = await answer_question(store, question, dialog=dialog)
     except Exception as e:
         logger.warning('Answer failed: %s', e)
         await event.reply('Не получилось получить ответ, попробуй позже.')
@@ -317,241 +116,9 @@ async def _send_answer(event, question: str, parent_qa_id: int = 0) -> None:
 
 
 # порядок и подписи секций общего рендера каталога (используются также в /sw)
-_SW_KIND_ORDER = {'software': 0, 'patch': 1, 'release_notes': 2, 'doc': 3,
-                  'mib': 4, 'tool': 5, '': 6}
-_SW_KIND_TITLES = {'software': '💿 Образ', 'patch': '🩹 Патчи',
-                   'release_notes': '📃 Release notes',
-                   'doc': '📖 Документация', 'mib': '🧾 MIB',
-                   'tool': '🛠 Инструменты', '': '📁 Прочее'}
-_RENDER_MAX_BRANCHES = 6
-
-
-_RENDER_MAX_DOCS = 8
-_SW_KINDS = ('software', 'patch')  # «софт-часть» ветки; остальное — в конец
-
-
-def _render_grouped(rows: list, query: str, model_query: str = '',
-                    max_models: int = 3) -> tuple[str, list, set]:
-    """Единый рендер каталога для /fw, /sw и листа навигации.
-
-    Порядок (решение владельца): сначала софт по веткам от новых к старым —
-    🔀 R025 (💿 образ + 🩹 патчи), затем R024 и т.д., — а вся документация/
-    RN/MIB/прочее одним блоком 📖 в конце модели с пометкой ветки.
-    Запрошенная модель всегда первой — иначе серия (S5700) заливает лимит
-    4096 и запрошенное отрезается. Возвращает (текст, кнопки 📎, seen_doc_ids)
-    — seen нужен вызывающему, чтобы дополнять кнопки без дублей.
-    """
-    if not rows:
-        return (f'По запросу «{query}» в каталоге пусто. Каталог наполняется '
-                f'из имён файлов в чатах.', [], set())
-    grouped: dict = {}
-    is_series: dict = {}
-    for r in rows:
-        branch = version_branch_label(r[1])
-        grouped.setdefault(r[0], {}).setdefault(branch, []).append(r)
-        is_series[r[0]] = is_series.get(r[0], False) or bool(r[7])
-    qnorm = re.sub(r'[^A-Z0-9]', '', (model_query or query).upper())
-
-    def _model_rank(m: str) -> tuple:
-        return (0 if qnorm and qnorm in re.sub(r'[^A-Z0-9]', '', m) else 1, m)
-
-    out = [f'Каталог по запросу «{query}»:']
-    buttons: list = []
-    seen: set[int] = set()
-
-    def _emit(r: tuple, extra: str = '') -> None:
-        unconfirmed = ' · не подтверждено' if r[6] != 'high' else ''
-        line = f'  • {r[2]} · {r[5]}{extra}{unconfirmed}'
-        link = _msg_link(r[3], r[4])
-        if link:
-            line += f'\n    {link}'
-        out.append(line)
-        if r[8] and r[9] not in seen and len(buttons) < 10:
-            seen.add(r[9])
-            buttons.append([Button.inline(f'📎 {r[2][:40]}',
-                                          f'g:{r[9]}'.encode())])
-
-    for model in sorted(grouped, key=_model_rank)[:max_models]:
-        suffix = (' (вся серия — проверь совместимость!)'
-                  if is_series[model] else '')
-        out.append(f'\n📦 {model}{suffix}')
-        branches = sorted((b for b in grouped[model] if b != 'без версии'),
-                          reverse=True)
-        if 'без версии' in grouped[model]:
-            branches.append('без версии')
-        # софт-часть по веткам; документация копится в общий хвост модели
-        sw_branches: list[tuple[str, dict]] = []
-        docs_pool: list[tuple[str, tuple]] = []
-        doc_names: set[str] = set()
-        for branch in branches:
-            seen_names: set[str] = set()
-            by_kind: dict = {}
-            for r in grouped[model][branch]:
-                if r[2] in seen_names:
-                    continue  # повторные посты того же файла не дублируем
-                seen_names.add(r[2])
-                if r[10] in _SW_KINDS:
-                    by_kind.setdefault(r[10], []).append(r)
-                elif r[2] not in doc_names:
-                    doc_names.add(r[2])
-                    docs_pool.append((branch, r))
-            if by_kind:
-                sw_branches.append((branch, by_kind))
-        for branch, by_kind in sw_branches[:_RENDER_MAX_BRANCHES]:
-            os_name = OS_NAMES.get(branch.split(' ')[0], '')
-            os_mark = f' · {os_name}' if os_name else ''
-            out.append(f'🔀 {branch}{os_mark}')
-            for kind in sorted(by_kind, key=lambda k: _SW_KIND_ORDER.get(k, 6)):
-                out.append(f'  {_SW_KIND_TITLES.get(kind, "📁 Прочее")}:')
-                for r in by_kind[kind][:5]:
-                    _emit(r)
-                if len(by_kind[kind]) > 5:
-                    out.append(f'    … и ещё {len(by_kind[kind]) - 5}')
-        if len(sw_branches) > _RENDER_MAX_BRANCHES:
-            out.append(f'  … и ещё веток с софтом: '
-                       f'{len(sw_branches) - _RENDER_MAX_BRANCHES} '
-                       f'(уточни версией: /fw {model} R0xx)')
-        if docs_pool:
-            out.append('📖 Документация и прочее:')
-            for branch, r in docs_pool[:_RENDER_MAX_DOCS]:
-                emoji = _SW_KIND_TITLES.get(r[10], '📁 Прочее').split()[0]
-                branch_mark = f' {branch}' if branch != 'без версии' else ''
-                _emit(r, extra=f' · {emoji}{branch_mark}')
-            if len(docs_pool) > _RENDER_MAX_DOCS:
-                out.append(f'    … и ещё {len(docs_pool) - _RENDER_MAX_DOCS} '
-                           f'(все — в /fw через навигацию)')
-    return '\n'.join(out), buttons, seen
-
-
-async def _fw_llm_match(query: str) -> tuple[list[str], list[int]]:
-    """Fallback для /fw: подстрочный поиск промахнулся — просим лёгкую модель
-    сматчить запрос к известным моделям И к именам файлов каталога напрямую.
-    Ловит новые схемы имён, серии и вольные формулировки без правки регулярок
-    (качество матчинга важнее стоимости вызова — решение владельца).
-    Возвращает (модели, doc_id подходящих файлов)."""
-    if not os.getenv('OPENAI_API_KEY'):
-        return [], []
-    known = store.all_models()
-    files = store.all_files(skip_signatures=True)
-    if not known and not files:
-        return [], []
-    file_list = '\n'.join(f'{i}: {name}' for i, (_, name) in enumerate(files))
-    oa = openai_client()
-    resp = await oa.chat.completions.create(
-        model=ANSWER_MODEL,
-        response_format={'type': 'json_object'},
-        messages=[{'role': 'user', 'content':
-            'Запрос пользователя (софт/прошивка для оборудования Huawei): '
-            + query[:200] + '\n\n'
-            'Известные модели/серии: ' + (', '.join(known) or 'нет') + '\n\n'
-            'Файлы каталога (номер: имя):\n' + (file_list or 'нет') + '\n\n'
-            'Верни JSON {"models": [...], "file_numbers": [...]} — какие '
-            'модели и какие файлы соответствуют запросу (учитывай серии, '
-            'подсемейства, сокращения, опечатки). models — только значения '
-            'из списка, максимум 5; file_numbers — номера из списка файлов, '
-            'максимум 10. Ничего не подходит — пустые списки.'}])
-    try:
-        data = json.loads(resp.choices[0].message.content or '{}')
-    except Exception:
-        return [], []
-    known_set = set(known)
-    models = [str(m) for m in data.get('models', []) if str(m) in known_set][:5]
-    doc_ids: list[int] = []
-    for n in data.get('file_numbers', []):
-        try:
-            doc_ids.append(files[int(n)][0])
-        except (ValueError, IndexError, TypeError):
-            continue
-    return models, doc_ids[:10]
 
 
 # ── Навигация каталога кнопками: категория → модель → ветка R → файлы ──
-NAV_PAGE_SIZE = 14
-
-
-def _nav_tree() -> dict:
-    """Категория -> {модель -> {rkey(9 симв. version_key) -> (счётчик, метка)}}.
-    Метка ветки берётся из сырой версии (version_branch_label), не из ключа."""
-    tree: dict = {}
-    for model, version, vkey in store.fw_all():
-        cat = product_category(model)
-        rkey = (vkey or '')[:9] or '-'
-        node = tree.setdefault(cat, {}).setdefault(model, {})
-        if rkey in node:
-            node[rkey] = (node[rkey][0] + 1, node[rkey][1])
-        else:
-            node[rkey] = (1, version_branch_label(version))
-    return tree
-
-
-def _branch_files(branch: dict) -> int:
-    """Сумма файлов по всем веткам модели (значения — (счётчик, метка))."""
-    return sum(cnt for cnt, _ in branch.values())
-
-
-def _nav_root_view() -> tuple[str, list]:
-    tree = _nav_tree()
-    if not tree:
-        return 'Каталог пока пуст — файлы появятся после инжеста.', []
-    buttons = []
-    for ci, cat in enumerate(PRODUCT_CATEGORIES):
-        models = tree.get(cat)
-        if models:
-            n_files = sum(_branch_files(r) for r in models.values())
-            buttons.append([Button.inline(
-                f'{cat} · {len(models)} моделей · {n_files} файлов',
-                f'n:c:{ci}:0'.encode())])
-    return ('Каталог прошивок и документации. Выбери раздел '
-            '(или сразу /fw <модель>):'), buttons
-
-
-def _nav_category_view(ci: int, page: int) -> tuple[str, list]:
-    cat = PRODUCT_CATEGORIES[ci]
-    models = sorted(_nav_tree().get(cat, {}).items())
-    if not models:
-        return f'{cat}: пусто.', [[Button.inline('⬅️ Разделы', b'n:r')]]
-    start = page * NAV_PAGE_SIZE
-    chunk = models[start:start + NAV_PAGE_SIZE]
-    buttons = []
-    for i in range(0, len(chunk), 2):  # по две модели в ряд
-        row = [Button.inline(f'{m} ({_branch_files(r)})', f'n:m:{m}'.encode())
-               for m, r in chunk[i:i + 2]]
-        buttons.append(row)
-    nav_row = []
-    if page > 0:
-        nav_row.append(Button.inline('◀️', f'n:c:{ci}:{page - 1}'.encode()))
-    nav_row.append(Button.inline('⬅️ Разделы', b'n:r'))
-    if start + NAV_PAGE_SIZE < len(models):
-        nav_row.append(Button.inline('▶️', f'n:c:{ci}:{page + 1}'.encode()))
-    buttons.append(nav_row)
-    pages = (len(models) - 1) // NAV_PAGE_SIZE + 1
-    return f'{cat} — модели ({page + 1}/{pages}):', buttons
-
-
-def _nav_model_view(model: str) -> tuple[str, list]:
-    branches = {}
-    for m, rkeys in _nav_tree().get(product_category(model), {}).items():
-        if m == model:
-            branches = rkeys
-    if not branches:
-        return f'{model}: файлов нет.', [[Button.inline('⬅️ Разделы', b'n:r')]]
-    ci = PRODUCT_CATEGORIES.index(product_category(model))
-    buttons = []
-    for rkey in sorted(branches, reverse=True):
-        count, label = branches[rkey]  # метка уже человекочитаемая
-        buttons.append([Button.inline(f'{label} · {count} файл(ов)',
-                                      f'n:v:{model}:{rkey}'.encode())])
-    buttons.append([Button.inline('⬅️ Модели', f'n:c:{ci}:0'.encode())])
-    return f'{model} — ветки версий:', buttons
-
-
-def _nav_files_view(model: str, rkey: str) -> tuple[str, list]:
-    rows = store.find_firmware_exact(model, '' if rkey == '-' else rkey)
-    if rkey == '-':
-        rows = [r for r in rows if not r[1]]
-    text, buttons, _ = _render_grouped(rows, model, model, max_models=1)
-    buttons.append([Button.inline('⬅️ Ветки версий', f'n:m:{model}'.encode())])
-    return text[:4000], buttons
 
 
 async def _handle_sw(event, text: str) -> None:
@@ -577,7 +144,7 @@ async def _handle_sw(event, text: str) -> None:
         await event.reply(f'По «{arg}» в каталоге пусто. Попробуй /fw {arg} '
                           f'(там есть LLM-подбор) или /download <начало имени>.')
         return
-    out, buttons, _ = _render_grouped(rows, arg, model_query)
+    out, buttons, _ = render_grouped(rows, arg, model_query)
     await event.reply(out[:4000], link_preview=False, buttons=buttons or None)
 
 
@@ -633,7 +200,7 @@ async def _handle_fw(event, text: str) -> None:
     parts = text.split(maxsplit=1)
     arg = parts[1].strip() if len(parts) > 1 else ''
     if not arg:
-        nav_text, nav_buttons = _nav_root_view()
+        nav_text, nav_buttons = nav_root_view(store)
         await event.reply(nav_text, buttons=nav_buttons or None)
         return
     # 'S5735-S-V2 R025': версия отдельным словом — фильтр, а не часть модели
@@ -647,7 +214,7 @@ async def _handle_fw(event, text: str) -> None:
     extra_files: list[tuple] = []
     if not rows:
         try:
-            models, doc_ids = await _fw_llm_match(arg)
+            models, doc_ids = await fw_llm_match(store, arg)
             seen_rows = set()
             for model in models:
                 for r in store.find_firmware(model):
@@ -666,17 +233,17 @@ async def _handle_fw(event, text: str) -> None:
         except Exception as e:
             logger.warning('fw llm fallback failed: %s', e)
     if rows:
-        text_out, buttons, seen = _render_grouped(rows, arg, model_query)
+        text_out, buttons, seen = render_grouped(rows, arg, model_query)
     elif extra_files:
         text_out = f'Точных связок «модель → прошивка» по «{arg}» нет.'
         buttons, seen = [], set()
     else:
-        text_out, buttons, seen = _render_grouped(rows, arg, model_query)
+        text_out, buttons, seen = render_grouped(rows, arg, model_query)
     if extra_files:
         lines = ['', '🤖 Возможно подходящие файлы (LLM по именам):']
         for doc_id, name, md5, chat_id, msg_id, date in extra_files:
             line = f'  • {name} · {date}'
-            link = _msg_link(chat_id, msg_id)
+            link = msg_link(chat_id, msg_id)
             if link:
                 line += f'\n    {link}'
             lines.append(line)
@@ -690,18 +257,11 @@ async def _handle_fw(event, text: str) -> None:
                       link_preview=False, buttons=buttons or None)
 
 
-def _fmt_event(ts: str, kind: str, text: str, cost: float) -> str:
-    line = f'{ts[5:16]} [{kind}] {text}'
-    if cost:
-        line += f' ~${cost:.2f}'
-    return line
-
-
 async def handle_admin(event) -> None:
     text = (event.raw_text or '').strip()
     low = text.lower()
     if low.startswith('/start') or low.startswith('/help'):
-        await event.reply(_user_help() + ADMIN_HELP_EXTRA)
+        await event.reply(user_help(_bot_username) + ADMIN_HELP_EXTRA)
     elif low.startswith('/status'):
         s = store.kb_stats()
         notify = 'вкл' if store.get_state('admin_notify', '1') == '1' else 'выкл'
@@ -731,7 +291,7 @@ async def handle_admin(event) -> None:
         if not rows:
             await event.reply('Событий пока нет.')
         else:
-            body = '\n'.join(_fmt_event(ts, kind, tx, cost)
+            body = '\n'.join(fmt_event(ts, kind, tx, cost)
                              for _, ts, kind, tx, cost in reversed(rows))
             await event.reply(body[:4000], link_preview=False)
     elif low.startswith('/notify'):
@@ -786,13 +346,13 @@ async def handle_admin(event) -> None:
             f'обязательно — можно принять всё разом:',
             buttons=[[Button.inline(f'✅ Принять все {pending}', b'c:allfw')]])
     elif text.startswith('/') and not low.startswith('/ask'):
-        await event.reply(_user_help() + ADMIN_HELP_EXTRA)
+        await event.reply(user_help(_bot_username) + ADMIN_HELP_EXTRA)
     else:
         question = _extract_question(text)
         if question is None:
             question = text  # в личке админа любой текст — вопрос к базе
         if not question:
-            await event.reply(_user_help() + ADMIN_HELP_EXTRA)
+            await event.reply(user_help(_bot_username) + ADMIN_HELP_EXTRA)
             return
         parent_qa = 0
         reply_id = event.message.reply_to_msg_id
@@ -818,7 +378,7 @@ async def notifier_loop() -> None:
             if not rows:
                 continue
             msg = 'События:\n' + '\n'.join(
-                _fmt_event(ts, kind, tx, cost) for _, ts, kind, tx, cost in rows)
+                fmt_event(ts, kind, tx, cost) for _, ts, kind, tx, cost in rows)
             sent = False
             for admin_id in ADMIN_IDS:
                 try:
@@ -843,7 +403,7 @@ async def auto_answer_gaps() -> int:
             store.mark_gap_closed(qa_id)  # чат больше не обслуживается
             continue
         try:
-            answer, found = await answer_question(question)
+            answer, found = await answer_question(store, question)
         except Exception as e:
             logger.warning('gap re-answer failed for %s: %s', qa_id, e)
             continue
@@ -929,7 +489,7 @@ async def handler(event):
     text = (event.raw_text or '').strip()
     low = text.lower()
     if low.startswith(('/help', '/start')):
-        await event.reply(_user_help())
+        await event.reply(user_help(_bot_username))
         return
     if low.startswith('/fw'):
         await _handle_fw(event, text)  # без кулдауна: дёшево, без LLM
@@ -978,13 +538,13 @@ async def on_nav(event):
         parts = event.data.decode().split(':')
         kind = parts[1]
         if kind == 'r':
-            text, buttons = _nav_root_view()
+            text, buttons = nav_root_view(store)
         elif kind == 'c':
-            text, buttons = _nav_category_view(int(parts[2]), int(parts[3]))
+            text, buttons = nav_category_view(store, int(parts[2]), int(parts[3]))
         elif kind == 'm':
-            text, buttons = _nav_model_view(parts[2])
+            text, buttons = nav_model_view(store, parts[2])
         elif kind == 'v':
-            text, buttons = _nav_files_view(parts[2], parts[3])
+            text, buttons = nav_files_view(store, parts[2], parts[3])
         else:
             await event.answer()
             return
