@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="132"
+     viewBox="0 0 1200 132" role="img" aria-labelledby="t02 d02">
+  <title id="t02">База знаний</title>
+  <desc id="d02">чанк — фрагмент беседы, не сообщение</desc>
+  <rect width="1200" height="132" rx="18" fill="#0B0F14"/>
+  <rect x="0" y="26" width="6" height="80" rx="3" fill="#58A6FF"/>
+  <text x="56" y="58" font-family="ui-monospace,SFMono-Regular,Menlo,monospace"
+        font-size="18" letter-spacing="2" fill="#7D8590">02</text>
+  <text x="56" y="96" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+        font-size="40" font-weight="700" fill="#E6EDF3">База знаний</text>
+  <text x="1144" y="58" text-anchor="end"
+        font-family="ui-monospace,SFMono-Regular,Menlo,monospace"
+        font-size="18" fill="#58A6FF">sqlite-vec + FTS5 · RRF</text>
+  <text x="1144" y="90" text-anchor="end"
+        font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+        font-size="19" fill="#7D8590">чанк — фрагмент беседы, не сообщение</text>
+</svg>

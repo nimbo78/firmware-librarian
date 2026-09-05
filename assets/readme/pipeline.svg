@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="456"
+     viewBox="0 0 1200 456" role="img" aria-labelledby="pt pd">
+  <title id="pt">Пост-инжест конвейер</title>
+  <desc id="pd">Шесть шагов после инжеста чатов, в строгом порядке: каталог, PDF, архивы, HedEx, LLM-экстракция, бэкап. Порядок задан в одном месте — kb_pipeline.py — и одинаков для ночного джоба и ручного бэкфилла.</desc>
+  <rect width="1200" height="456" rx="26" fill="#0B0F14"/>
+  <text x="64" y="72" font-family="ui-monospace,SFMono-Regular,Menlo,monospace"
+        font-size="18" letter-spacing="2.2" fill="#7D8590">KB_PIPELINE.PY · ЕДИНСТВЕННОЕ МЕСТО, ГДЕ ЗАДАН ПОРЯДОК</text>
+  <text x="64" y="118" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+        font-size="34" font-weight="700" fill="#E6EDF3">Что происходит после инжеста чатов</text>
+  <g transform="translate(66 148)">
+    <rect width="336" height="118" rx="14" fill="#131A22" stroke="#21262D" stroke-width="1.5"/>
+    <text x="24" y="38" font-family="ui-monospace,SFMono-Regular,Menlo,monospace"
+          font-size="18" fill="#58A6FF">1</text>
+    <text x="52" y="38" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+          font-size="24" font-weight="600" fill="#E6EDF3">Каталог</text>
+    <text x="24" y="70" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+          font-size="18" fill="#7D8590">md5 из журнала, перепарс имён,</text>
+    <text x="24" y="94" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+          font-size="18" fill="#7D8590">связки прошивок и серии</text>
+  </g>
+  <g transform="translate(432 148)">
+    <rect width="336" height="118" rx="14" fill="#131A22" stroke="#21262D" stroke-width="1.5"/>
+    <text x="24" y="38" font-family="ui-monospace,SFMono-Regular,Menlo,monospace"
+          font-size="18" fill="#58A6FF">2</text>
+    <text x="52" y="38" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+          font-size="24" font-weight="600" fill="#E6EDF3">PDF</text>
+    <text x="24" y="70" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+          font-size="18" fill="#7D8590">текстовый слой скачанных</text>
+    <text x="24" y="94" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+          font-size="18" fill="#7D8590">документов → чанки</text>
+  </g>
+  <g transform="translate(798 148)">
+    <rect width="336" height="118" rx="14" fill="#131A22" stroke="#21262D" stroke-width="1.5"/>
+    <text x="24" y="38" font-family="ui-monospace,SFMono-Regular,Menlo,monospace"
+          font-size="18" fill="#58A6FF">3</text>
+    <text x="52" y="38" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+          font-size="24" font-weight="600" fill="#E6EDF3">Архивы</text>
+    <text x="24" y="70" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+          font-size="18" fill="#7D8590">zip/rar/7z: листинг, прошивки</text>
+    <text x="24" y="94" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+          font-size="18" fill="#7D8590">по содержимому, текст в RAG</text>
+  </g>
+  <g transform="translate(66 296)">
+    <rect width="336" height="118" rx="14" fill="#131A22" stroke="#21262D" stroke-width="1.5"/>
+    <text x="24" y="38" font-family="ui-monospace,SFMono-Regular,Menlo,monospace"
+          font-size="18" fill="#58A6FF">4</text>
+    <text x="52" y="38" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+          font-size="24" font-weight="600" fill="#E6EDF3">HedEx</text>
+    <text x="24" y="70" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+          font-size="18" fill="#7D8590">страницы .hdx → чанки,</text>
+    <text x="24" y="94" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+          font-size="18" fill="#7D8590">дедуп между версиями</text>
+  </g>
+  <g transform="translate(432 296)">
+    <rect width="336" height="118" rx="14" fill="#131A22" stroke="#21262D" stroke-width="1.5"/>
+    <text x="24" y="38" font-family="ui-monospace,SFMono-Regular,Menlo,monospace"
+          font-size="18" fill="#58A6FF">5</text>
+    <text x="52" y="38" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+          font-size="24" font-weight="600" fill="#E6EDF3">LLM-экстракция</text>
+    <text x="24" y="70" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+          font-size="18" fill="#7D8590">подписи без связок и</text>
+    <text x="24" y="94" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+          font-size="18" fill="#7D8590">таксономия серий</text>
+  </g>
+  <g transform="translate(798 296)">
+    <rect width="336" height="118" rx="14" fill="#131A22" stroke="#21262D" stroke-width="1.5"/>
+    <text x="24" y="38" font-family="ui-monospace,SFMono-Regular,Menlo,monospace"
+          font-size="18" fill="#58A6FF">6</text>
+    <text x="52" y="38" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+          font-size="24" font-weight="600" fill="#E6EDF3">Бэкап</text>
+    <text x="24" y="70" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+          font-size="18" fill="#7D8590">VACUUM INTO раз в неделю</text>
+    <text x="24" y="94" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+          font-size="18" fill="#7D8590">(копия весит как база)</text>
+  </g>
+  <path d="M966 266 L966 281 L234 281 L234 296"
+        fill="none" stroke="#58A6FF" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="64" y="470" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+        font-size="19" fill="#7D8590">Порядок не случайный: архивы извлекают <tspan font-family="ui-monospace,SFMono-Regular,Menlo,monospace" fill="#ADBAC7">.hdx</tspan> на диск, и шаг HedEx подхватывает их тем же прогоном.</text>
+  <text x="64" y="498" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif"
+        font-size="19" fill="#7D8590">Шаги изолированы: падение одного не роняет остальные. Тот же конвейер зовёт ручной бэкфилл.</text>
+</svg>
