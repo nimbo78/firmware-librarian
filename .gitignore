@@ -34,3 +34,6 @@ fromChat/
 
 # --- Локальное состояние IDE-плагинов ---
 .serena/
+
+# --- Артефакты браузерных превью (playwright MCP) ---
+.playwright-mcp/
