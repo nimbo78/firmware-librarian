@@ -19,7 +19,7 @@ from telethon import Button, TelegramClient, events
 
 from kb_answer import answer_question, fw_llm_match
 from kb_firmware import split_query
-from kb_ingest import openai_client
+from kb_ingest import message_topic_id, openai_client
 from kb_render import (ADMIN_HELP_EXTRA, fmt_event, msg_link,
                        nav_category_view, nav_files_view, nav_model_view,
                        nav_root_view, render_grouped, user_help)
@@ -29,8 +29,30 @@ from tg_conn import proxy_kwargs
 API_ID = int(os.environ['TELEGRAM_API_ID'])
 API_HASH = os.environ['TELEGRAM_API_HASH']
 BOT_TOKEN = os.getenv('KB_BOT_TOKEN', '')
-ANSWER_CHAT_IDS = {int(x) for x in os.getenv('KB_ANSWER_CHAT_IDS', '').split(',')
-                   if x.strip()}
+def _parse_chat_topics(raw: str) -> dict[int, set[int]]:
+    """'-100123:15,-100123:22,-100999' -> {-100123: {15, 22}, -100999: set()}.
+
+    Пустой набор топиков = отвечаем в чате где угодно (обратная
+    совместимость со старым форматом «просто список чатов»). В форуме
+    иначе бот засоряет все топики подряд — а его ждут в одном-двух."""
+    out: dict[int, set[int]] = {}
+    for item in raw.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        chat, _, topic = item.partition(':')
+        topics = out.setdefault(int(chat), set())
+        if topic.strip():
+            topics.add(int(topic))
+    return out
+
+
+ANSWER_TOPICS = _parse_chat_topics(os.getenv('KB_ANSWER_CHAT_IDS', ''))
+ANSWER_CHAT_IDS = set(ANSWER_TOPICS)
+# Через сколько минут убирать за собой служебные сообщения (каталожные
+# простыни, «подожди», подсказки). 0 = не убирать. Ответы на вопросы не
+# трогаются никогда — это знание, ради которого всё затевалось.
+CLEANUP_MINUTES = int(os.getenv('KB_CLEANUP_MINUTES', '0') or 0)
 # Whitelist админов: telegram user id через запятую. Только им доступны
 # команды в личке и уведомления. Бот не может написать первым — админ
 # должен один раз нажать Start.
@@ -55,6 +77,8 @@ GAPS_POST_HOUR = 10
 # файлы уже в чате, простыня со списком больше не нужна (решение владельца)
 MSG_CLICKS_TO_DELETE = 3
 _msg_clicks: dict[tuple[int, int], int] = {}
+# (когда удалять, chat_id, msg_id) — очередь уборки за собой
+_cleanup: list[tuple[float, int, int]] = []
 
 
 # %(name)s подписывает источник: telethon.network.* — сетевой слой Telegram,
@@ -71,6 +95,54 @@ client = TelegramClient(SESSION, API_ID, API_HASH,
 store = open_store()
 _last_ask: dict[int, float] = {}
 _bot_username = ''
+
+
+def _topic_allowed(event) -> bool:
+    """Разрешён ли ответ в этом топике форума (см. _parse_chat_topics)."""
+    topics = ANSWER_TOPICS.get(event.chat_id)
+    if topics is None:
+        return False
+    if not topics:
+        return True
+    return message_topic_id(event.message) in topics
+
+
+def _schedule_cleanup(msg) -> None:
+    """Пометить сообщение к удалению через CLEANUP_MINUTES. Список живёт
+    в памяти: после рестарта хвост не удалится — приемлемо, как и со
+    счётчиками кликов."""
+    # в личке админа чистить нечего — там простыни никому не мешают
+    if (CLEANUP_MINUTES > 0 and msg is not None
+            and not getattr(msg, 'is_private', False)):
+        _cleanup.append((time.monotonic() + CLEANUP_MINUTES * 60,
+                         msg.chat_id, msg.id))
+
+
+async def _reply_temp(event, *args, **kwargs):
+    """Служебный ответ: сам удалится, чтобы не копиться в топике.
+    Заодно убирается и команда пользователя — если бот админ в группе."""
+    msg = await event.reply(*args, **kwargs)
+    _schedule_cleanup(msg)
+    _schedule_cleanup(event.message)
+    return msg
+
+
+async def cleanup_loop() -> None:
+    """Удаляет отслужившие служебные сообщения. Тик раз в 30 секунд."""
+    if CLEANUP_MINUTES <= 0:
+        return
+    while True:
+        await asyncio.sleep(30)
+        now = time.monotonic()
+        due = [x for x in _cleanup if x[0] <= now]
+        if not due or not client.is_connected():
+            continue
+        _cleanup[:] = [x for x in _cleanup if x[0] > now]
+        for _, chat_id, msg_id in due:
+            try:
+                await client.delete_messages(chat_id, msg_id)
+            except Exception as e:  # нет прав или сообщение уже удалено
+                logger.debug('cleanup skipped %s/%s: %s', chat_id, msg_id, e)
 
 
 def _extract_question(text: str) -> str | None:
@@ -132,7 +204,7 @@ async def _handle_sw(event, text: str) -> None:
     parts = text.split(maxsplit=1)
     arg = parts[1].strip() if len(parts) > 1 else ''
     if not arg:
-        await event.reply('Укажи модель: /sw S5735-S (можно с веткой: '
+        await _reply_temp('Укажи модель: /sw S5735-S (можно с веткой: '
                           '/sw S5735-S R024)')
         return
     model_query, version_tokens = split_query(arg)
@@ -141,11 +213,11 @@ async def _handle_sw(event, text: str) -> None:
         rows = [r for r in rows
                 if all(t in (r[1] or '').upper() for t in version_tokens)]
     if not rows:
-        await event.reply(f'По «{arg}» в каталоге пусто. Попробуй /fw {arg} '
+        await _reply_temp(f'По «{arg}» в каталоге пусто. Попробуй /fw {arg} '
                           f'(там есть LLM-подбор) или /download <начало имени>.')
         return
     out, buttons, _ = render_grouped(rows, arg, model_query)
-    await event.reply(out[:4000], link_preview=False, buttons=buttons or None)
+    await _reply_temp(out[:4000], link_preview=False, buttons=buttons or None)
 
 
 DOWNLOAD_BATCH_LIMIT = 12
@@ -158,7 +230,7 @@ async def _handle_download(event, text: str) -> None:
     parts = text.split(maxsplit=1)
     prefix = parts[1].strip() if len(parts) > 1 else ''
     if len(prefix) < 8:
-        await event.reply('Дай начало имени файла (минимум 8 символов): '
+        await _reply_temp('Дай начало имени файла (минимум 8 символов): '
                           '/download iMasterNCEServerInstall_V100R022C00SPC908')
         return
     rows = store.files_by_prefix(prefix, limit=DOWNLOAD_BATCH_LIMIT + 1)
@@ -169,16 +241,16 @@ async def _handle_download(event, text: str) -> None:
             on_disk.append((name, path))
     if not on_disk:
         if rows:
-            await event.reply('Файлы с таким именем есть в каталоге, но на '
+            await _reply_temp('Файлы с таким именем есть в каталоге, но на '
                               'диске NAS их нет — качай по ссылкам из /fw.')
         else:
-            await event.reply(f'Ничего не начинается с «{prefix[:60]}».')
+            await _reply_temp(f'Ничего не начинается с «{prefix[:60]}».')
         return
     truncated = len(on_disk) > DOWNLOAD_BATCH_LIMIT
     on_disk = on_disk[:DOWNLOAD_BATCH_LIMIT]
     note = (f' (первые {DOWNLOAD_BATCH_LIMIT}, уточни префикс для остальных)'
             if truncated else '')
-    await event.reply(f'Отправляю {len(on_disk)} файл(ов){note} — большие '
+    await _reply_temp(f'Отправляю {len(on_disk)} файл(ов){note} — большие '
                       f'идут долго…')
     logger.info('Download batch "%s": %d files to %s (asked by %s)',
                 prefix[:60], len(on_disk), event.chat_id, event.sender_id)
@@ -192,7 +264,7 @@ async def _handle_download(event, text: str) -> None:
         except Exception as e:
             logger.warning('download batch send failed for %s: %s', name, e)
     if sent < len(on_disk):
-        await event.reply(f'Отправлено {sent} из {len(on_disk)} — остальные '
+        await _reply_temp(f'Отправлено {sent} из {len(on_disk)} — остальные '
                           f'не ушли, детали в логах.')
 
 
@@ -201,7 +273,7 @@ async def _handle_fw(event, text: str) -> None:
     arg = parts[1].strip() if len(parts) > 1 else ''
     if not arg:
         nav_text, nav_buttons = nav_root_view(store)
-        await event.reply(nav_text, buttons=nav_buttons or None)
+        await _reply_temp(nav_text, buttons=nav_buttons or None)
         return
     # 'S5735-S-V2 R025': версия отдельным словом — фильтр, а не часть модели
     model_query, version_tokens = split_query(arg)
@@ -253,7 +325,7 @@ async def _handle_fw(event, text: str) -> None:
                     [Button.inline(f'📎 {name[:40]}', f'g:{doc_id}'.encode())])
         text_out += '\n'.join(lines)
     # пометка LLM — в начале: хвост может обрезаться лимитом 4096
-    await event.reply((llm_note + text_out)[:4000],
+    await _reply_temp((llm_note + text_out)[:4000],
                       link_preview=False, buttons=buttons or None)
 
 
@@ -484,12 +556,12 @@ async def handler(event):
         if event.sender_id in ADMIN_IDS:
             await handle_admin(event)
         return  # личка не-админов игнорируется
-    if event.chat_id not in ANSWER_CHAT_IDS:
-        return
+    if not _topic_allowed(event):
+        return          # чужой чат или топик, где бота не ждут
     text = (event.raw_text or '').strip()
     low = text.lower()
     if low.startswith(('/help', '/start')):
-        await event.reply(user_help(_bot_username))
+        await _reply_temp(user_help(_bot_username))
         return
     if low.startswith('/fw'):
         await _handle_fw(event, text)  # без кулдауна: дёшево, без LLM
@@ -501,7 +573,7 @@ async def handler(event):
         # кулдаун: пачка до 12 больших файлов — лёгкий вектор флуда в группе
         now = time.monotonic()
         if now - _last_ask.get(event.sender_id, 0.0) < COOLDOWN_SECONDS:
-            await event.reply('Подожди немного перед следующей пачкой файлов.')
+            await _reply_temp('Подожди немного перед следующей пачкой файлов.')
             return
         _last_ask[event.sender_id] = now
         await _handle_download(event, text)
@@ -518,11 +590,11 @@ async def handler(event):
             return
         question = text  # follow-up без команды
     if not question:
-        await event.reply('Напиши вопрос после команды: /ask как прошить ONT')
+        await _reply_temp('Напиши вопрос после команды: /ask как прошить ONT')
         return
     now = time.monotonic()
     if now - _last_ask.get(event.sender_id, 0.0) < COOLDOWN_SECONDS:
-        await event.reply('Подожди немного перед следующим вопросом.')
+        await _reply_temp('Подожди немного перед следующим вопросом.')
         return
     _last_ask[event.sender_id] = now
     await _send_answer(event, question, parent_qa_id=parent_qa)
@@ -737,6 +809,7 @@ async def run() -> None:
     backoff = initial_backoff
     notifier_task = asyncio.create_task(notifier_loop())  # живут поверх реконнектов
     gaps_task = asyncio.create_task(gaps_loop())
+    cleanup_task = asyncio.create_task(cleanup_loop())
     while True:
         try:
             await client.start(bot_token=BOT_TOKEN)

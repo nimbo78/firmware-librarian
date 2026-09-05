@@ -70,6 +70,7 @@ services:
       EMBED_API_KEY: ${EMBED_API_KEY:-}
       ANSWER_MODEL: ${ANSWER_MODEL:-gpt-5-mini}
       KB_WEB: ${KB_WEB:-0}
+      KB_CLEANUP_MINUTES: ${KB_CLEANUP_MINUTES:-0}
     volumes:
       - /volume1/docker/tg-kb:/app/kb
       # read-only: бот только отдаёт файлы по кнопке 📎 в /fw, пишет — качалка
