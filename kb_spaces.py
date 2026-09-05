@@ -195,9 +195,12 @@ def _space_from_table(slug: str, tbl: dict) -> Space:
     if not isinstance(tbl, dict):
         raise ValueError(f'spaces.toml: [{slug}] должен быть таблицей')
     chats = tuple(int(x) for x in tbl.get('chats', ()))
-    answer = parse_chat_topics(tbl.get('answer', ()))
-    if not answer:
-        answer = {chat: set() for chat in chats}
+    # ключ отсутствует = отвечаем во всех чатах-источниках (обычный случай:
+    # это одни и те же чаты); ПУСТОЙ список = не отвечаем нигде — режим
+    # «только копим знания» для больших публичных чатов
+    raw_answer = tbl.get('answer')
+    answer = (parse_chat_topics(raw_answer) if raw_answer is not None
+              else {chat: set() for chat in chats})
     catalog = str(tbl.get('catalog', 'none'))
     scope = str(tbl.get('default_scope', 'home'))
     if catalog not in CATALOGS:
@@ -311,10 +314,20 @@ title = "B4"
 persona = "администраторов B4 и MikroTik"
 chats = [-2001, -2002]
 default_scope = "all"
+
+[quiet]
+title = "Только чтение"
+chats = [-3001]
+answer = []
 ''')
         sp = load_spaces(path=path)
-        assert sp.slugs == ('huawei', 'b4') and sp.default.slug == 'huawei'
+        assert sp.slugs == ('huawei', 'b4', 'quiet') and sp.default.slug == 'huawei'
         hw, b4 = sp.get('huawei'), sp.get('b4')
+        # пустой answer = «копим знания, но не отвечаем»; отсутствие ключа —
+        # наоборот, отвечаем во всех чатах-источниках
+        assert sp.get('quiet').answer == {} and sp.get('quiet').chats == (-3001,)
+        assert -3001 not in sp.answer_topics()
+        assert sp.for_chat(-3001).slug == 'quiet', 'знания всё равно свои'
         assert hw.answer == {-1001: {15, 22}} and hw.gaps_topic == 22
         assert hw.download_extensions == ('pdf', 'hdx', 'zip')
         assert b4.answer == {-2001: set(), -2002: set()}, 'answer по умолчанию = chats'
