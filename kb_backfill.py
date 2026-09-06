@@ -150,8 +150,9 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
     # в RAG — иначе их файлы невидимы для /fw и кнопок 📎
     chat_space = {c: s for s in spaces.all for c in s.chats}
     chat_ids = list(chat_space)
-    extra = {c: s for s in spaces.all for c in s.download_chats
-             if c not in chat_space}
+    # только каталогизируем (без RAG): чаты качалки, не заявленные в chats
+    catalog_only = {c: s for s in spaces.all for c in s.download_chats
+                    if c not in chat_space}
     spent = 0.0
     stopped = False
     # политика обогащения — своя у каждой области (см. MediaPolicy)
@@ -176,16 +177,17 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
             stopped = True
             break
         spent += stats.cost
-        extra = f', удалено устаревших чанков: {stats.pruned}' if stats.pruned else ''
+        pruned_note = (f', удалено устаревших чанков: {stats.pruned}'
+                       if stats.pruned else '')
         print(f'  {stats.messages} сообщений -> {stats.new_chunks} чанков'
-              f'{extra}, ~${stats.cost:.2f}')
+              f'{pruned_note}, ~${stats.cost:.2f}')
     # Каталогизация документов из чатов качалки, не входящих в KB_CHAT_IDS:
     # без инжеста в RAG, только files/firmware — иначе файлы, скачанные из
     # «не-KB» чатов, невидимы для /fw и кнопок 📎
-    if not stopped and extra:
+    if not stopped and catalog_only:
         from kb_firmware import document_filename, record_file
         from kb_ingest import fetch_topic_names, message_topic_id
-        for chat_id, space in extra.items():
+        for chat_id, space in catalog_only.items():
             print(f'Каталог (без инжеста): {chat_id}...', flush=True)
             topics = await fetch_topic_names(client, chat_id)
             recorded = 0
