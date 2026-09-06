@@ -326,10 +326,31 @@ async def enrich_message(store, msg, enrich_media: bool = True,
                             else:
                                 data, mime = converted, 'image/jpeg'
                         if data:
-                            cached = await describe_image(data, mime)
-                            cost += VISION_COST_PER_IMAGE
-                            await remember_media(store, key, cached,
-                                                 VISION_COST_PER_IMAGE)
+                            try:
+                                cached = await describe_image(data, mime)
+                            except Exception as e:
+                                # Заявленный mime бывает враньём: документ с
+                                # image/png внутри оказывается чем угодно, и
+                                # vision отвечает 400 invalid_image_format.
+                                # Ретрай тут бесполезен (400 не тарифицируется,
+                                # но повторяется каждый прогон) — зато помогает
+                                # пережатие через Pillow.
+                                if 'invalid_image_format' not in str(e):
+                                    raise
+                                converted = _to_jpeg(data)
+                                if converted is None:
+                                    # не картинка вовсе — пропуск навсегда
+                                    await remember_media(store, key, '', 0.0)
+                                    logger.info('vision skip (битый %s) для %s/%s',
+                                                mime, msg.chat_id, msg.id)
+                                    data = None
+                                else:
+                                    cached = await describe_image(converted,
+                                                                  'image/jpeg')
+                            if data:
+                                cost += VISION_COST_PER_IMAGE
+                                await remember_media(store, key, cached,
+                                                     VISION_COST_PER_IMAGE)
                     else:
                         await remember_media(store, key, '', 0.0)  # слишком большое
                 except Exception as e:

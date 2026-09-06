@@ -312,25 +312,34 @@ class SqliteVecStore:
                 space = c.space or self.default_space
                 fields = (c.chat_id, c.topic_id, c.topic_name, c.date_from, c.date_to,
                           c.msg_first, c.msg_last, c.authors, c.text, space)
-                row = self.db.execute(
-                    'SELECT rowid FROM chunks WHERE id = ?', (c.id,)).fetchone()
-                if row:
-                    # НЕ INSERT OR REPLACE: REPLACE меняет rowid и отвязывает vec/fts
-                    rowid = row[0]
-                    self.db.execute('''
-                        UPDATE chunks SET chat_id=?, topic_id=?, topic_name=?,
-                            date_from=?, date_to=?, msg_first=?, msg_last=?,
-                            authors=?, text=?, space=?
-                        WHERE rowid=?''', fields + (rowid,))
-                    self.db.execute('DELETE FROM chunks_vec WHERE rowid=?', (rowid,))
-                    self.db.execute('DELETE FROM chunks_fts WHERE rowid=?', (rowid,))
-                else:
-                    cur = self.db.execute('''
-                        INSERT INTO chunks(id, chat_id, topic_id, topic_name,
-                            date_from, date_to, msg_first, msg_last, authors, text,
-                            space)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?)''', (c.id,) + fields)
-                    rowid = cur.lastrowid
+                # Одним оператором: вставка или обновление на месте.
+                # НЕ INSERT OR REPLACE — REPLACE меняет rowid и отвязывает
+                # vec/fts; ON CONFLICT DO UPDATE правит существующую строку,
+                # rowid сохраняется. И НЕ «SELECT, потом INSERT/UPDATE»:
+                # SELECT в python-sqlite3 идёт в автокоммите, то есть ДО
+                # начала пишущей транзакции — сосед (ночной инжест того же
+                # чата, второй бэкфилл) успевал вставить тот же id между
+                # проверкой и вставкой, и прогон падал на UNIQUE constraint.
+                self.db.execute('''
+                    INSERT INTO chunks(id, chat_id, topic_id, topic_name,
+                        date_from, date_to, msg_first, msg_last, authors, text,
+                        space)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        chat_id=excluded.chat_id, topic_id=excluded.topic_id,
+                        topic_name=excluded.topic_name,
+                        date_from=excluded.date_from, date_to=excluded.date_to,
+                        msg_first=excluded.msg_first, msg_last=excluded.msg_last,
+                        authors=excluded.authors, text=excluded.text,
+                        space=excluded.space''', (c.id,) + fields)
+                # rowid читается уже внутри пишущей транзакции — сосед в неё
+                # не вклинится; lastrowid после DO UPDATE недостоверен
+                rowid = self.db.execute(
+                    'SELECT rowid FROM chunks WHERE id = ?', (c.id,)).fetchone()[0]
+                # для новой строки это no-op, для обновлённой — снятие старых
+                # вектора и полнотекста перед записью новых
+                self.db.execute('DELETE FROM chunks_vec WHERE rowid=?', (rowid,))
+                self.db.execute('DELETE FROM chunks_fts WHERE rowid=?', (rowid,))
                 self.db.execute(
                     'INSERT INTO chunks_vec(rowid, space, embedding) VALUES(?,?,?)',
                     (rowid, space, _f32(c.embedding)))
@@ -1044,6 +1053,28 @@ def _selftest() -> None:
 
         hits = store.search('где лежит прошивка MA5608T', vec(0), top_k=2)
         assert hits and 'MA5608T' in hits[0].text, hits
+
+        # Гонка двух писателей: сосед (ночной инжест, второй бэкфилл) вставил
+        # тот же id между нашей проверкой и записью. Прод падал здесь на
+        # UNIQUE constraint failed: chunks.id
+        neighbour = SqliteVecStore(os.path.join(tmp, 'kb.sqlite'), dim)
+        same = Chunk(-1001234, 2, 'Прошивки', '2026-01-04', '2026-01-04', 40, 45,
+                     'ivan', 'вариант соседа', vec(3))
+        neighbour.upsert_chunks([same])
+        mine = Chunk(-1001234, 2, 'Прошивки', '2026-01-04', '2026-01-04', 40, 45,
+                     'ivan', 'наш вариант', vec(3))
+        store.upsert_chunks([mine])      # не должно падать
+        neighbour.close()
+        row = store.db.execute('SELECT rowid, text FROM chunks WHERE id=?',
+                               (mine.id,)).fetchone()
+        assert row and row[1] == 'наш вариант', row
+        # rowid сохранился, значит вектор и полнотекст не отвязались
+        for tbl in ('chunks_vec', 'chunks_fts'):
+            n = store.db.execute(
+                f'SELECT count(*) FROM {tbl} WHERE rowid=?', (row[0],)).fetchone()[0]
+            assert n == 1, (tbl, n)
+        assert store.prune_chunks(-1001234, [c.id for c in chunks]) == 1
+        assert store.count() == 3
 
         # лексический хит: вектор указывает мимо, точное слово решает
         hits = store.search('S5735', vec(2), top_k=3)
