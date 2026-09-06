@@ -168,6 +168,31 @@ async def _dry_run(client, spaces) -> None:
     print('Подсказка: --max-cost N остановит боевой прогон при достижении N$.')
 
 
+def _finish(store, spent: float, outcome: str) -> None:
+    """Итог прогона — один на все исходы: конец, лимит бюджета, Ctrl+C.
+
+    Прерывание безопасно ровно по той же причине, что и лимит: чанки пишутся
+    пачками в транзакциях, media_cache — по одному элементу, а last_seen_id
+    двигается только после успешной обработки чата. Поэтому обещание везде
+    одно: повторный запуск продолжит без двойной оплаты."""
+    print(f'\nЧанков в базе: {store.count()}. '
+          f'Потрачено в этом прогоне: ~${spent:.2f}')
+    if outcome == 'budget':
+        print('ЛИМИТ БЮДЖЕТА ДОСТИГНУТ. Обработанное закэшировано — пополни '
+              'баланс API и запусти повторно, прогон продолжит с места '
+              'остановки без двойной оплаты.')
+        store.add_event('backfill', f'Бэкфилл ОСТАНОВЛЕН по лимиту бюджета, '
+                                    f'чанков: {store.count()}', spent)
+    elif outcome == 'interrupted':
+        print('ПРЕРВАНО (Ctrl+C). Обработанное сохранено — повторный запуск '
+              'продолжит с места остановки без двойной оплаты.')
+        store.add_event('backfill', f'Бэкфилл прерван вручную, '
+                                    f'чанков: {store.count()}', spent)
+    else:
+        store.add_event('backfill',
+                        f'Бэкфилл завершён, чанков в базе: {store.count()}', spent)
+
+
 async def _local_only(spaces, max_cost: float | None) -> None:
     """--local-only: без подключения к Telegram (сессию не трогает, качалку
     можно не гасить) — весь пост-инжест конвейер kb_pipeline. Нужен только
@@ -175,15 +200,15 @@ async def _local_only(spaces, max_cost: float | None) -> None:
     но осмысленнее не пересекаться по времени."""
     from kb_pipeline import run_post_ingest
     store = open_store()
-    spent, stopped = await run_post_ingest(store, spaces, budget=max_cost,
-                                           progress=_progress, report='print')
-    print(f'\nЧанков в базе: {store.count()}. Потрачено: ~${spent:.2f}')
-    if stopped:
-        print('ЛИМИТ БЮДЖЕТА ДОСТИГНУТ — повторный запуск продолжит без '
-              'двойной оплаты.')
-    store.add_event('backfill',
-                    f'Локальный прогон (--local-only) завершён, чанков: '
-                    f'{store.count()}', spent)
+    try:
+        spent, stopped = await run_post_ingest(store, spaces, budget=max_cost,
+                                               progress=_progress, report='print')
+    except KeyboardInterrupt:
+        # шаги конвейера идемпотентны и метят сделанное в state, так что
+        # прерывание стоит только незавершённого шага
+        _finish(store, 0.0, 'interrupted')
+        raise SystemExit(130)
+    _finish(store, spent, 'budget' if stopped else 'done')
 
 
 async def _backfill(client, spaces, max_cost: float | None) -> None:
@@ -206,113 +231,110 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
     def remaining() -> float | None:
         return None if max_cost is None else max(max_cost - spent, 0.0)
 
-    # Этап 1: только текст (быстро и дёшево) — база отвечает уже после него.
-    # Медиа входит в чанки плейсхолдерами, поэтому границы окончательные.
-    for n, chat_id in enumerate(chat_ids, 1):
-        print(f'[1/3] Текст: {chat_id} (чат {n} из {len(chat_ids)})...', flush=True)
-        try:
-            stats = await ingest_chat(client, store, chat_id, min_id=0,
-                                      progress=_progress, max_cost=remaining(),
-                                      enrich_media=False,
-                                      space=chat_space[chat_id].slug)
-        except BudgetExceeded as e:
-            spent += e.cost
-            stopped = True
-            break
-        spent += stats.cost
-        media_total[chat_id] = stats.media_seen
-        pruned_note = (f', удалено устаревших чанков: {stats.pruned}'
-                       if stats.pruned else '')
-        print(f'  {stats.messages} сообщений -> {stats.new_chunks} чанков'
-              f'{pruned_note}, ~${stats.cost:.2f}')
-    # Каталогизация документов из чатов качалки, не входящих в KB_CHAT_IDS:
-    # без инжеста в RAG, только files/firmware — иначе файлы, скачанные из
-    # «не-KB» чатов, невидимы для /fw и кнопок 📎
-    if not stopped and catalog_only:
-        from kb_firmware import document_filename, record_file
-        from kb_ingest import fetch_topic_names, message_topic_id
-        for chat_id, space in catalog_only.items():
-            print(f'Каталог (без инжеста): {chat_id}...', flush=True)
-            topics = await fetch_topic_names(client, chat_id)
-            recorded = 0
-            async for msg in client.iter_messages(chat_id, reverse=True):
-                if msg.document is None:
-                    continue
-                fname = document_filename(msg)
-                if not fname:
-                    continue
-                record_file(store, msg, fname,
-                            topics.get(message_topic_id(msg), ''),
-                            space=space.slug)
-                recorded += 1
-            print(f'  документов закаталогизировано: {recorded}')
-    # Этап 2: vision/whisper — только наполнение кэша, чанки не трогаем
-    if media_wanted and not stopped:
+    try:
+        # Этап 1: только текст (быстро и дёшево) — база отвечает уже после него.
+        # Медиа входит в чанки плейсхолдерами, поэтому границы окончательные.
         for n, chat_id in enumerate(chat_ids, 1):
-            total = media_total.get(chat_id, 0)
-            print(f'[2/3] Медиа: {chat_id} (чат {n} из {len(chat_ids)}), '
-                  f'всего медиа: {total}...', flush=True)
-            if not (chat_media[chat_id].vision or chat_media[chat_id].voice):
-                print('  обогащение выключено для этой области — пропуск')
-                continue
-            if not total:
-                print('  медиа в чате нет — пропуск')
-                continue
-            try:
-                paid, cost = await enrich_chat_media(client, store, chat_id,
-                                                     progress=_progress,
-                                                     max_cost=remaining(),
-                                                     media=chat_media[chat_id],
-                                                     total=total)
-            except BudgetExceeded as e:
-                spent += e.cost
-                stopped = True
-                break
-            spent += cost
-            cached = max(total - paid, 0)
-            print(f'  оплачено в этом прогоне: {paid}, ~${cost:.2f} '
-                  f'(из кэша: {cached})')
-
-    # Этап 3: пересборка чанков с описаниями из кэша; переэмбеддятся
-    # только изменившиеся (id те же — сравнение по хэшу текста)
-    if media_wanted and not stopped:
-        for n, chat_id in enumerate(chat_ids, 1):
-            print(f'[3/3] Чанки с медиа: {chat_id} '
-                  f'(чат {n} из {len(chat_ids)})...', flush=True)
+            print(f'[1/3] Текст: {chat_id} (чат {n} из {len(chat_ids)})...', flush=True)
             try:
                 stats = await ingest_chat(client, store, chat_id, min_id=0,
-                                          progress=_progress,
-                                          max_cost=remaining(),
-                                          space=chat_space[chat_id].slug,
-                                          media=chat_media[chat_id])
+                                          progress=_progress, max_cost=remaining(),
+                                          enrich_media=False,
+                                          space=chat_space[chat_id].slug)
             except BudgetExceeded as e:
                 spent += e.cost
                 stopped = True
                 break
             spent += stats.cost
-            print(f'  обновлено чанков: {stats.new_chunks}, ~${stats.cost:.2f}')
-    if not stopped:
-        # общий пост-инжест конвейер: каталог -> PDF -> архивы -> HedEx ->
-        # экстракция -> бэкап (kb_pipeline, тот же путь, что у ночного джоба)
-        from kb_pipeline import run_post_ingest
-        more, stopped = await run_post_ingest(store, spaces,
-                                              budget=remaining(),
+            media_total[chat_id] = stats.media_seen
+            pruned_note = (f', удалено устаревших чанков: {stats.pruned}'
+                           if stats.pruned else '')
+            print(f'  {stats.messages} сообщений -> {stats.new_chunks} чанков'
+                  f'{pruned_note}, ~${stats.cost:.2f}')
+        # Каталогизация документов из чатов качалки, не входящих в KB_CHAT_IDS:
+        # без инжеста в RAG, только files/firmware — иначе файлы, скачанные из
+        # «не-KB» чатов, невидимы для /fw и кнопок 📎
+        if not stopped and catalog_only:
+            from kb_firmware import document_filename, record_file
+            from kb_ingest import fetch_topic_names, message_topic_id
+            for chat_id, space in catalog_only.items():
+                print(f'Каталог (без инжеста): {chat_id}...', flush=True)
+                topics = await fetch_topic_names(client, chat_id)
+                recorded = 0
+                async for msg in client.iter_messages(chat_id, reverse=True):
+                    if msg.document is None:
+                        continue
+                    fname = document_filename(msg)
+                    if not fname:
+                        continue
+                    record_file(store, msg, fname,
+                                topics.get(message_topic_id(msg), ''),
+                                space=space.slug)
+                    recorded += 1
+                print(f'  документов закаталогизировано: {recorded}')
+        # Этап 2: vision/whisper — только наполнение кэша, чанки не трогаем
+        if media_wanted and not stopped:
+            for n, chat_id in enumerate(chat_ids, 1):
+                total = media_total.get(chat_id, 0)
+                print(f'[2/3] Медиа: {chat_id} (чат {n} из {len(chat_ids)}), '
+                      f'всего медиа: {total}...', flush=True)
+                if not (chat_media[chat_id].vision or chat_media[chat_id].voice):
+                    print('  обогащение выключено для этой области — пропуск')
+                    continue
+                if not total:
+                    print('  медиа в чате нет — пропуск')
+                    continue
+                try:
+                    paid, cost = await enrich_chat_media(client, store, chat_id,
+                                                         progress=_progress,
+                                                         max_cost=remaining(),
+                                                         media=chat_media[chat_id],
+                                                         total=total)
+                except BudgetExceeded as e:
+                    spent += e.cost
+                    stopped = True
+                    break
+                spent += cost
+                cached = max(total - paid, 0)
+                print(f'  оплачено в этом прогоне: {paid}, ~${cost:.2f} '
+                      f'(из кэша: {cached})')
+
+        # Этап 3: пересборка чанков с описаниями из кэша; переэмбеддятся
+        # только изменившиеся (id те же — сравнение по хэшу текста)
+        if media_wanted and not stopped:
+            for n, chat_id in enumerate(chat_ids, 1):
+                print(f'[3/3] Чанки с медиа: {chat_id} '
+                      f'(чат {n} из {len(chat_ids)})...', flush=True)
+                try:
+                    stats = await ingest_chat(client, store, chat_id, min_id=0,
                                               progress=_progress,
-                                              report='print')
-        spent += more
-    else:
-        store.backup()
-    print(f'\nЧанков в базе: {store.count()}. Потрачено в этом прогоне: ~${spent:.2f}')
-    if stopped:
-        print('ЛИМИТ БЮДЖЕТА ДОСТИГНУТ. Обработанное закэшировано — пополни '
-              'баланс API и запусти бэкфилл повторно, он продолжит с места '
-              'остановки без двойной оплаты.')
-        store.add_event('backfill',
-                        f'Бэкфилл ОСТАНОВЛЕН по лимиту бюджета, чанков: {store.count()}',
-                        spent)
-    else:
-        store.add_event('backfill',
-                        f'Бэкфилл завершён, чанков в базе: {store.count()}', spent)
+                                              max_cost=remaining(),
+                                              space=chat_space[chat_id].slug,
+                                              media=chat_media[chat_id])
+                except BudgetExceeded as e:
+                    spent += e.cost
+                    stopped = True
+                    break
+                spent += stats.cost
+                print(f'  обновлено чанков: {stats.new_chunks}, ~${stats.cost:.2f}')
+        if not stopped:
+            # общий пост-инжест конвейер: каталог -> PDF -> архивы -> HedEx ->
+            # экстракция -> бэкап (kb_pipeline, тот же путь, что у ночного джоба)
+            from kb_pipeline import run_post_ingest
+            more, stopped = await run_post_ingest(store, spaces,
+                                                  budget=remaining(),
+                                                  progress=_progress,
+                                                  report='print')
+            spent += more
+        else:
+            store.backup()
+        _finish(store, spent, 'budget' if stopped else 'done')
+    except KeyboardInterrupt:
+        # Ctrl+C безопасен ровно по той же причине, что и лимит бюджета:
+        # чанки пишутся пачками в транзакциях, media_cache — по одному
+        # элементу, а state двигается только после успешной обработки чата
+        _finish(store, spent, 'interrupted')
+        raise SystemExit(130)
 
 
 async def main() -> None:
@@ -380,4 +402,9 @@ async def main() -> None:
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # прерывание вне этапов: подключение к Telegram, --dry-run
+        print('\nПрервано.')
+        raise SystemExit(130)

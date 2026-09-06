@@ -51,16 +51,20 @@ from kb_ingest import IngestStats  # noqa: E402
 from kb_spaces import load_spaces  # noqa: E402
 
 
-def _quiet(spaces, max_cost) -> str:
+def _quiet(spaces, max_cost) -> tuple[str, object]:
     """Прогон бэкфилла с перехватом вывода.
 
     Бэкфилл печатает прогресс и сообщение про исчерпанный бюджет — в тесте
     это сбивает с толку (выглядит как реальная проблема с балансом API),
     поэтому наружу вывод идёт только при провале проверки."""
     buf = io.StringIO()
+    code = None
     with contextlib.redirect_stdout(buf):
-        asyncio.run(B._backfill(FakeClient(), spaces, max_cost))
-    return buf.getvalue()
+        try:
+            asyncio.run(B._backfill(FakeClient(), spaces, max_cost))
+        except SystemExit as e:      # Ctrl+C выходит кодом, а не traceback'ом
+            code = e.code
+    return buf.getvalue(), code
 
 
 class FakeMsg:
@@ -117,8 +121,9 @@ def _selftest() -> None:
     kb_ingest.message_topic_id = lambda msg: 1
 
     spaces = load_spaces()
-    out = _quiet(spaces, None)
+    out, code = _quiet(spaces, None)
     try:
+        assert code is None, code
         # Этапы 1 и 3 прошли по обоим чатам-источникам, с правильными областями
         assert (-1001, 'huawei', False) in calls['ingest'], calls['ingest']
         assert (-2001, 'b4', False) in calls['ingest'], calls['ingest']
@@ -135,7 +140,7 @@ def _selftest() -> None:
         # полном прогоне, через час работы
         assert calls['catalog'] == [('S5735-L_V200R019.cc', 'huawei')], calls['catalog']
         assert calls['pipeline'] == ['print'], calls['pipeline']
-        print('  1/2 обычный прогон: этапы, каталогизация, политика медиа — OK')
+        print('  1/3 обычный прогон: этапы, каталогизация, политика медиа — OK')
 
         # Бюджет: BudgetExceeded на первом же чате обрывает всё, конвейер не зовём
         calls['ingest'].clear(); calls['media'].clear(); calls['pipeline'].clear()
@@ -144,10 +149,24 @@ def _selftest() -> None:
             raise kb_ingest.BudgetExceeded(1.5)
 
         B.ingest_chat = broke
-        out = _quiet(spaces, 1.0)
+        out, code = _quiet(spaces, 1.0)
+        assert code is None, 'лимит бюджета — не аварийный выход'
         assert calls['media'] == [] and calls['pipeline'] == [], calls
         assert 'ЛИМИТ БЮДЖЕТА' in out, out   # пользователю обязаны объяснить
-        print('  2/2 обрыв по бюджету (подделан в тесте, денег не тратит) — OK')
+        print('  2/3 обрыв по бюджету (подделан в тесте, денег не тратит) — OK')
+
+        # Ctrl+C: вместо traceback — итог с обещанием продолжить и код 130
+        calls['ingest'].clear(); calls['pipeline'].clear()
+
+        async def interrupted(*a, **kw):
+            raise KeyboardInterrupt
+
+        B.ingest_chat = interrupted
+        out, code = _quiet(spaces, None)
+        assert code == 130, code
+        assert 'ПРЕРВАНО' in out and 'без двойной оплаты' in out, out
+        assert calls['pipeline'] == [], 'после Ctrl+C конвейер запускать нельзя'
+        print('  3/3 Ctrl+C: итог напечатан, код возврата 130 — OK')
     except AssertionError:
         print('--- вывод бэкфилла ---\n' + out)
         raise
