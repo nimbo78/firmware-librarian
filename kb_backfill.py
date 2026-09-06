@@ -172,31 +172,31 @@ async def _dry_run(client, spaces) -> None:
     for space in spaces.all:
         media = media_policy(space.vision, space.voice)
         for chat_id in space.chats:
-            print(f'Сканирую {chat_id} — вся история, на большом чате это '
-                  f'минуты/десятки минут...', flush=True)
-            st = await scan_chat(client, chat_id, progress=lambda n: print(
-                f'  просмотрено сообщений: {n}', flush=True))
+            _progress.say(f'Сканирую {chat_id} — вся история, на большом чате это '
+                  f'минуты/десятки минут...')
+            st = await scan_chat(client, chat_id, progress=lambda n: _progress.say(
+                f'  просмотрено сообщений: {n}'))
             embed = st.chars / 3 / 1e6 * EMBED_PRICE_PER_MTOK
             vision = st.images * VISION_COST_PER_IMAGE if media.vision else 0.0
             voice = (st.voice_seconds / 60 * WHISPER_PRICE_PER_MIN
                      if media.voice else 0.0)
             total += embed + vision + voice
-            print(f'{chat_id} (область {space.slug}):')
-            print(f'  сообщений: {st.messages}, ~{st.chars // 3} токенов '
+            _progress.say(f'{chat_id} (область {space.slug}):')
+            _progress.say(f'  сообщений: {st.messages}, ~{st.chars // 3} токенов '
                   f'-> эмбеддинги ~${embed:.2f}')
             mark = '' if media.vision else ' (vision выключен — не считается)'
-            print(f'  картинок: {st.images} -> vision ~${vision:.2f}{mark}')
+            _progress.say(f'  картинок: {st.images} -> vision ~${vision:.2f}{mark}')
             mark = '' if media.voice else ' (whisper выключен — не считается)'
-            print(f'  голосовых: {st.voice_seconds // 60} мин '
+            _progress.say(f'  голосовых: {st.voice_seconds // 60} мин '
                   f'-> whisper ~${voice:.2f}{mark}')
     from kb_archive import archive_enabled
     from kb_hedex import hedex_enabled
     if not pdf_enabled():
-        print('PDF: KB_PDF выключен — не считается')
+        _progress.say('PDF: KB_PDF выключен — не считается')
     if not archive_enabled():
-        print('Архивы: KB_ARCHIVE выключен — не считается')
+        _progress.say('Архивы: KB_ARCHIVE выключен — не считается')
     if not hedex_enabled():
-        print('HedEx: KB_HEDEX выключен — не считается')
+        _progress.say('HedEx: KB_HEDEX выключен — не считается')
     store = open_store()
     for space in spaces.all:
         if not space.folder:
@@ -207,25 +207,25 @@ async def _dry_run(client, spaces) -> None:
             # ~1800 символов на страницу мануала — грубая оценка
             pdf_cost = pages * 1800 / 3 / 1e6 * EMBED_PRICE_PER_MTOK
             total += pdf_cost
-            print(f'PDF в {space.folder}: {files} файлов, {pages} страниц '
+            _progress.say(f'PDF в {space.folder}: {files} файлов, {pages} страниц '
                   f'-> эмбеддинги ~${pdf_cost:.2f}')
         if archive_enabled():
             from kb_archive import scan_archives
             files, chars = scan_archives(store, space.folder, space=space.slug)
             arc_cost = chars / 3 / 1e6 * EMBED_PRICE_PER_MTOK
             total += arc_cost
-            print(f'Архивы в {space.folder}: новых {files} '
+            _progress.say(f'Архивы в {space.folder}: новых {files} '
                   f'-> эмбеддинги ~${arc_cost:.2f} (грубая оценка по листингам)')
         if hedex_enabled():
             from kb_hedex import scan_hdx
             files, chars = scan_hdx(store, space.folder, space=space.slug)
             hedex_cost = chars / 3 / 1e6 * EMBED_PRICE_PER_MTOK
             total += hedex_cost
-            print(f'HedEx в {space.folder}: новых пакетов {files} '
+            _progress.say(f'HedEx в {space.folder}: новых пакетов {files} '
                   f'-> эмбеддинги ~${hedex_cost:.2f} (без кросс-версионного '
                   f'дедупа — реально будет меньше)')
-    print(f'\nИтого оценка: ~${total:.2f}')
-    print('Подсказка: --max-cost N остановит боевой прогон при достижении N$.')
+    _progress.say(f'\nИтого оценка: ~${total:.2f}')
+    _progress.say('Подсказка: --max-cost N остановит боевой прогон при достижении N$.')
 
 
 def _finish(store, spent: float, outcome: str) -> None:
