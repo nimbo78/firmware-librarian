@@ -52,7 +52,7 @@ from kb_ingest import IngestStats  # noqa: E402
 from kb_spaces import load_spaces  # noqa: E402
 
 
-def _quiet(spaces, max_cost) -> tuple[str, object]:
+def _quiet(spaces, max_cost, force: bool = False) -> tuple[str, object]:
     """Прогон бэкфилла с перехватом вывода.
 
     Бэкфилл печатает прогресс и сообщение про исчерпанный бюджет — в тесте
@@ -62,7 +62,7 @@ def _quiet(spaces, max_cost) -> tuple[str, object]:
     code = None
     with contextlib.redirect_stdout(buf):
         try:
-            asyncio.run(B._backfill(FakeClient(), spaces, max_cost))
+            asyncio.run(B._backfill(FakeClient(), spaces, max_cost, force=force))
         except SystemExit as e:      # Ctrl+C выходит кодом, а не traceback'ом
             code = e.code
     return buf.getvalue(), code
@@ -76,10 +76,15 @@ class FakeMsg:
 class FakeClient:
     """Telegram, которого нет: отдаёт по одному документу на чат."""
 
+    TIP = 777        # id последнего сообщения: по нему помечается разобранное
+
     def iter_messages(self, chat_id, reverse=False, min_id=None):
         async def gen():
             yield FakeMsg(1)
         return gen()
+
+    async def get_messages(self, chat_id, limit=1):
+        return [FakeMsg(self.TIP)]
 
 
 class _ScanMsg:
@@ -246,7 +251,7 @@ def _selftest() -> None:
         # полном прогоне, через час работы
         assert calls['catalog'] == [('S5735-L_V200R019.cc', 'huawei')], calls['catalog']
         assert calls['pipeline'] == [('print', B._progress.say)], calls['pipeline']
-        print('  1/5 обычный прогон: этапы, каталогизация, политика медиа — OK')
+        print('  1/6 обычный прогон: этапы, каталогизация, политика медиа — OK')
 
         # Бюджет: BudgetExceeded на первом же чате обрывает всё, конвейер не зовём
         calls['ingest'].clear(); calls['media'].clear(); calls['pipeline'].clear()
@@ -255,11 +260,13 @@ def _selftest() -> None:
             raise kb_ingest.BudgetExceeded(1.5)
 
         B.ingest_chat = broke
-        out, code = _quiet(spaces, 1.0)
+        # force: иначе этап 1 пропустится по метке от прошлого сценария и
+        # сбой внутри него просто не случится
+        out, code = _quiet(spaces, 1.0, force=True)
         assert code is None, 'лимит бюджета — не аварийный выход'
         assert calls['media'] == [] and calls['pipeline'] == [], calls
         assert 'ЛИМИТ БЮДЖЕТА' in out, out   # пользователю обязаны объяснить
-        print('  2/5 обрыв по бюджету (подделан в тесте, денег не тратит) — OK')
+        print('  2/6 обрыв по бюджету (подделан в тесте, денег не тратит) — OK')
 
         # Ctrl+C: вместо traceback — итог с обещанием продолжить и код 130
         calls['ingest'].clear(); calls['pipeline'].clear()
@@ -268,15 +275,43 @@ def _selftest() -> None:
             raise KeyboardInterrupt
 
         B.ingest_chat = interrupted
-        out, code = _quiet(spaces, None)
+        out, code = _quiet(spaces, None, force=True)
         assert code == 130, code
         assert 'ПРЕРВАНО' in out and 'без двойной оплаты' in out, out
         assert calls['pipeline'] == [], 'после Ctrl+C конвейер запускать нельзя'
-        print('  3/5 Ctrl+C: итог напечатан, код возврата 130 — OK')
+        print('  3/6 Ctrl+C: итог напечатан, код возврата 130 — OK')
         _check_scan_progress()
-        print('  4/5 проход по истории виден снаружи (проценты и ETA) — OK')
+        print('  4/6 проход по истории виден снаружи (проценты и ETA) — OK')
         _check_live_bar()
-        print('  5/5 полоса перерисовывается в терминале, в журнале — строки — OK')
+        print('  5/6 полоса перерисовывается в терминале, в журнале — строки — OK')
+
+        # Повторный запуск не перечитывает ту же историю заново: она помечена
+        # разобранной до id последнего сообщения. Раньше каждый перезапуск
+        # стоил полного прохода по чату — на 125 тыс. сообщений это часы
+        B.ingest_chat = fake_ingest
+        calls['ingest'].clear(); calls['media'].clear()
+        out, _ = _quiet(spaces, None, force=True)   # полный прогон: ставит метки
+        assert calls['ingest'], 'полный прогон обязан читать историю'
+        calls['ingest'].clear(); calls['media'].clear()
+
+        async def nothing_new(client, store, chat_id, progress=None, max_cost=None,
+                              media=None, concurrency=None, total=0):
+            calls['media'].append((chat_id, total))
+            return 0, 0.0                     # всё уже в кэше, платить нечего
+
+        B.enrich_chat_media = nothing_new
+        out, _ = _quiet(spaces, None)
+        assert not calls['ingest'], f'история перечитана заново: {calls["ingest"]}'
+        assert 'история уже разобрана' in out, out
+        assert 'новых описаний нет' in out, out
+        # знаменатель для этапа [2/3] пережил перезапуск через state
+        assert calls['media'] == [(-1001, 5)], calls['media']
+
+        calls['ingest'].clear()
+        out, _ = _quiet(spaces, None, force=True)
+        assert calls['ingest'], '--force обязан разобрать заново'
+        assert 'история уже разобрана' not in out, out
+        print('  6/6 повторный запуск не перечитывает историю, --force — да — OK')
     except AssertionError:
         print('--- вывод бэкфилла ---\n' + out)
         raise

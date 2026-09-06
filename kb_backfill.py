@@ -22,6 +22,12 @@
 --max-cost N останавливает боевой прогон при достижении N$; всё обработанное
 кэшируется, повторный запуск после пополнения продолжит без двойной оплаты.
 
+Доведённые до конца этапы помечаются в state вместе с id последнего сообщения
+чата, поэтому повторный запуск не перечитывает ту же историю заново (на сотне
+тысяч сообщений это часы). Появились новые сообщения — id другой, этап идёт.
+--force игнорирует пометки: нужен, если сообщения удаляли (id последнего не
+меняется, а содержимое истории — да).
+
 Пространства знаний (kb_spaces): по умолчанию обрабатываются все, --space b4
 сужает прогон до одной области — так новое пространство заводится, не трогая
 уже проинжещенные.
@@ -266,7 +272,27 @@ async def _local_only(spaces, max_cost: float | None) -> None:
     _finish(store, spent, 'budget' if stopped else 'done')
 
 
-async def _backfill(client, spaces, max_cost: float | None) -> None:
+async def _chat_tip(client, chat_id: int) -> int:
+    """Id последнего сообщения чата — один RPC. 0 = узнать не удалось."""
+    try:
+        msgs = await client.get_messages(chat_id, limit=1)
+        return msgs[0].id if msgs else 0
+    except Exception as e:
+        logging.getLogger(__name__).debug('tip unavailable for %s: %s', chat_id, e)
+        return 0
+
+
+async def _backfill(client, spaces, max_cost: float | None,
+                    force: bool = False) -> None:
+    """Полный разбор истории. Этапы, доведённые до конца, помечаются в state
+    вместе с id последнего сообщения чата — повторный запуск не перечитывает
+    ту же историю заново.
+
+    Пропуск безопасен именно потому, что этап 1 полный: при совпадении id
+    последнего сообщения он дал бы те же чанки с теми же id и хэшами, то есть
+    ноль записей в базу. Появились новые сообщения — id другой, этап идёт.
+    --force игнорирует пометки (нужен, если сообщения удаляли: id последнего
+    не меняется, а содержимое истории — да)."""
     store = open_store()
     # чат -> пространство; чаты качалки вне chats каталогизируем без инжеста
     # в RAG — иначе их файлы невидимы для /fw и кнопок 📎
@@ -278,6 +304,8 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
     spent = 0.0
     stopped = False
     media_total: dict[int, int] = {}   # чат -> сколько в нём медиа (для ETA)
+    tips: dict[int, int] = {}          # чат -> id последнего сообщения
+    paid_media: dict[int, int] = {}    # чат -> оплачено медиа в ЭТОМ прогоне
     # политика обогащения — своя у каждой области (см. MediaPolicy)
     chat_media = {c: media_policy(s.vision, s.voice)
                   for s in spaces.all for c in s.chats}
@@ -291,6 +319,14 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
         # Медиа входит в чанки плейсхолдерами, поэтому границы окончательные.
         for n, chat_id in enumerate(chat_ids, 1):
             _progress.say(f'[1/3] Текст: {chat_id} (чат {n} из {len(chat_ids)})...')
+            tip = await _chat_tip(client, chat_id)
+            tips[chat_id] = tip
+            if not force and tip and store.get_state(f'backfill_full:{chat_id}') == str(tip):
+                media_total[chat_id] = int(
+                    store.get_state(f'backfill_media_seen:{chat_id}', '0') or 0)
+                _progress.say(f'  история уже разобрана до сообщения {tip} — '
+                              f'пропуск (--force разберёт заново)')
+                continue
             try:
                 stats = await ingest_chat(client, store, chat_id, min_id=0,
                                           progress=_progress, max_cost=remaining(),
@@ -302,6 +338,10 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
                 break
             spent += stats.cost
             media_total[chat_id] = stats.media_seen
+            if tip:
+                # доведено до конца: помечаем историю разобранной до этого места
+                store.set_state(f'backfill_media_seen:{chat_id}', str(stats.media_seen))
+                store.set_state(f'backfill_full:{chat_id}', str(tip))
             pruned_note = (f', удалено устаревших чанков: {stats.pruned}'
                            if stats.pruned else '')
             _progress.say(f'  {stats.messages} сообщений -> {stats.new_chunks} чанков'
@@ -350,6 +390,7 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
                     stopped = True
                     break
                 spent += cost
+                paid_media[chat_id] = paid
                 cached = max(total - paid, 0)
                 _progress.say(f'  оплачено в этом прогоне: {paid}, ~${cost:.2f} '
                       f'(из кэша: {cached})')
@@ -360,6 +401,13 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
             for n, chat_id in enumerate(chat_ids, 1):
                 _progress.say(f'[3/3] Чанки с медиа: {chat_id} '
                       f'(чат {n} из {len(chat_ids)})...')
+                tip = tips.get(chat_id, 0)
+                # пересобирать нечего: этап 2 ничего нового не оплатил, а
+                # чанки с описаниями из кэша уже собраны на этой же истории
+                if (not force and tip and not paid_media.get(chat_id)
+                        and store.get_state(f'backfill_media:{chat_id}') == str(tip)):
+                    _progress.say('  новых описаний нет, чанки уже собраны — пропуск')
+                    continue
                 try:
                     stats = await ingest_chat(client, store, chat_id, min_id=0,
                                               progress=_progress,
@@ -371,6 +419,8 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
                     stopped = True
                     break
                 spent += stats.cost
+                if tips.get(chat_id):
+                    store.set_state(f'backfill_media:{chat_id}', str(tips[chat_id]))
                 _progress.say(f'  обновлено чанков: {stats.new_chunks}, ~${stats.cost:.2f}')
         if not stopped:
             # общий пост-инжест конвейер: каталог -> PDF -> архивы -> HedEx ->
@@ -404,6 +454,9 @@ async def main() -> None:
                         help='только локальные конвейеры (архивы, HedEx, PDF, '
                              'экстракция) — БЕЗ подключения к Telegram: сессию '
                              'не трогает, качалку можно не останавливать')
+    parser.add_argument('--force', action='store_true',
+                        help='разобрать историю заново, игнорируя пометки о '
+                             'уже разобранном (нужно, если сообщения удаляли)')
     parser.add_argument('--space', default='', metavar='SLUG',
                         help='обработать только одну область знаний '
                              '(по умолчанию — все из spaces.toml)')
@@ -452,7 +505,7 @@ async def main() -> None:
         if args.dry_run:
             await _dry_run(client, spaces)
         else:
-            await _backfill(client, spaces, args.max_cost)
+            await _backfill(client, spaces, args.max_cost, force=args.force)
     finally:
         await client.disconnect()
 
