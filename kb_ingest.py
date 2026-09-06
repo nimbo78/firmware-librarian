@@ -114,6 +114,7 @@ class IngestStats:
     messages: int = 0
     new_chunks: int = 0
     media_items: int = 0   # обработано медиа в этом прогоне (кэш не считается)
+    media_seen: int = 0    # всего медиа в чате: знаменатель прогресса этапа [2/3]
     cost: float = 0.0      # оценка потраченного, $
     pruned: int = 0        # удалено чанков с устаревшими границами (полный прогон)
 
@@ -388,7 +389,8 @@ async def enrich_message(store, msg, enrich_media: bool = True,
 async def enrich_chat_media(tg_client, store, chat_id: int, progress=None,
                             max_cost: float | None = None,
                             media: MediaPolicy | None = None,
-                            concurrency: int | None = None) -> tuple[int, float]:
+                            concurrency: int | None = None,
+                            total: int = 0) -> tuple[int, float]:
     """Этап 2 бэкфилла: только наполняет media_cache (vision/whisper), чанки
     не трогает. Возвращает (обработано в этом прогоне, стоимость $).
 
@@ -407,12 +409,13 @@ async def enrich_chat_media(tg_client, store, chat_id: int, progress=None,
         return 0, 0.0
     limit = max(1, concurrency or MEDIA_CONCURRENCY)
     queue: asyncio.Queue = asyncio.Queue(maxsize=limit * 2)
-    done = 0
+    done = 0        # оплачено в этом прогоне
+    seen = 0        # просмотрено, включая уже лежащее в кэше — это и есть прогресс
     cost = 0.0
     over_budget = False
 
     async def worker() -> None:
-        nonlocal done, cost, over_budget
+        nonlocal done, seen, cost, over_budget
         while True:
             msg = await queue.get()
             try:
@@ -421,12 +424,13 @@ async def enrich_chat_media(tg_client, store, chat_id: int, progress=None,
                 if over_budget:
                     continue      # добираем очередь, но больше не платим
                 _, c = await enrich_message(store, msg, media=media)
+                seen += 1
+                if progress and seen % 20 == 0:
+                    progress('media', seen, total, cost)
                 if c <= 0:
-                    continue
+                    continue      # уже было в кэше — денег не стоило
                 done += 1
                 cost += c
-                if progress and done % 20 == 0:
-                    progress('media', done, 0, cost)
                 if max_cost is not None and cost >= max_cost:
                     over_budget = True
             except Exception as e:
@@ -581,6 +585,10 @@ async def ingest_chat(tg_client, store, chat_id: int, min_id: int | None = None,
                     logger.warning('file record failed for %s/%s: %s',
                                    chat_id, msg.id, e)
         text = (msg.raw_text or '').strip()
+        if _is_image(msg) or _voice_duration(msg) > 0:
+            # даром: сообщения и так перебираются. Этап [2/3] иначе не знает,
+            # сколько всего работы, и не может показать ни проценты, ни ETA
+            stats.media_seen += 1
         extra, cost = await enrich_message(store, msg, enrich_media, media)
         if cost > 0:
             stats.media_items += 1

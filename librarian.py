@@ -305,7 +305,10 @@ async def kb_ingest_loop() -> None:
             _last_note[0] = now
             msg = f'{_labels.get(kind, kind)}: обработано {done}'
             if total:
-                msg += f', чанков {total}'
+                # у медиа и эмбеддингов total — сколько всего работы,
+                # у документных шагов — сколько чанков получилось
+                msg += (f' из {total}' if kind in ('media', 'embed')
+                        else f', чанков {total}')
             if cost:
                 msg += f', ~${cost:.2f}'
             logger.info('KB pipeline: %s', msg)

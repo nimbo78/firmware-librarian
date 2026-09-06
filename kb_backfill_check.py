@@ -85,12 +85,16 @@ def _selftest() -> None:
                           max_cost=None, enrich_media=True, space='', media=None):
         calls['ingest'].append((chat_id, space, enrich_media))
         # pruned > 0 — тот самый случай, на котором прод падал: раньше строка
-        # лога затирала словарь чатов для каталогизации
-        return IngestStats(messages=10, new_chunks=3, pruned=2, cost=0.01)
+        # лога затирала словарь чатов для каталогизации.
+        # media_seen — знаменатель прогресса этапа [2/3]
+        return IngestStats(messages=10, new_chunks=3, pruned=2, cost=0.01,
+                           media_seen=5)
 
     async def fake_media(client, store, chat_id, progress=None, max_cost=None,
-                         media=None, concurrency=None):
-        calls['media'].append((chat_id, media.vision, media.voice))
+                         media=None, concurrency=None, total=0):
+        calls['media'].append((chat_id, media.vision, media.voice, total))
+        if progress:                      # прогресс обязан пережить проценты и ETA
+            progress('media', 2, total, 0.008)
         return 2, 0.008
 
     async def fake_pipeline(store, spaces, budget=None, progress=None,
@@ -120,7 +124,11 @@ def _selftest() -> None:
         assert (-2001, 'b4', False) in calls['ingest'], calls['ingest']
         assert (-1001, 'huawei', True) in calls['ingest'], 'этап [3/3] не дошёл'
         # Этап 2: только там, где обогащение включено (у b4 vision/voice = false)
-        assert calls['media'] == [(-1001, True, False)], calls['media']
+        # знаменатель посчитан на этапе [1/3] и доехал до этапа [2/3]
+        assert calls['media'] == [(-1001, True, False, 5)], calls['media']
+        assert 'всего медиа: 5' in out, out
+        assert 'медиа: 2/5 (40%)' in out, out
+        assert 'из кэша: 3' in out, out
         assert 'обогащение выключено' in out, out
         # Каталогизация чата качалки вне chats — ветка, в которой жил баг с
         # затенением extra: падала только при pruned > 0, то есть на повторном

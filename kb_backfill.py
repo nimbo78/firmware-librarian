@@ -32,6 +32,7 @@ import argparse
 import asyncio
 import logging
 import os
+import time
 
 from telethon import TelegramClient
 
@@ -50,19 +51,60 @@ def _require(name: str) -> str:
     return val
 
 
-def _progress(stage: str, done: int, total: int, cost: float) -> None:
-    if stage == 'media':
-        print(f'  медиа: {done} обработано, потрачено ~${cost:.2f}', flush=True)
-    elif stage == 'embed':
-        print(f'  эмбеддинги: {done}/{total}, потрачено ~${cost:.2f}', flush=True)
-    elif stage == 'pdf':
-        print(f'  PDF: {done} файлов, потрачено ~${cost:.2f}', flush=True)
-    elif stage == 'hedex':
-        print(f'  HedEx: {done} пакетов, {total} чанков, '
-              f'потрачено ~${cost:.2f}', flush=True)
-    elif stage == 'archive':
-        print(f'  архивы: {done} просмотрено, {total} чанков, '
-              f'потрачено ~${cost:.2f}', flush=True)
+def _human_time(seconds: float) -> str:
+    if seconds < 90:
+        return f'{int(seconds)} с'
+    if seconds < 90 * 60:
+        return f'{int(seconds / 60)} мин'
+    h, m = divmod(int(seconds / 60), 60)
+    return f'{h} ч {m:02d} мин'
+
+
+class Progress:
+    """Печать прогресса с процентами и оценкой остатка.
+
+    Бэкфилл идёт часами, и «обработано 220» без знаменателя не отвечает на
+    единственный интересный вопрос — сколько ещё ждать. Скорость считается
+    по факту с начала этапа, а не по эталонным цифрам: она сильно зависит
+    от чата (длина сообщений, доля картинок) и времени суток у провайдера.
+
+    Этапы разделяются сами: счётчик, который перестал расти, означает новый
+    чат или новый этап — время старта сбрасывается, чтобы ETA не врал.
+    """
+
+    LABELS = {'media': 'медиа', 'embed': 'эмбеддинги', 'pdf': 'PDF',
+              'hedex': 'HedEx', 'archive': 'архивы'}
+
+    def __init__(self):
+        self._start: dict[str, tuple[float, int]] = {}
+
+    def __call__(self, stage: str, done: int, total: int, cost: float) -> None:
+        t0, base = self._start.get(stage, (0.0, 0))
+        if not t0 or done <= base:
+            # base = done, а не 0: работа до сброса сделана за неизвестное
+            # время, и включать её в скорость — врать в оптимистичную сторону
+            t0, base = time.monotonic(), done
+            self._start[stage] = (t0, base)
+        line = f'  {self.LABELS.get(stage, stage)}: {done}'
+        if stage in ('media', 'embed') and total > 0:
+            line += f'/{total} ({done * 100 // total}%)'
+        elif stage in ('hedex', 'archive') and total:
+            line += f', чанков {total}'
+        elif stage == 'pdf':
+            line += ' файлов'
+        if cost:
+            line += f', ~${cost:.2f}'
+        elapsed = time.monotonic() - t0
+        speed = (done - base) / elapsed if elapsed > 1 else 0.0
+        if speed > 0 and total > done and stage in ('media', 'embed'):
+            line += f', осталось ~{_human_time((total - done) / speed)}'
+        elif speed > 0:
+            line += f', {speed * 60:.0f}/мин'
+        print(line, flush=True)
+
+
+# Один экземпляр на прогон: этапы различаются по ключу stage
+_progress = Progress()
 
 
 async def _dry_run(client, spaces) -> None:
@@ -155,6 +197,7 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
                     if c not in chat_space}
     spent = 0.0
     stopped = False
+    media_total: dict[int, int] = {}   # чат -> сколько в нём медиа (для ETA)
     # политика обогащения — своя у каждой области (см. MediaPolicy)
     chat_media = {c: media_policy(s.vision, s.voice)
                   for s in spaces.all for c in s.chats}
@@ -165,8 +208,8 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
 
     # Этап 1: только текст (быстро и дёшево) — база отвечает уже после него.
     # Медиа входит в чанки плейсхолдерами, поэтому границы окончательные.
-    for chat_id in chat_ids:
-        print(f'[1/3] Текст: {chat_id}...', flush=True)
+    for n, chat_id in enumerate(chat_ids, 1):
+        print(f'[1/3] Текст: {chat_id} (чат {n} из {len(chat_ids)})...', flush=True)
         try:
             stats = await ingest_chat(client, store, chat_id, min_id=0,
                                       progress=_progress, max_cost=remaining(),
@@ -177,6 +220,7 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
             stopped = True
             break
         spent += stats.cost
+        media_total[chat_id] = stats.media_seen
         pruned_note = (f', удалено устаревших чанков: {stats.pruned}'
                        if stats.pruned else '')
         print(f'  {stats.messages} сообщений -> {stats.new_chunks} чанков'
@@ -204,28 +248,37 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
             print(f'  документов закаталогизировано: {recorded}')
     # Этап 2: vision/whisper — только наполнение кэша, чанки не трогаем
     if media_wanted and not stopped:
-        for chat_id in chat_ids:
-            print(f'[2/3] Медиа: {chat_id}...', flush=True)
+        for n, chat_id in enumerate(chat_ids, 1):
+            total = media_total.get(chat_id, 0)
+            print(f'[2/3] Медиа: {chat_id} (чат {n} из {len(chat_ids)}), '
+                  f'всего медиа: {total}...', flush=True)
             if not (chat_media[chat_id].vision or chat_media[chat_id].voice):
                 print('  обогащение выключено для этой области — пропуск')
                 continue
+            if not total:
+                print('  медиа в чате нет — пропуск')
+                continue
             try:
-                n, cost = await enrich_chat_media(client, store, chat_id,
-                                                  progress=_progress,
-                                                  max_cost=remaining(),
-                                                  media=chat_media[chat_id])
+                paid, cost = await enrich_chat_media(client, store, chat_id,
+                                                     progress=_progress,
+                                                     max_cost=remaining(),
+                                                     media=chat_media[chat_id],
+                                                     total=total)
             except BudgetExceeded as e:
                 spent += e.cost
                 stopped = True
                 break
             spent += cost
-            print(f'  обработано медиа: {n}, ~${cost:.2f}')
+            cached = max(total - paid, 0)
+            print(f'  оплачено в этом прогоне: {paid}, ~${cost:.2f} '
+                  f'(из кэша: {cached})')
 
     # Этап 3: пересборка чанков с описаниями из кэша; переэмбеддятся
     # только изменившиеся (id те же — сравнение по хэшу текста)
     if media_wanted and not stopped:
-        for chat_id in chat_ids:
-            print(f'[3/3] Чанки с медиа: {chat_id}...', flush=True)
+        for n, chat_id in enumerate(chat_ids, 1):
+            print(f'[3/3] Чанки с медиа: {chat_id} '
+                  f'(чат {n} из {len(chat_ids)})...', flush=True)
             try:
                 stats = await ingest_chat(client, store, chat_id, min_id=0,
                                           progress=_progress,
