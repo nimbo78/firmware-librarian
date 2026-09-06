@@ -32,6 +32,8 @@ import argparse
 import asyncio
 import logging
 import os
+import shutil
+import sys
 import time
 
 from telethon import TelegramClient
@@ -61,24 +63,58 @@ def _human_time(seconds: float) -> str:
 
 
 class Progress:
-    """Печать прогресса с процентами и оценкой остатка.
+    """Прогресс бэкфилла: полоса, проценты и оценка остатка.
 
     Бэкфилл идёт часами, и «обработано 220» без знаменателя не отвечает на
     единственный интересный вопрос — сколько ещё ждать. Скорость считается
     по факту с начала этапа, а не по эталонным цифрам: она сильно зависит
     от чата (длина сообщений, доля картинок) и времени суток у провайдера.
 
+    В терминале строка перерисовывается на месте (\\r), в остальных случаях
+    печатается по строке на обновление. Различие принципиальное, а не
+    косметическое: этот же вывод — журнал многочасового прогона в
+    `docker logs` и в перенаправленном в файл выводе, где возврат каретки
+    превращается в кашу. Поток берётся в момент печати, а не в конструкторе:
+    иначе перехват вывода (selftest, tee) достался бы мимо.
+
     Этапы разделяются сами: счётчик, который перестал расти, означает новый
-    чат или новый этап — время старта сбрасывается, чтобы ETA не врал.
+    чат или новый этап — время старта сбрасывается, чтобы ETA не врал, а
+    предыдущая полоса закрывается переводом строки и остаётся в истории.
     """
 
     LABELS = {'scan': 'сообщения', 'media': 'медиа', 'embed': 'эмбеддинги',
               'pdf': 'PDF', 'hedex': 'HedEx', 'archive': 'архивы'}
-    # этапы с известным объёмом работы: только у них есть проценты и ETA
+    # этапы с известным объёмом работы: только у них есть полоса, % и ETA
     MEASURED = ('scan', 'media', 'embed')
+    BAR = 24
 
     def __init__(self):
         self._start: dict[str, tuple[float, int]] = {}
+        self._open = False        # есть ли незакрытая перерисовываемая строка
+
+    @staticmethod
+    def _live() -> bool:
+        out = sys.stdout
+        try:
+            return bool(out.isatty())
+        except Exception:
+            return False
+
+    def close(self) -> None:
+        """Закрыть живую строку, чтобы следующий вывод не наехал на неё."""
+        if self._open:
+            print(flush=True)
+            self._open = False
+
+    def say(self, text: str = '') -> None:
+        """Обычная строка вывода. Через неё обязан идти ВЕСЬ вывод прогона —
+        иначе обычный print затрёт наполовину нарисованную полосу."""
+        self.close()
+        print(text, flush=True)
+
+    def _bar(self, frac: float) -> str:
+        filled = int(round(frac * self.BAR))
+        return '█' * filled + '░' * (self.BAR - filled)
 
     def __call__(self, stage: str, done: int, total: int, cost: float) -> None:
         t0, base = self._start.get(stage, (0.0, 0))
@@ -87,13 +123,21 @@ class Progress:
             # время, и включать её в скорость — врать в оптимистичную сторону
             t0, base = time.monotonic(), done
             self._start[stage] = (t0, base)
-        line = f'  {self.LABELS.get(stage, stage)}: {done}'
+            self.close()          # прошлый этап остаётся отдельной строкой
+        label = self.LABELS.get(stage, stage)
+        live = self._live()
         if stage in self.MEASURED and total > 0:
-            line += f'/{total} ({done * 100 // total}%)'
-        elif stage in ('hedex', 'archive') and total:
-            line += f', чанков {total}'
-        elif stage == 'pdf':
-            line += ' файлов'
+            frac = min(done / total, 1.0)
+            # полоса — только в терминале: в журнале прогона она лишний шум
+            line = (f'  {label} {self._bar(frac)} {int(frac * 100):3d}% {done}/{total}'
+                    if live else
+                    f'  {label}: {done}/{total} ({int(frac * 100)}%)')
+        else:
+            line = f'  {label}: {done}'
+            if stage in ('hedex', 'archive') and total:
+                line += f', чанков {total}'
+            elif stage == 'pdf':
+                line += ' файлов'
         if cost:
             line += f', ~${cost:.2f}'
         elapsed = time.monotonic() - t0
@@ -102,7 +146,15 @@ class Progress:
             line += f', осталось ~{_human_time((total - done) / speed)}'
         elif speed > 0:
             line += f', {speed * 60:.0f}/мин'
-        print(line, flush=True)
+        if live:
+            width = max(40, shutil.get_terminal_size((100, 24)).columns - 1)
+            # обрезаем и добиваем пробелами: короткая строка не должна
+            # оставлять хвост предыдущей, длинная — переноситься и плодить
+            # строки вместо перерисовки
+            print('\r' + line[:width].ljust(width), end='', flush=True)
+            self._open = True
+        else:
+            print(line, flush=True)
 
 
 # Один экземпляр на прогон: этапы различаются по ключу stage
@@ -177,16 +229,16 @@ def _finish(store, spent: float, outcome: str) -> None:
     пачками в транзакциях, media_cache — по одному элементу, а last_seen_id
     двигается только после успешной обработки чата. Поэтому обещание везде
     одно: повторный запуск продолжит без двойной оплаты."""
-    print(f'\nЧанков в базе: {store.count()}. '
+    _progress.say(f'\nЧанков в базе: {store.count()}. '
           f'Потрачено в этом прогоне: ~${spent:.2f}')
     if outcome == 'budget':
-        print('ЛИМИТ БЮДЖЕТА ДОСТИГНУТ. Обработанное закэшировано — пополни '
+        _progress.say('ЛИМИТ БЮДЖЕТА ДОСТИГНУТ. Обработанное закэшировано — пополни '
               'баланс API и запусти повторно, прогон продолжит с места '
               'остановки без двойной оплаты.')
         store.add_event('backfill', f'Бэкфилл ОСТАНОВЛЕН по лимиту бюджета, '
                                     f'чанков: {store.count()}', spent)
     elif outcome == 'interrupted':
-        print('ПРЕРВАНО (Ctrl+C). Обработанное сохранено — повторный запуск '
+        _progress.say('ПРЕРВАНО (Ctrl+C). Обработанное сохранено — повторный запуск '
               'продолжит с места остановки без двойной оплаты.')
         store.add_event('backfill', f'Бэкфилл прерван вручную, '
                                     f'чанков: {store.count()}', spent)
@@ -204,7 +256,8 @@ async def _local_only(spaces, max_cost: float | None) -> None:
     store = open_store()
     try:
         spent, stopped = await run_post_ingest(store, spaces, budget=max_cost,
-                                               progress=_progress, report='print')
+                                               progress=_progress, report='print',
+                                               say=_progress.say)
     except KeyboardInterrupt:
         # шаги конвейера идемпотентны и метят сделанное в state, так что
         # прерывание стоит только незавершённого шага
@@ -237,7 +290,7 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
         # Этап 1: только текст (быстро и дёшево) — база отвечает уже после него.
         # Медиа входит в чанки плейсхолдерами, поэтому границы окончательные.
         for n, chat_id in enumerate(chat_ids, 1):
-            print(f'[1/3] Текст: {chat_id} (чат {n} из {len(chat_ids)})...', flush=True)
+            _progress.say(f'[1/3] Текст: {chat_id} (чат {n} из {len(chat_ids)})...')
             try:
                 stats = await ingest_chat(client, store, chat_id, min_id=0,
                                           progress=_progress, max_cost=remaining(),
@@ -251,7 +304,7 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
             media_total[chat_id] = stats.media_seen
             pruned_note = (f', удалено устаревших чанков: {stats.pruned}'
                            if stats.pruned else '')
-            print(f'  {stats.messages} сообщений -> {stats.new_chunks} чанков'
+            _progress.say(f'  {stats.messages} сообщений -> {stats.new_chunks} чанков'
                   f'{pruned_note}, ~${stats.cost:.2f}')
         # Каталогизация документов из чатов качалки, не входящих в KB_CHAT_IDS:
         # без инжеста в RAG, только files/firmware — иначе файлы, скачанные из
@@ -260,7 +313,7 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
             from kb_firmware import document_filename, record_file
             from kb_ingest import fetch_topic_names, message_topic_id
             for chat_id, space in catalog_only.items():
-                print(f'Каталог (без инжеста): {chat_id}...', flush=True)
+                _progress.say(f'Каталог (без инжеста): {chat_id}...')
                 topics = await fetch_topic_names(client, chat_id)
                 recorded = 0
                 async for msg in client.iter_messages(chat_id, reverse=True):
@@ -273,18 +326,18 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
                                 topics.get(message_topic_id(msg), ''),
                                 space=space.slug)
                     recorded += 1
-                print(f'  документов закаталогизировано: {recorded}')
+                _progress.say(f'  документов закаталогизировано: {recorded}')
         # Этап 2: vision/whisper — только наполнение кэша, чанки не трогаем
         if media_wanted and not stopped:
             for n, chat_id in enumerate(chat_ids, 1):
                 total = media_total.get(chat_id, 0)
-                print(f'[2/3] Медиа: {chat_id} (чат {n} из {len(chat_ids)}), '
-                      f'всего медиа: {total}...', flush=True)
+                _progress.say(f'[2/3] Медиа: {chat_id} (чат {n} из {len(chat_ids)}), '
+                      f'всего медиа: {total}...')
                 if not (chat_media[chat_id].vision or chat_media[chat_id].voice):
-                    print('  обогащение выключено для этой области — пропуск')
+                    _progress.say('  обогащение выключено для этой области — пропуск')
                     continue
                 if not total:
-                    print('  медиа в чате нет — пропуск')
+                    _progress.say('  медиа в чате нет — пропуск')
                     continue
                 try:
                     paid, cost = await enrich_chat_media(client, store, chat_id,
@@ -298,15 +351,15 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
                     break
                 spent += cost
                 cached = max(total - paid, 0)
-                print(f'  оплачено в этом прогоне: {paid}, ~${cost:.2f} '
+                _progress.say(f'  оплачено в этом прогоне: {paid}, ~${cost:.2f} '
                       f'(из кэша: {cached})')
 
         # Этап 3: пересборка чанков с описаниями из кэша; переэмбеддятся
         # только изменившиеся (id те же — сравнение по хэшу текста)
         if media_wanted and not stopped:
             for n, chat_id in enumerate(chat_ids, 1):
-                print(f'[3/3] Чанки с медиа: {chat_id} '
-                      f'(чат {n} из {len(chat_ids)})...', flush=True)
+                _progress.say(f'[3/3] Чанки с медиа: {chat_id} '
+                      f'(чат {n} из {len(chat_ids)})...')
                 try:
                     stats = await ingest_chat(client, store, chat_id, min_id=0,
                                               progress=_progress,
@@ -318,7 +371,7 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
                     stopped = True
                     break
                 spent += stats.cost
-                print(f'  обновлено чанков: {stats.new_chunks}, ~${stats.cost:.2f}')
+                _progress.say(f'  обновлено чанков: {stats.new_chunks}, ~${stats.cost:.2f}')
         if not stopped:
             # общий пост-инжест конвейер: каталог -> PDF -> архивы -> HedEx ->
             # экстракция -> бэкап (kb_pipeline, тот же путь, что у ночного джоба)
@@ -326,7 +379,8 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
             more, stopped = await run_post_ingest(store, spaces,
                                                   budget=remaining(),
                                                   progress=_progress,
-                                                  report='print')
+                                                  report='print',
+                                                  say=_progress.say)
             spent += more
         else:
             store.backup()
@@ -391,9 +445,9 @@ async def main() -> None:
     # %(name)s подписывает источник (telethon.network.* vs наши модули)
     logging.basicConfig(level=logging.WARNING,
                         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    print('Подключаюсь к Telegram...', flush=True)
+    _progress.say('Подключаюсь к Telegram...')
     await client.start(phone=lambda: input('Enter your phone: '))
-    print('Подключился.', flush=True)
+    _progress.say('Подключился.')
     try:
         if args.dry_run:
             await _dry_run(client, spaces)
@@ -408,5 +462,5 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         # прерывание вне этапов: подключение к Telegram, --dry-run
-        print('\nПрервано.')
+        _progress.say('\nПрервано.')
         raise SystemExit(130)

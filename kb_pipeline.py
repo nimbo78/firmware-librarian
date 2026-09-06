@@ -42,7 +42,8 @@ def _backup_due(store) -> bool:
 async def run_post_ingest(store, spaces, *,
                           budget: float | None = None,
                           progress=None,
-                          report: str = 'events') -> tuple[float, bool]:
+                          report: str = 'events',
+                          say=print) -> tuple[float, bool]:
     """Возвращает (потрачено $, упёрлись ли в бюджет).
 
     spaces — kb_spaces.Spaces: документные шаги идут по папке каждого
@@ -64,7 +65,10 @@ async def run_post_ingest(store, spaces, *,
             logger.info('%s: %s (~$%.2f)', kind, text, cost)
             store.add_event(kind, text, cost)
         else:
-            print(f'{text}, ~${cost:.2f}')
+            # say, а не print: у бэкфилла это метод объекта прогресса, который
+            # сперва закрывает перерисовываемую строку — иначе строка отчёта
+            # ляжет поверх наполовину нарисованной полосы
+            say(f'{text}, ~${cost:.2f}')
 
     def status(text: str) -> None:
         """Текущее состояние конвейера -> команда /status в личке бота.
@@ -80,7 +84,7 @@ async def run_post_ingest(store, spaces, *,
         if to_events:
             store.add_event('error', text)
         else:
-            print(f'ОШИБКА [{kind}]: {text}')
+            say(f'ОШИБКА [{kind}]: {text}')
 
     started = datetime.now()
 
@@ -170,7 +174,7 @@ async def run_post_ingest(store, spaces, *,
                         'review',
                         f'{pending} записей каталога ждут подтверждения — /review')
                 else:
-                    print(f'На подтверждение (/review в личке бота): {pending}')
+                    say(f'На подтверждение (/review в личке бота): {pending}')
         except Exception as e:
             fail('extract', f'LLM-экстракция упала: {e}')
 

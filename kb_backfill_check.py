@@ -150,6 +150,41 @@ def _check_scan_progress() -> None:
     assert 'сообщения: 500/1200 (41%)' in line.getvalue(), line.getvalue()
 
 
+class _Tty(io.StringIO):
+    """Поток, который считает себя терминалом."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+def _check_live_bar() -> None:
+    """В терминале — перерисовка одной строки, в журнале — обычные строки.
+
+    Контракт, который легко сломать: любой посторонний вывод обязан идти
+    через say(), иначе он ляжет поверх наполовину нарисованной полосы."""
+    tty = _Tty()
+    with contextlib.redirect_stdout(tty):
+        p = B.Progress()
+        p('scan', 500, 1000, 0.0)
+        p('scan', 1000, 1000, 0.0)
+        p.say('итог этапа')
+    raw = tty.getvalue()
+    assert raw.count('\r') == 2, raw            # два тика — две перерисовки
+    assert '█' in raw and '░' in raw, raw       # полоса нарисована
+    # say обязана перевести строку ДО своего текста, иначе наедет на полосу
+    assert raw.endswith('\nитог этапа\n'), repr(raw[-40:])
+    assert raw.count('\n') == 2, repr(raw)      # всего две физические строки
+
+    plain = io.StringIO()                       # не терминал: журнал прогона
+    with contextlib.redirect_stdout(plain):
+        p = B.Progress()
+        p('scan', 500, 1000, 0.0)
+        p.say('итог этапа')
+    out = plain.getvalue()
+    assert '\r' not in out and '█' not in out, repr(out)
+    assert 'сообщения: 500/1000 (50%)' in out, out
+
+
 def _selftest() -> None:
     calls: dict[str, list] = {'ingest': [], 'media': [], 'catalog': [],
                               'pipeline': []}
@@ -171,8 +206,10 @@ def _selftest() -> None:
         return 2, 0.008
 
     async def fake_pipeline(store, spaces, budget=None, progress=None,
-                            report='events'):
-        calls['pipeline'].append(report)
+                            report='events', say=print):
+        # say — печать конвейера через объект прогресса: иначе его строки
+        # лягут поверх перерисовываемой полосы
+        calls['pipeline'].append((report, say))
         return 0.0, False
 
     def fake_record(store, msg, fname, topic_name, space=''):
@@ -208,8 +245,8 @@ def _selftest() -> None:
         # затенением extra: падала только при pruned > 0, то есть на повторном
         # полном прогоне, через час работы
         assert calls['catalog'] == [('S5735-L_V200R019.cc', 'huawei')], calls['catalog']
-        assert calls['pipeline'] == ['print'], calls['pipeline']
-        print('  1/4 обычный прогон: этапы, каталогизация, политика медиа — OK')
+        assert calls['pipeline'] == [('print', B._progress.say)], calls['pipeline']
+        print('  1/5 обычный прогон: этапы, каталогизация, политика медиа — OK')
 
         # Бюджет: BudgetExceeded на первом же чате обрывает всё, конвейер не зовём
         calls['ingest'].clear(); calls['media'].clear(); calls['pipeline'].clear()
@@ -222,7 +259,7 @@ def _selftest() -> None:
         assert code is None, 'лимит бюджета — не аварийный выход'
         assert calls['media'] == [] and calls['pipeline'] == [], calls
         assert 'ЛИМИТ БЮДЖЕТА' in out, out   # пользователю обязаны объяснить
-        print('  2/4 обрыв по бюджету (подделан в тесте, денег не тратит) — OK')
+        print('  2/5 обрыв по бюджету (подделан в тесте, денег не тратит) — OK')
 
         # Ctrl+C: вместо traceback — итог с обещанием продолжить и код 130
         calls['ingest'].clear(); calls['pipeline'].clear()
@@ -235,9 +272,11 @@ def _selftest() -> None:
         assert code == 130, code
         assert 'ПРЕРВАНО' in out and 'без двойной оплаты' in out, out
         assert calls['pipeline'] == [], 'после Ctrl+C конвейер запускать нельзя'
-        print('  3/4 Ctrl+C: итог напечатан, код возврата 130 — OK')
+        print('  3/5 Ctrl+C: итог напечатан, код возврата 130 — OK')
         _check_scan_progress()
-        print('  4/4 проход по истории виден снаружи (проценты и ETA) — OK')
+        print('  4/5 проход по истории виден снаружи (проценты и ETA) — OK')
+        _check_live_bar()
+        print('  5/5 полоса перерисовывается в терминале, в журнале — строки — OK')
     except AssertionError:
         print('--- вывод бэкфилла ---\n' + out)
         raise
