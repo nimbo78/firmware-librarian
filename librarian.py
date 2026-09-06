@@ -299,7 +299,7 @@ async def kb_ingest_loop() -> None:
                    'embed': 'эмбеддинги', 'media': 'медиа',
                    'scan': 'просмотр сообщений'}
 
-        def _pipeline_progress(kind, done, total, cost):
+        def _pipeline_progress(kind, done, total, cost, extra=''):
             now = time.monotonic()
             if now - _last_note[0] < 20:
                 return
@@ -310,6 +310,8 @@ async def kb_ingest_loop() -> None:
                 # у документных шагов — сколько чанков получилось
                 msg += (f' из {total}' if kind in ('media', 'embed')
                         else f', чанков {total}')
+            if extra:
+                msg += f', {extra}'
             if cost:
                 msg += f', ~${cost:.2f}'
             logger.info('KB pipeline: %s', msg)

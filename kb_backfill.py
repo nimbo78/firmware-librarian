@@ -122,7 +122,8 @@ class Progress:
         filled = int(round(frac * self.BAR))
         return '█' * filled + '░' * (self.BAR - filled)
 
-    def __call__(self, stage: str, done: int, total: int, cost: float) -> None:
+    def __call__(self, stage: str, done: int, total: int, cost: float,
+                 extra: str = '') -> None:
         t0, base = self._start.get(stage, (0.0, 0))
         if not t0 or done <= base:
             # base = done, а не 0: работа до сброса сделана за неизвестное
@@ -144,6 +145,8 @@ class Progress:
                 line += f', чанков {total}'
             elif stage == 'pdf':
                 line += ' файлов'
+        if extra:
+            line += f', {extra}'
         if cost:
             line += f', ~${cost:.2f}'
         elapsed = time.monotonic() - t0
@@ -400,6 +403,9 @@ async def _backfill(client, spaces, max_cost: float | None,
                 if at:
                     _progress.say(f'  продолжаю с сообщения {at} '
                                   f'({seen0} медиа уже пройдено)')
+                else:
+                    _progress.say('  иду с начала истории; уже обработанное '
+                                  'берётся из кэша и не оплачивается')
 
                 def _save(msg_id: int, seen: int, k=at_key, s=seen_key) -> None:
                     store.set_state(k, str(msg_id))

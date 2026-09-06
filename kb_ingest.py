@@ -440,7 +440,9 @@ async def enrich_chat_media(tg_client, store, chat_id: int, progress=None,
                 seen += 1
                 if seen % 20 == 0:
                     if progress:
-                        progress('media', seen, total, cost)
+                        # сколько оплачено — единственный способ отличить
+                        # настоящую работу от повторного прохода по кэшу
+                        progress('media', seen, total, cost, f'оплачено {done}')
                     if checkpoint:
                         checkpoint(safe_point(), seen)
                 if c <= 0:
