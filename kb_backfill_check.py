@@ -204,7 +204,8 @@ def _selftest() -> None:
                            media_seen=5)
 
     async def fake_media(client, store, chat_id, progress=None, max_cost=None,
-                         media=None, concurrency=None, total=0):
+                         media=None, concurrency=None, total=0, min_id=0,
+                         seen0=0, checkpoint=None):
         calls['media'].append((chat_id, media.vision, media.voice, total))
         if progress:                      # прогресс обязан пережить проценты и ETA
             progress('media', 2, total, 0.008)
@@ -288,30 +289,51 @@ def _selftest() -> None:
         # Повторный запуск не перечитывает ту же историю заново: она помечена
         # разобранной до id последнего сообщения. Раньше каждый перезапуск
         # стоил полного прохода по чату — на 125 тыс. сообщений это часы
-        B.ingest_chat = fake_ingest
-        calls['ingest'].clear(); calls['media'].clear()
-        out, _ = _quiet(spaces, None, force=True)   # полный прогон: ставит метки
-        assert calls['ingest'], 'полный прогон обязан читать историю'
-        calls['ingest'].clear(); calls['media'].clear()
+        starts: list[int] = []
+
+        async def track_ingest(client, store, chat_id, min_id=None, progress=None,
+                               max_cost=None, enrich_media=True, space='',
+                               media=None):
+            if not enrich_media:      # только этап [1/3]: этап [3/3] полный
+                starts.append(min_id)  # по определению — там всегда min_id=0
+            return await fake_ingest(client, store, chat_id, min_id, progress,
+                                     max_cost, enrich_media, space, media)
 
         async def nothing_new(client, store, chat_id, progress=None, max_cost=None,
-                              media=None, concurrency=None, total=0):
-            calls['media'].append((chat_id, total))
+                              media=None, concurrency=None, total=0, min_id=0,
+                              seen0=0, checkpoint=None):
+            calls['media'].append((chat_id, total, min_id, seen0))
             return 0, 0.0                     # всё уже в кэше, платить нечего
 
+        B.ingest_chat = track_ingest
         B.enrich_chat_media = nothing_new
-        out, _ = _quiet(spaces, None)
-        assert not calls['ingest'], f'история перечитана заново: {calls["ingest"]}'
-        assert 'история уже разобрана' in out, out
-        assert 'новых описаний нет' in out, out
-        # знаменатель для этапа [2/3] пережил перезапуск через state
-        assert calls['media'] == [(-1001, 5)], calls['media']
+        FakeClient.TIP = 777
+        calls['ingest'].clear(); calls['media'].clear(); starts.clear()
+        _quiet(spaces, None, force=True)      # полный разбор: ставит метки
+        assert starts and starts[0] == 0, starts
 
-        calls['ingest'].clear()
+        # чат живой: пришли новые сообщения. Раньше это обесценивало метку —
+        # id последнего не совпадал, и вся история читалась заново
+        FakeClient.TIP = 800
+        calls['ingest'].clear(); starts.clear()
+        out, _ = _quiet(spaces, None)
+        assert 'дочитываю хвост' in out, out
+        assert 777 in starts, f'хвост читается не с 777: {starts}'
+        assert 0 not in starts, f'история перечитана заново: {starts}'
+
+        # ничего не изменилось — этап 1 пропускается целиком
+        calls['ingest'].clear(); calls['media'].clear(); starts.clear()
+        out, _ = _quiet(spaces, None)
+        assert not starts, f'история перечитана заново: {starts}'
+        assert 'нового нет — пропуск' in out, out
+        assert 'новых описаний нет' in out, out
+        # знаменатель этапа [2/3] пережил перезапуски (5 + 5 за хвост)
+        assert calls['media'] == [(-1001, 10, 0, 0)], calls['media']
+
+        starts.clear()
         out, _ = _quiet(spaces, None, force=True)
-        assert calls['ingest'], '--force обязан разобрать заново'
-        assert 'история уже разобрана' not in out, out
-        print('  6/6 повторный запуск не перечитывает историю, --force — да — OK')
+        assert 0 in starts, '--force обязан разобрать историю заново'
+        print('  6/6 живой чат: дочитываем хвост, а не всю историю — OK')
     except AssertionError:
         print('--- вывод бэкфилла ---\n' + out)
         raise

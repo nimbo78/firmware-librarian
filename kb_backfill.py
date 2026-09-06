@@ -321,14 +321,23 @@ async def _backfill(client, spaces, max_cost: float | None,
             _progress.say(f'[1/3] Текст: {chat_id} (чат {n} из {len(chat_ids)})...')
             tip = await _chat_tip(client, chat_id)
             tips[chat_id] = tip
-            if not force and tip and store.get_state(f'backfill_full:{chat_id}') == str(tip):
-                media_total[chat_id] = int(
-                    store.get_state(f'backfill_media_seen:{chat_id}', '0') or 0)
-                _progress.say(f'  история уже разобрана до сообщения {tip} — '
-                              f'пропуск (--force разберёт заново)')
+            # докуда история уже разобрана полностью (0 = ни разу)
+            done_upto = 0 if force else int(
+                store.get_state(f'backfill_full:{chat_id}', '0') or 0)
+            seen_before = int(
+                store.get_state(f'backfill_media_seen:{chat_id}', '0') or 0)
+            if done_upto and tip and tip <= done_upto:
+                media_total[chat_id] = seen_before
+                _progress.say(f'  история разобрана до сообщения {done_upto}, '
+                              f'нового нет — пропуск')
                 continue
+            if done_upto:
+                # чат живой: заново читать 100+ тыс. сообщений ради хвоста в
+                # пару сотен незачем. Границы чанков хвоста считаются от
+                # done_upto — как в ночном инжесте, который так работает всегда
+                _progress.say(f'  разобрано до {done_upto}, дочитываю хвост...')
             try:
-                stats = await ingest_chat(client, store, chat_id, min_id=0,
+                stats = await ingest_chat(client, store, chat_id, min_id=done_upto,
                                           progress=_progress, max_cost=remaining(),
                                           enrich_media=False,
                                           space=chat_space[chat_id].slug)
@@ -337,10 +346,14 @@ async def _backfill(client, spaces, max_cost: float | None,
                 stopped = True
                 break
             spent += stats.cost
-            media_total[chat_id] = stats.media_seen
+            # знаменатель этапа 2 — медиа по ВСЕЙ истории. Полный проход даёт
+            # его сразу, дочитывание хвоста — только прирост, который надо
+            # добавить к посчитанному раньше
+            media_total[chat_id] = (seen_before + stats.media_seen if done_upto
+                                    else stats.media_seen)
             if tip:
-                # доведено до конца: помечаем историю разобранной до этого места
-                store.set_state(f'backfill_media_seen:{chat_id}', str(stats.media_seen))
+                store.set_state(f'backfill_media_seen:{chat_id}',
+                                str(media_total[chat_id]))
                 store.set_state(f'backfill_full:{chat_id}', str(tip))
             pruned_note = (f', удалено устаревших чанков: {stats.pruned}'
                            if stats.pruned else '')
@@ -379,18 +392,37 @@ async def _backfill(client, spaces, max_cost: float | None,
                 if not total:
                     _progress.say('  медиа в чате нет — пропуск')
                     continue
+                # продолжение прерванного этапа: докуда дошли в прошлый раз
+                at_key, seen_key = (f'backfill_media_at:{chat_id}',
+                                    f'backfill_media_seen_at:{chat_id}')
+                at = 0 if force else int(store.get_state(at_key, '0') or 0)
+                seen0 = 0 if force else int(store.get_state(seen_key, '0') or 0)
+                if at:
+                    _progress.say(f'  продолжаю с сообщения {at} '
+                                  f'({seen0} медиа уже пройдено)')
+
+                def _save(msg_id: int, seen: int, k=at_key, s=seen_key) -> None:
+                    store.set_state(k, str(msg_id))
+                    store.set_state(s, str(seen))
+
                 try:
                     paid, cost = await enrich_chat_media(client, store, chat_id,
                                                          progress=_progress,
                                                          max_cost=remaining(),
                                                          media=chat_media[chat_id],
-                                                         total=total)
+                                                         total=total, min_id=at,
+                                                         seen0=seen0,
+                                                         checkpoint=_save)
                 except BudgetExceeded as e:
                     spent += e.cost
                     stopped = True
                     break
                 spent += cost
                 paid_media[chat_id] = paid
+                # этап дошёл до конца: следующий прогон начнёт с начала
+                # истории (и почти весь возьмёт из кэша), а не с середины
+                store.set_state(at_key, '0')
+                store.set_state(seen_key, '0')
                 cached = max(total - paid, 0)
                 _progress.say(f'  оплачено в этом прогоне: {paid}, ~${cost:.2f} '
                       f'(из кэша: {cached})')

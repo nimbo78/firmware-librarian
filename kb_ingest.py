@@ -390,7 +390,8 @@ async def enrich_chat_media(tg_client, store, chat_id: int, progress=None,
                             max_cost: float | None = None,
                             media: MediaPolicy | None = None,
                             concurrency: int | None = None,
-                            total: int = 0) -> tuple[int, float]:
+                            total: int = 0, min_id: int = 0, seen0: int = 0,
+                            checkpoint=None) -> tuple[int, float]:
     """Этап 2 бэкфилла: только наполняет media_cache (vision/whisper), чанки
     не трогает. Возвращает (обработано в этом прогоне, стоимость $).
 
@@ -403,6 +404,12 @@ async def enrich_chat_media(tg_client, store, chat_id: int, progress=None,
 
     Очередь ограничена (concurrency * 2), поэтому в памяти живёт не больше
     нескольких изображений — история чата целиком никуда не выкачивается.
+
+    min_id/seen0/checkpoint — продолжение прерванного прогона: этап идёт
+    часами, и после обрыва связи заново перебирать пройденную половину
+    истории незачем. checkpoint(msg_id, seen) вызывается по ходу дела с
+    заведомо безопасной точкой: рабочие завершают вразнобой, поэтому это
+    id ниже всех, что сейчас в работе.
     """
     media = media or media_policy()
     if not (media.vision or media.voice):
@@ -410,9 +417,15 @@ async def enrich_chat_media(tg_client, store, chat_id: int, progress=None,
     limit = max(1, concurrency or MEDIA_CONCURRENCY)
     queue: asyncio.Queue = asyncio.Queue(maxsize=limit * 2)
     done = 0        # оплачено в этом прогоне
-    seen = 0        # просмотрено, включая уже лежащее в кэше — это и есть прогресс
+    seen = seen0    # просмотрено, включая уже лежащее в кэше — это и есть прогресс
     cost = 0.0
     over_budget = False
+    inflight: set[int] = set()   # что сейчас в работе у пула
+    last_out = [min_id]          # последний отданный в очередь id
+
+    def safe_point() -> int:
+        """Id, ниже которого всё гарантированно обработано."""
+        return min(inflight) - 1 if inflight else last_out[0]
 
     async def worker() -> None:
         nonlocal done, seen, cost, over_budget
@@ -425,8 +438,11 @@ async def enrich_chat_media(tg_client, store, chat_id: int, progress=None,
                     continue      # добираем очередь, но больше не платим
                 _, c = await enrich_message(store, msg, media=media)
                 seen += 1
-                if progress and seen % 20 == 0:
-                    progress('media', seen, total, cost)
+                if seen % 20 == 0:
+                    if progress:
+                        progress('media', seen, total, cost)
+                    if checkpoint:
+                        checkpoint(safe_point(), seen)
                 if c <= 0:
                     continue      # уже было в кэше — денег не стоило
                 done += 1
@@ -439,15 +455,19 @@ async def enrich_chat_media(tg_client, store, chat_id: int, progress=None,
                 logger.warning('media worker failed on %s/%s: %s',
                                chat_id, getattr(msg, 'id', '?'), e)
             finally:
+                inflight.discard(getattr(msg, 'id', -1))
                 queue.task_done()
 
     workers = [asyncio.create_task(worker()) for _ in range(limit)]
     try:
-        async for msg in tg_client.iter_messages(chat_id, reverse=True):
+        async for msg in tg_client.iter_messages(chat_id, reverse=True,
+                                                 min_id=min_id):
             if not (_is_image(msg) or _voice_duration(msg) > 0):
                 continue
             if over_budget:
                 break
+            inflight.add(msg.id)
+            last_out[0] = msg.id
             await queue.put(msg)
     finally:
         for _ in workers:
