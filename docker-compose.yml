@@ -32,6 +32,7 @@ services:
       KB_ARCHIVE: ${KB_ARCHIVE:-0}
       KB_BACKUP_DAYS: ${KB_BACKUP_DAYS:-7}
       KB_VISION_MODEL: ${KB_VISION_MODEL:-gpt-5-mini}
+      KB_MEDIA_CONCURRENCY: ${KB_MEDIA_CONCURRENCY:-4}
       KB_ADMIN_IDS: ${KB_ADMIN_IDS:-}
       KB_SPACES_FILE: /app/spaces.toml
     volumes:

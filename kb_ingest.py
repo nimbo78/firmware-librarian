@@ -260,6 +260,10 @@ def media_policy(vision: bool | None = None,
 
 
 MEDIA_CACHE_RETRIES = 5
+# Сколько картинок/голосовых обрабатывать одновременно на этапе [2/3].
+# 4 — компромисс: заметно быстрее последовательной обработки и далеко от
+# лимитов OpenAI (429 не кэшируется, картинка просто уйдёт в следующий прогон).
+MEDIA_CONCURRENCY = int(os.getenv('KB_MEDIA_CONCURRENCY', '4') or 4)
 
 
 async def remember_media(store, key: str, text: str, cost: float) -> bool:
@@ -362,25 +366,72 @@ async def enrich_message(store, msg, enrich_media: bool = True,
 
 async def enrich_chat_media(tg_client, store, chat_id: int, progress=None,
                             max_cost: float | None = None,
-                            media: MediaPolicy | None = None) -> tuple[int, float]:
+                            media: MediaPolicy | None = None,
+                            concurrency: int | None = None) -> tuple[int, float]:
     """Этап 2 бэкфилла: только наполняет media_cache (vision/whisper), чанки
-    не трогает. Возвращает (обработано в этом прогоне, стоимость $)."""
+    не трогает. Возвращает (обработано в этом прогоне, стоимость $).
+
+    Обработка идёт пулом из KB_MEDIA_CONCURRENCY задач. Узкое место — не
+    сеть Telegram (картинка приходит за доли секунды), а ожидание ответа
+    vision: последовательно выходило ~20 с на изображение, и на большом
+    чате этап растягивался на сутки. Пул ждёт несколько ответов разом.
+    Заодно MTProto не простаивает: скачивания идут непрерывно, и Telegram
+    реже закрывает соединение как бездействующее.
+
+    Очередь ограничена (concurrency * 2), поэтому в памяти живёт не больше
+    нескольких изображений — история чата целиком никуда не выкачивается.
+    """
     media = media or media_policy()
     if not (media.vision or media.voice):
         return 0, 0.0
+    limit = max(1, concurrency or MEDIA_CONCURRENCY)
+    queue: asyncio.Queue = asyncio.Queue(maxsize=limit * 2)
     done = 0
     cost = 0.0
-    async for msg in tg_client.iter_messages(chat_id, reverse=True):
-        if not (_is_image(msg) or _voice_duration(msg) > 0):
-            continue
-        _, c = await enrich_message(store, msg, media=media)
-        if c > 0:
-            done += 1
-            cost += c
-            if progress and done % 20 == 0:
-                progress('media', done, 0, cost)
-            if max_cost is not None and cost >= max_cost:
-                raise BudgetExceeded(cost)
+    over_budget = False
+
+    async def worker() -> None:
+        nonlocal done, cost, over_budget
+        while True:
+            msg = await queue.get()
+            try:
+                if msg is None:
+                    return
+                if over_budget:
+                    continue      # добираем очередь, но больше не платим
+                _, c = await enrich_message(store, msg, media=media)
+                if c <= 0:
+                    continue
+                done += 1
+                cost += c
+                if progress and done % 20 == 0:
+                    progress('media', done, 0, cost)
+                if max_cost is not None and cost >= max_cost:
+                    over_budget = True
+            except Exception as e:
+                # рабочий не должен умирать: иначе очередь переполнится и
+                # продюсер встанет навсегда
+                logger.warning('media worker failed on %s/%s: %s',
+                               chat_id, getattr(msg, 'id', '?'), e)
+            finally:
+                queue.task_done()
+
+    workers = [asyncio.create_task(worker()) for _ in range(limit)]
+    try:
+        async for msg in tg_client.iter_messages(chat_id, reverse=True):
+            if not (_is_image(msg) or _voice_duration(msg) > 0):
+                continue
+            if over_budget:
+                break
+            await queue.put(msg)
+    finally:
+        for _ in workers:
+            await queue.put(None)
+        await asyncio.gather(*workers)
+    if over_budget:
+        # лимит проверяется после каждого ответа, но несколько запросов уже
+        # были в полёте — перебор не больше concurrency * цена картинки
+        raise BudgetExceeded(cost)
     return done, cost
 
 
