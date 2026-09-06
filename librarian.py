@@ -296,7 +296,8 @@ async def kb_ingest_loop() -> None:
         # Троттлинг — состояние обновляется не чаще раза в 20 секунд.
         _last_note = [0.0]
         _labels = {'pdf': 'PDF', 'archive': 'архивы', 'hedex': 'HedEx',
-                   'embed': 'эмбеддинги', 'media': 'медиа'}
+                   'embed': 'эмбеддинги', 'media': 'медиа',
+                   'scan': 'просмотр сообщений'}
 
         def _pipeline_progress(kind, done, total, cost):
             now = time.monotonic()

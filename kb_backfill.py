@@ -72,8 +72,10 @@ class Progress:
     чат или новый этап — время старта сбрасывается, чтобы ETA не врал.
     """
 
-    LABELS = {'media': 'медиа', 'embed': 'эмбеддинги', 'pdf': 'PDF',
-              'hedex': 'HedEx', 'archive': 'архивы'}
+    LABELS = {'scan': 'сообщения', 'media': 'медиа', 'embed': 'эмбеддинги',
+              'pdf': 'PDF', 'hedex': 'HedEx', 'archive': 'архивы'}
+    # этапы с известным объёмом работы: только у них есть проценты и ETA
+    MEASURED = ('scan', 'media', 'embed')
 
     def __init__(self):
         self._start: dict[str, tuple[float, int]] = {}
@@ -86,7 +88,7 @@ class Progress:
             t0, base = time.monotonic(), done
             self._start[stage] = (t0, base)
         line = f'  {self.LABELS.get(stage, stage)}: {done}'
-        if stage in ('media', 'embed') and total > 0:
+        if stage in self.MEASURED and total > 0:
             line += f'/{total} ({done * 100 // total}%)'
         elif stage in ('hedex', 'archive') and total:
             line += f', чанков {total}'
@@ -96,7 +98,7 @@ class Progress:
             line += f', ~${cost:.2f}'
         elapsed = time.monotonic() - t0
         speed = (done - base) / elapsed if elapsed > 1 else 0.0
-        if speed > 0 and total > done and stage in ('media', 'embed'):
+        if speed > 0 and total > done and stage in self.MEASURED:
             line += f', осталось ~{_human_time((total - done) / speed)}'
         elif speed > 0:
             line += f', {speed * 60:.0f}/мин'

@@ -18,6 +18,7 @@ import contextlib
 import io
 import os
 import tempfile
+from datetime import datetime
 
 _TMP = tempfile.mkdtemp()
 _SPACES = os.path.join(_TMP, 'spaces.toml')
@@ -81,6 +82,74 @@ class FakeClient:
         return gen()
 
 
+class _ScanMsg:
+    """Сообщение без медиа и документов: нам важен только проход по истории."""
+
+    def __init__(self, mid: int):
+        self.id, self.sender_id = mid, 42
+        self.document = self.file = self.sender = None
+        self.photo = self.sticker = self.gif = self.voice = None
+        self.reply_to = None
+        self.raw_text = f'сообщение {mid}'
+        self.date = datetime(2026, 1, 1, 12, 0)
+
+
+class _ScanStore:
+    def get_state(self, key, default=None): return default
+    def set_state(self, key, value): pass
+    def chunk_hashes(self, ids): return {}
+    def upsert_chunks(self, chunks): pass
+    def prune_chunks(self, chat_id, keep): return 0
+
+
+class _ScanClient:
+    def __init__(self, n): self.n = n
+
+    async def get_messages(self, chat_id, limit=0):
+        class Empty(list):
+            total = 0
+        out = Empty()
+        out.total = self.n
+        return out
+
+    def iter_messages(self, chat_id, min_id=None, reverse=False):
+        async def gen():
+            for i in range(1, self.n + 1):
+                yield _ScanMsg(i)
+        return gen()
+
+
+def _check_scan_progress() -> None:
+    """Проход по истории обязан быть виден: раньше между «Подключился» и
+    первыми эмбеддингами бэкфилл молчал минутами и выглядел зависшим."""
+    seen: list[tuple] = []
+    real_topics, real_embed = kb_ingest.fetch_topic_names, kb_ingest.embed_texts
+
+    async def no_topics(client, chat_id): return {}
+
+    async def fake_embed(texts): return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    kb_ingest.fetch_topic_names = no_topics
+    kb_ingest.embed_texts = fake_embed
+    try:
+        asyncio.run(kb_ingest.ingest_chat(
+            _ScanClient(1200), _ScanStore(), -1001, min_id=0,
+            progress=lambda *a: seen.append(a), enrich_media=False))
+    finally:
+        kb_ingest.fetch_topic_names = real_topics
+        kb_ingest.embed_texts = real_embed
+
+    scans = [s for s in seen if s[0] == 'scan']
+    assert len(scans) == 3, scans          # 500, 1000 и финальный тик
+    assert scans[0][1] == 500 and scans[0][2] == 1200, scans[0]
+    assert scans[-1][1] == 1200, scans[-1]  # 100% в конце прохода
+    # и что это печатается человеку с процентами
+    line = io.StringIO()
+    with contextlib.redirect_stdout(line):
+        B.Progress()('scan', 500, 1200, 0.0)
+    assert 'сообщения: 500/1200 (41%)' in line.getvalue(), line.getvalue()
+
+
 def _selftest() -> None:
     calls: dict[str, list] = {'ingest': [], 'media': [], 'catalog': [],
                               'pipeline': []}
@@ -140,7 +209,7 @@ def _selftest() -> None:
         # полном прогоне, через час работы
         assert calls['catalog'] == [('S5735-L_V200R019.cc', 'huawei')], calls['catalog']
         assert calls['pipeline'] == ['print'], calls['pipeline']
-        print('  1/3 обычный прогон: этапы, каталогизация, политика медиа — OK')
+        print('  1/4 обычный прогон: этапы, каталогизация, политика медиа — OK')
 
         # Бюджет: BudgetExceeded на первом же чате обрывает всё, конвейер не зовём
         calls['ingest'].clear(); calls['media'].clear(); calls['pipeline'].clear()
@@ -153,7 +222,7 @@ def _selftest() -> None:
         assert code is None, 'лимит бюджета — не аварийный выход'
         assert calls['media'] == [] and calls['pipeline'] == [], calls
         assert 'ЛИМИТ БЮДЖЕТА' in out, out   # пользователю обязаны объяснить
-        print('  2/3 обрыв по бюджету (подделан в тесте, денег не тратит) — OK')
+        print('  2/4 обрыв по бюджету (подделан в тесте, денег не тратит) — OK')
 
         # Ctrl+C: вместо traceback — итог с обещанием продолжить и код 130
         calls['ingest'].clear(); calls['pipeline'].clear()
@@ -166,7 +235,9 @@ def _selftest() -> None:
         assert code == 130, code
         assert 'ПРЕРВАНО' in out and 'без двойной оплаты' in out, out
         assert calls['pipeline'] == [], 'после Ctrl+C конвейер запускать нельзя'
-        print('  3/3 Ctrl+C: итог напечатан, код возврата 130 — OK')
+        print('  3/4 Ctrl+C: итог напечатан, код возврата 130 — OK')
+        _check_scan_progress()
+        print('  4/4 проход по истории виден снаружи (проценты и ETA) — OK')
     except AssertionError:
         print('--- вывод бэкфилла ---\n' + out)
         raise

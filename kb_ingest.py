@@ -571,9 +571,23 @@ async def ingest_chat(tg_client, store, chat_id: int, min_id: int | None = None,
     topic_names = await fetch_topic_names(tg_client, chat_id)
     records = []
     max_id = min_id
+    scanned = 0
+    # Сколько сообщений в чате — один RPC (limit=0 отдаёт только счётчик).
+    # Нужен для процентов: проход по истории большого чата идёт минутами, и
+    # без него бэкфилл выглядит зависшим. Для дельты (min_id>0) счётчик
+    # всего чата не годится — там просто счёт просмотренных.
+    total_msgs = 0
+    if progress and full_run:
+        try:
+            total_msgs = (await tg_client.get_messages(chat_id, limit=0)).total or 0
+        except Exception as e:      # метод могут не дать — переживём без %
+            logger.debug('message count unavailable for %s: %s', chat_id, e)
     async for msg in tg_client.iter_messages(chat_id, min_id=min_id, reverse=True):
         if msg.id > max_id:
             max_id = msg.id
+        scanned += 1
+        if progress and scanned % 500 == 0:
+            progress('scan', scanned, total_msgs, stats.cost)
         # Каталог файлов: все документы чата попадают в files/firmware
         if msg.document is not None:
             fname = document_filename(msg)
@@ -604,6 +618,8 @@ async def ingest_chat(tg_client, store, chat_id: int, min_id: int | None = None,
         records.append((msg.id, message_topic_id(msg), msg.date,
                         _sender_name(msg), line))
     stats.messages = len(records)
+    if progress and scanned:
+        progress('scan', scanned, total_msgs or scanned, stats.cost)
     chunks = build_chunks(chat_id, records, topic_names)
     # Переэмбеддим новое И изменившееся (обогащение медиа меняет текст
     # чанка при том же id) — сравнение по хэшу текста
