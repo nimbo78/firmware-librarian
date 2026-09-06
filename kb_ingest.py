@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import io
@@ -239,6 +240,32 @@ def _voice_duration(msg) -> int:
     return int(getattr(msg.file, 'duration', 0) or 0)
 
 
+MEDIA_CACHE_RETRIES = 5
+
+
+async def remember_media(store, key: str, text: str, cost: float) -> bool:
+    """Сохранить в media_cache уже ОПЛАЧЕННЫЙ результат, не теряя его из-за
+    случайной блокировки базы.
+
+    Деньги за vision/whisper потрачены до записи: если писать один раз и
+    молча проглатывать «database is locked» (соседний процесс держит
+    длинную транзакцию), повторный прогон заплатит за то же изображение
+    снова. Поэтому несколько попыток с паузой, а провал — отдельной
+    строкой в логе, чтобы потерю было видно."""
+    for attempt in range(MEDIA_CACHE_RETRIES):
+        try:
+            store.put_media_text(key, text, cost)
+            return True
+        except Exception as e:
+            if attempt == MEDIA_CACHE_RETRIES - 1:
+                logger.warning('media_cache: %s не сохранён (%s) — оплачено '
+                               '~$%.3f, повторный прогон заплатит снова',
+                               key, e, cost)
+                return False
+            await asyncio.sleep(1.0 + attempt)
+    return False
+
+
 async def enrich_message(store, msg, enrich_media: bool = True) -> tuple[str, float]:
     """Текст-довесок для медиа-сообщения и стоимость обработки.
 
@@ -267,7 +294,7 @@ async def enrich_message(store, msg, enrich_media: bool = True) -> tuple[str, fl
                             converted = _to_jpeg(data)
                             if converted is None:
                                 # формат не осилили — пропуск навсегда, не ретраим
-                                store.put_media_text(key, '', 0.0)
+                                await remember_media(store, key, '', 0.0)
                                 logger.info('vision skip (unsupported format %s) '
                                             'for %s/%s', mime, msg.chat_id, msg.id)
                                 data = None
@@ -276,9 +303,10 @@ async def enrich_message(store, msg, enrich_media: bool = True) -> tuple[str, fl
                         if data:
                             cached = await describe_image(data, mime)
                             cost += VISION_COST_PER_IMAGE
-                            store.put_media_text(key, cached, VISION_COST_PER_IMAGE)
+                            await remember_media(store, key, cached,
+                                                 VISION_COST_PER_IMAGE)
                     else:
-                        store.put_media_text(key, '', 0.0)  # слишком большое
+                        await remember_media(store, key, '', 0.0)  # слишком большое
                 except Exception as e:
                     logger.warning('vision failed for %s/%s: %s',
                                    msg.chat_id, msg.id, e)
@@ -293,7 +321,7 @@ async def enrich_message(store, msg, enrich_media: bool = True) -> tuple[str, fl
             cached = store.get_media_text(key)
             if cached is None:
                 if duration > MAX_VOICE_SECONDS:
-                    store.put_media_text(key, '', 0.0)
+                    await remember_media(store, key, '', 0.0)
                 else:
                     try:
                         data = await msg.download_media(file=bytes)
@@ -301,7 +329,7 @@ async def enrich_message(store, msg, enrich_media: bool = True) -> tuple[str, fl
                             cached = await transcribe_voice(data)
                             c = duration / 60.0 * WHISPER_PRICE_PER_MIN
                             cost += c
-                            store.put_media_text(key, cached, c)
+                            await remember_media(store, key, cached, c)
                     except Exception as e:
                         logger.warning('whisper failed for %s/%s: %s',
                                        msg.chat_id, msg.id, e)

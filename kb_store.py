@@ -109,9 +109,13 @@ class SqliteVecStore:
         self.db.enable_load_extension(True)
         sqlite_vec.load(self.db)
         self.db.enable_load_extension(False)
-        # Базу одновременно пишет качалка (ночной ingest) и читает kb-bot
+        # Базу одновременно пишет качалка (ночной ingest) и читает kb-bot.
+        # busy_timeout щедрый: пакет чанков с векторами пишется секундами, а
+        # шаги архивов и HedEx идут часами — при 5 с соседний писатель
+        # (бэкфилл, события бота) ловил «database is locked» и терял работу,
+        # включая уже ОПЛАЧЕННЫЕ описания картинок.
         self.db.execute('PRAGMA journal_mode=WAL')
-        self.db.execute('PRAGMA busy_timeout=5000')
+        self.db.execute('PRAGMA busy_timeout=30000')
         try:
             self._init_schema()
             self._ensure_spaces_schema()
