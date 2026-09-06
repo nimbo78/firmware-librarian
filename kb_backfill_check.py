@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import os
 import tempfile
 
@@ -47,6 +49,18 @@ import kb_ingest  # noqa: E402
 import kb_pipeline  # noqa: E402
 from kb_ingest import IngestStats  # noqa: E402
 from kb_spaces import load_spaces  # noqa: E402
+
+
+def _quiet(spaces, max_cost) -> str:
+    """Прогон бэкфилла с перехватом вывода.
+
+    Бэкфилл печатает прогресс и сообщение про исчерпанный бюджет — в тесте
+    это сбивает с толку (выглядит как реальная проблема с балансом API),
+    поэтому наружу вывод идёт только при провале проверки."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        asyncio.run(B._backfill(FakeClient(), spaces, max_cost))
+    return buf.getvalue()
 
 
 class FakeMsg:
@@ -99,27 +113,36 @@ def _selftest() -> None:
     kb_ingest.message_topic_id = lambda msg: 1
 
     spaces = load_spaces()
-    asyncio.run(B._backfill(FakeClient(), spaces, None))
+    out = _quiet(spaces, None)
+    try:
+        # Этапы 1 и 3 прошли по обоим чатам-источникам, с правильными областями
+        assert (-1001, 'huawei', False) in calls['ingest'], calls['ingest']
+        assert (-2001, 'b4', False) in calls['ingest'], calls['ingest']
+        assert (-1001, 'huawei', True) in calls['ingest'], 'этап [3/3] не дошёл'
+        # Этап 2: только там, где обогащение включено (у b4 vision/voice = false)
+        assert calls['media'] == [(-1001, True, False)], calls['media']
+        assert 'обогащение выключено' in out, out
+        # Каталогизация чата качалки вне chats — ветка, в которой жил баг с
+        # затенением extra: падала только при pruned > 0, то есть на повторном
+        # полном прогоне, через час работы
+        assert calls['catalog'] == [('S5735-L_V200R019.cc', 'huawei')], calls['catalog']
+        assert calls['pipeline'] == ['print'], calls['pipeline']
+        print('  1/2 обычный прогон: этапы, каталогизация, политика медиа — OK')
 
-    # Этапы 1 и 3 прошли по обоим чатам-источникам, с правильными областями
-    assert (-1001, 'huawei', False) in calls['ingest'], calls['ingest']
-    assert (-2001, 'b4', False) in calls['ingest'], calls['ingest']
-    assert (-1001, 'huawei', True) in calls['ingest'], 'этап [3/3] не дошёл'
-    # Этап 2: только там, где обогащение включено (у b4 vision/voice = false)
-    assert calls['media'] == [(-1001, True, False)], calls['media']
-    # Каталогизация чата качалки, не заявленного в chats — ветка, где жил баг
-    assert calls['catalog'] == [('S5735-L_V200R019.cc', 'huawei')], calls['catalog']
-    assert calls['pipeline'] == ['print'], calls['pipeline']
+        # Бюджет: BudgetExceeded на первом же чате обрывает всё, конвейер не зовём
+        calls['ingest'].clear(); calls['media'].clear(); calls['pipeline'].clear()
 
-    # Бюджет: BudgetExceeded на первом же чате обрывает всё, конвейер не зовём
-    calls['ingest'].clear(); calls['media'].clear(); calls['pipeline'].clear()
+        async def broke(*a, **kw):
+            raise kb_ingest.BudgetExceeded(1.5)
 
-    async def broke(*a, **kw):
-        raise kb_ingest.BudgetExceeded(1.5)
-
-    B.ingest_chat = broke
-    asyncio.run(B._backfill(FakeClient(), spaces, 1.0))
-    assert calls['media'] == [] and calls['pipeline'] == [], calls
+        B.ingest_chat = broke
+        out = _quiet(spaces, 1.0)
+        assert calls['media'] == [] and calls['pipeline'] == [], calls
+        assert 'ЛИМИТ БЮДЖЕТА' in out, out   # пользователю обязаны объяснить
+        print('  2/2 обрыв по бюджету (подделан в тесте, денег не тратит) — OK')
+    except AssertionError:
+        print('--- вывод бэкфилла ---\n' + out)
+        raise
     print('kb_backfill_check: OK')
 
 
