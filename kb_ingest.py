@@ -240,6 +240,25 @@ def _voice_duration(msg) -> int:
     return int(getattr(msg.file, 'duration', 0) or 0)
 
 
+@dataclass(frozen=True)
+class MediaPolicy:
+    """Что обогащать в этом прогоне: решение области, а не глобальный флаг.
+
+    Картинки платные ($0.004 штука), и в большом чужом чате ценность обычно
+    в тексте. Раньше это решалось только KB_VISION на весь процесс: выключил
+    ради бэкфилла одной области — выключил и для своей, включил обратно —
+    ночной инжест начал платить за чужие скриншоты каждую ночь."""
+    vision: bool
+    voice: bool
+
+
+def media_policy(vision: bool | None = None,
+                 voice: bool | None = None) -> MediaPolicy:
+    """None — как в env (KB_VISION/KB_VOICE), иначе переопределение области."""
+    return MediaPolicy(vision_enabled() if vision is None else vision,
+                       voice_enabled() if voice is None else voice)
+
+
 MEDIA_CACHE_RETRIES = 5
 
 
@@ -266,7 +285,8 @@ async def remember_media(store, key: str, text: str, cost: float) -> bool:
     return False
 
 
-async def enrich_message(store, msg, enrich_media: bool = True) -> tuple[str, float]:
+async def enrich_message(store, msg, enrich_media: bool = True,
+                         media: MediaPolicy | None = None) -> tuple[str, float]:
     """Текст-довесок для медиа-сообщения и стоимость обработки.
 
     Медиа ВСЕГДА даёт плейсхолдер ([изображение] / [голосовое]), даже при
@@ -278,10 +298,11 @@ async def enrich_message(store, msg, enrich_media: bool = True) -> tuple[str, fl
     """
     parts: list[str] = []
     cost = 0.0
+    media = media or media_policy()
 
     if _is_image(msg):
         text = ''
-        if enrich_media and vision_enabled():
+        if enrich_media and media.vision:
             key = f'img:{msg.chat_id}:{msg.id}'
             cached = store.get_media_text(key)
             if cached is None:
@@ -316,7 +337,7 @@ async def enrich_message(store, msg, enrich_media: bool = True) -> tuple[str, fl
     duration = _voice_duration(msg)
     if duration > 0:
         text = ''
-        if enrich_media and voice_enabled():
+        if enrich_media and media.voice:
             key = f'voice:{msg.chat_id}:{msg.id}'
             cached = store.get_media_text(key)
             if cached is None:
@@ -340,17 +361,19 @@ async def enrich_message(store, msg, enrich_media: bool = True) -> tuple[str, fl
 
 
 async def enrich_chat_media(tg_client, store, chat_id: int, progress=None,
-                            max_cost: float | None = None) -> tuple[int, float]:
+                            max_cost: float | None = None,
+                            media: MediaPolicy | None = None) -> tuple[int, float]:
     """Этап 2 бэкфилла: только наполняет media_cache (vision/whisper), чанки
     не трогает. Возвращает (обработано в этом прогоне, стоимость $)."""
-    if not (vision_enabled() or voice_enabled()):
+    media = media or media_policy()
+    if not (media.vision or media.voice):
         return 0, 0.0
     done = 0
     cost = 0.0
     async for msg in tg_client.iter_messages(chat_id, reverse=True):
         if not (_is_image(msg) or _voice_duration(msg) > 0):
             continue
-        _, c = await enrich_message(store, msg)
+        _, c = await enrich_message(store, msg, media=media)
         if c > 0:
             done += 1
             cost += c
@@ -450,7 +473,8 @@ def build_chunks(chat_id: int, records: list, topic_names: dict[int, str]) -> li
 
 async def ingest_chat(tg_client, store, chat_id: int, min_id: int | None = None,
                       progress=None, max_cost: float | None = None,
-                      enrich_media: bool = True, space: str = '') -> IngestStats:
+                      enrich_media: bool = True, space: str = '',
+                      media: MediaPolicy | None = None) -> IngestStats:
     """Инжест сообщений chat_id от last_seen_id (или явного min_id) до конца.
 
     progress(stage, done, total, cost) — колбэк прогресса ('media' | 'embed').
@@ -463,6 +487,7 @@ async def ingest_chat(tg_client, store, chat_id: int, min_id: int | None = None,
     границами (prune) — история полностью пересобрана, они больше не валидны.
     """
     stats = IngestStats()
+    media = media or media_policy()
     state_key = f'last_seen_id:{chat_id}'
     if min_id is None:
         min_id = int(store.get_state(state_key, '0'))
@@ -484,7 +509,7 @@ async def ingest_chat(tg_client, store, chat_id: int, min_id: int | None = None,
                     logger.warning('file record failed for %s/%s: %s',
                                    chat_id, msg.id, e)
         text = (msg.raw_text or '').strip()
-        extra, cost = await enrich_message(store, msg, enrich_media)
+        extra, cost = await enrich_message(store, msg, enrich_media, media)
         if cost > 0:
             stats.media_items += 1
             stats.cost += cost

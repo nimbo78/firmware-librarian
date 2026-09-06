@@ -37,7 +37,7 @@ from telethon import TelegramClient
 
 from kb_ingest import (BudgetExceeded, EMBED_PRICE_PER_MTOK, VISION_COST_PER_IMAGE,
                        WHISPER_PRICE_PER_MIN, enrich_chat_media, ingest_chat,
-                       pdf_enabled, scan_chat, vision_enabled, voice_enabled)
+                       media_policy, pdf_enabled, scan_chat)
 from kb_spaces import Spaces, load_spaces
 from kb_store import open_store
 from tg_conn import proxy_kwargs
@@ -67,23 +67,26 @@ def _progress(stage: str, done: int, total: int, cost: float) -> None:
 
 async def _dry_run(client, spaces) -> None:
     total = 0.0
-    for chat_id in [c for s in spaces.all for c in s.chats]:
-        print(f'Сканирую {chat_id} — вся история, на большом чате это '
-              f'минуты/десятки минут...', flush=True)
-        st = await scan_chat(client, chat_id, progress=lambda n: print(
-            f'  просмотрено сообщений: {n}', flush=True))
-        embed = st.chars / 3 / 1e6 * EMBED_PRICE_PER_MTOK
-        vision = st.images * VISION_COST_PER_IMAGE if vision_enabled() else 0.0
-        voice = (st.voice_seconds / 60 * WHISPER_PRICE_PER_MIN
-                 if voice_enabled() else 0.0)
-        total += embed + vision + voice
-        print(f'{chat_id}:')
-        print(f'  сообщений: {st.messages}, ~{st.chars // 3} токенов '
-              f'-> эмбеддинги ~${embed:.2f}')
-        mark = '' if vision_enabled() else ' (KB_VISION выключен — не считается)'
-        print(f'  картинок: {st.images} -> vision ~${vision:.2f}{mark}')
-        mark = '' if voice_enabled() else ' (KB_VOICE выключен — не считается)'
-        print(f'  голосовых: {st.voice_seconds // 60} мин -> whisper ~${voice:.2f}{mark}')
+    for space in spaces.all:
+        media = media_policy(space.vision, space.voice)
+        for chat_id in space.chats:
+            print(f'Сканирую {chat_id} — вся история, на большом чате это '
+                  f'минуты/десятки минут...', flush=True)
+            st = await scan_chat(client, chat_id, progress=lambda n: print(
+                f'  просмотрено сообщений: {n}', flush=True))
+            embed = st.chars / 3 / 1e6 * EMBED_PRICE_PER_MTOK
+            vision = st.images * VISION_COST_PER_IMAGE if media.vision else 0.0
+            voice = (st.voice_seconds / 60 * WHISPER_PRICE_PER_MIN
+                     if media.voice else 0.0)
+            total += embed + vision + voice
+            print(f'{chat_id} (область {space.slug}):')
+            print(f'  сообщений: {st.messages}, ~{st.chars // 3} токенов '
+                  f'-> эмбеддинги ~${embed:.2f}')
+            mark = '' if media.vision else ' (vision выключен — не считается)'
+            print(f'  картинок: {st.images} -> vision ~${vision:.2f}{mark}')
+            mark = '' if media.voice else ' (whisper выключен — не считается)'
+            print(f'  голосовых: {st.voice_seconds // 60} мин '
+                  f'-> whisper ~${voice:.2f}{mark}')
     from kb_archive import archive_enabled
     from kb_hedex import hedex_enabled
     if not pdf_enabled():
@@ -151,7 +154,10 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
              if c not in chat_space}
     spent = 0.0
     stopped = False
-    media_wanted = vision_enabled() or voice_enabled()
+    # политика обогащения — своя у каждой области (см. MediaPolicy)
+    chat_media = {c: media_policy(s.vision, s.voice)
+                  for s in spaces.all for c in s.chats}
+    media_wanted = any(m.vision or m.voice for m in chat_media.values())
 
     def remaining() -> float | None:
         return None if max_cost is None else max(max_cost - spent, 0.0)
@@ -198,10 +204,14 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
     if media_wanted and not stopped:
         for chat_id in chat_ids:
             print(f'[2/3] Медиа: {chat_id}...', flush=True)
+            if not (chat_media[chat_id].vision or chat_media[chat_id].voice):
+                print('  обогащение выключено для этой области — пропуск')
+                continue
             try:
                 n, cost = await enrich_chat_media(client, store, chat_id,
                                                   progress=_progress,
-                                                  max_cost=remaining())
+                                                  max_cost=remaining(),
+                                                  media=chat_media[chat_id])
             except BudgetExceeded as e:
                 spent += e.cost
                 stopped = True
@@ -218,7 +228,8 @@ async def _backfill(client, spaces, max_cost: float | None) -> None:
                 stats = await ingest_chat(client, store, chat_id, min_id=0,
                                           progress=_progress,
                                           max_cost=remaining(),
-                                          space=chat_space[chat_id].slug)
+                                          space=chat_space[chat_id].slug,
+                                          media=chat_media[chat_id])
             except BudgetExceeded as e:
                 spent += e.cost
                 stopped = True

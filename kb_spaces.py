@@ -75,6 +75,11 @@ class Space:
     catalog: str = 'none'                 # 'huawei' — парсер имён и /fw; 'none'
     download_chats: tuple[int, ...] = ()  # откуда качалка тянет файлы
     download_extensions: tuple[str, ...] = ()
+    # Обогащение медиа этой области: None = как в env (KB_VISION/KB_VOICE),
+    # true/false — переопределение. Картинки платные ($0.004 каждая), и в
+    # большом чужом чате ценность обычно в тексте, а не в скриншотах.
+    vision: bool | None = None
+    voice: bool | None = None
     gaps_chat: int = 0                    # еженедельный пост «помогите» (0 = нет)
     gaps_topic: int = 0
     default_scope: str = 'home'           # 'home' — своё, потом все; 'all' — сразу все
@@ -210,7 +215,14 @@ def _space_from_table(slug: str, tbl: dict) -> Space:
         raise ValueError(f'spaces.toml: [{slug}] default_scope = «{scope}», '
                          f'допустимо {"/".join(SCOPES)}')
     dl = tbl.get('download', {}) or {}
+    flags = {}
+    for name in ('vision', 'voice'):
+        if name in tbl:
+            if not isinstance(tbl[name], bool):
+                raise ValueError(f'spaces.toml: [{slug}] {name} — true или false')
+            flags[name] = tbl[name]
     return Space(
+        **flags,
         slug=slug, title=str(tbl.get('title', '')),
         persona=str(tbl.get('persona', _DEFAULT_PERSONA)),
         hints=str(tbl.get('hints', '')), chats=chats, answer=answer,
@@ -291,6 +303,9 @@ def dump_toml(spaces: Spaces) -> str:
         if s.folder:
             out.append(f'folder  = {_toml_str(s.folder)}')
         out.append(f'catalog = {_toml_str(s.catalog)}')
+        for name, val in (('vision', s.vision), ('voice', s.voice)):
+            if val is not None:
+                out.append(f'{name}  = {"true" if val else "false"}')
         if s.download_chats:
             chats = ', '.join(str(c) for c in s.download_chats)
             exts = ', '.join(_toml_str(e) for e in s.download_extensions)
@@ -359,6 +374,7 @@ default_scope = "all"
 title = "Только чтение"
 chats = [-3001]
 answer = []
+vision = false
 ''')
         sp = load_spaces(path=path)
         assert sp.slugs == ('huawei', 'b4', 'quiet') and sp.default.slug == 'huawei'
@@ -366,6 +382,9 @@ answer = []
         # пустой answer = «копим знания, но не отвечаем»; отсутствие ключа —
         # наоборот, отвечаем во всех чатах-источниках
         assert sp.get('quiet').answer == {} and sp.get('quiet').chats == (-3001,)
+        # обогащение медиа: не задано = как в env, false = не платим здесь
+        assert hw.vision is None and hw.voice is None
+        assert sp.get('quiet').vision is False and sp.get('quiet').voice is None
         assert -3001 not in sp.answer_topics()
         assert sp.for_chat(-3001).slug == 'quiet', 'знания всё равно свои'
         assert hw.answer == {-1001: {15, 22}} and hw.gaps_topic == 22
@@ -423,7 +442,8 @@ answer = []
                            env={}).default.slug == 'main'
         # кривые конфиги — понятные ошибки
         for body in ('[all]\nchats=[1]', '[Huawei]\nchats=[1]',
-                     '[x]\ncatalog="mikrotik"', '[x]\ndefault_scope="везде"'):
+                     '[x]\ncatalog="mikrotik"', '[x]\ndefault_scope="везде"',
+                     '[x]\nvision="нет"'):
             with open(path, 'w', encoding='utf-8') as f:
                 f.write(body)
             try:

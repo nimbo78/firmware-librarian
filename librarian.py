@@ -239,7 +239,7 @@ async def kb_ingest_loop() -> None:
         logger.warning('KB_CHAT_IDS задан, но OPENAI_API_KEY отсутствует — '
                        'ночной ingest выключен')
         return
-    from kb_ingest import ingest_chat
+    from kb_ingest import ingest_chat, media_policy
     from kb_store import open_store
     store = open_store()
     logger.info('KB ingest scheduled daily at %02d:00 for chats %s '
@@ -277,8 +277,11 @@ async def kb_ingest_loop() -> None:
             logger.info('KB ingest: on-demand run requested via /ingest')
         for chat_id, space in KB_CHAT_SPACES.items():
             try:
-                stats = await ingest_chat(client, store, chat_id,
-                                          space=space.slug)
+                stats = await ingest_chat(
+                    client, store, chat_id, space=space.slug,
+                    # обогащение медиа — решение области: в чужом чате
+                    # платить за каждый скриншот каждую ночь незачем
+                    media=media_policy(space.vision, space.voice))
                 logger.info('KB ingest %s: %d messages -> %d new chunks, '
                             'media %d, ~$%.2f', chat_id, stats.messages,
                             stats.new_chunks, stats.media_items, stats.cost)
