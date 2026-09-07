@@ -18,10 +18,13 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import tomllib
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 # Указатель «искать везде»: зарезервирован, пространство так назвать нельзя
 ALL = 'all'
@@ -258,6 +261,20 @@ def _implicit_space(env) -> Space:
         gaps_topic=int(env.get('KB_GAPS_TOPIC_ID', '0') or 0))
 
 
+# Переменные окружения, которые spaces.toml перекрывает целиком. Молчаливое
+# игнорирование дорого стоит: правишь KB_ANSWER_CHAT_IDS, перезапускаешь бота,
+# а гейт топиков всё это время берётся из файла.
+SUPERSEDED_ENV = ('KB_CHAT_IDS', 'KB_ANSWER_CHAT_IDS', 'KB_GAPS_CHAT_ID',
+                  'KB_GAPS_TOPIC_ID', 'CHAT_IDS', 'FILE_EXTENSIONS',
+                  'KB_SPACE', 'KB_PERSONA', 'KB_HINTS')
+
+
+def superseded_env(env=None) -> list[str]:
+    """Какие переменные .env заданы, но перекрыты файлом областей."""
+    env = os.environ if env is None else env
+    return [k for k in SUPERSEDED_ENV if (env.get(k) or '').strip()]
+
+
 def load_spaces(path: str | None = None, env=None) -> Spaces:
     """spaces.toml, если он есть и не пуст, иначе одно неявное из env.
 
@@ -273,6 +290,11 @@ def load_spaces(path: str | None = None, env=None) -> Spaces:
     if not data:
         # файл есть, но в нём одни комментарии — тоже «не настроено»
         return Spaces([_implicit_space(env)])
+    ignored = superseded_env(env)
+    if ignored:
+        logger.warning('%s задан — переменные %s из .env ИГНОРИРУЮТСЯ: чаты, '
+                       'топики ответа и папки берутся только из файла',
+                       path, ', '.join(ignored))
     return Spaces([_space_from_table(slug, tbl) for slug, tbl in data.items()])
 
 
@@ -436,6 +458,12 @@ vision = false
                            ('вопрос', 777)):
             sc, _ = one.resolve(chat, text)
             assert sc.slug == 'main' and not sc.fallback and not sc.multi, (text, sc)
+        # .env, перекрытый файлом, обязан быть виден в логах: правка
+        # KB_ANSWER_CHAT_IDS при живом spaces.toml не делает ничего
+        assert superseded_env({'KB_ANSWER_CHAT_IDS': '-100:15'}) ==             ['KB_ANSWER_CHAT_IDS']
+        assert superseded_env({'KB_ANSWER_CHAT_IDS': '  '}) == []
+        assert superseded_env({'ANSWER_MODEL': 'gpt-5'}) == [],             'модель ответов файлом не перекрывается'
+
         # каталог вместо файла = файла нет
         os.mkdir(os.path.join(tmp, 'dir.toml'))
         assert load_spaces(path=os.path.join(tmp, 'dir.toml'),

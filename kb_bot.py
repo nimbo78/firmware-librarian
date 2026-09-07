@@ -938,8 +938,15 @@ async def run() -> None:
             await client.start(bot_token=BOT_TOKEN)
             me = await client.get_me()
             _bot_username = me.username or ''
-            logger.info('KB bot online as @%s, чанков в базе: %d',
-                        _bot_username, store.count())
+            # Где именно бот отвечает — в лог на старте: выяснять это по
+            # поведению («почему он пишет в чужой топик?») дорого, а источник
+            # правды неочевиден — spaces.toml перекрывает KB_ANSWER_CHAT_IDS
+            gate = ', '.join(
+                f'{chat}:{",".join(str(t) for t in sorted(topics))}' if topics
+                else f'{chat} (весь чат)'
+                for chat, topics in sorted(ANSWER_TOPICS.items()))
+            logger.info('KB bot online as @%s, чанков в базе: %d; отвечаю в: %s',
+                        _bot_username, store.count(), gate or '(нигде)')
             backoff = initial_backoff
             await client.run_until_disconnected()
         except (ConnectionError, OSError, asyncio.TimeoutError) as e:
