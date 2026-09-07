@@ -275,27 +275,49 @@ def superseded_env(env=None) -> list[str]:
     return [k for k in SUPERSEDED_ENV if (env.get(k) or '').strip()]
 
 
+_cached: Spaces | None = None
+
+
 def load_spaces(path: str | None = None, env=None) -> Spaces:
     """spaces.toml, если он есть и не пуст, иначе одно неявное из env.
+
+    Прод-вызов (без аргументов) кэшируется: конфиг читают и kb_bot, и
+    open_store, и конвейеры — файл разбирался бы заново каждый раз, а
+    предупреждение о перекрытом .env печаталось бы по разу на вызов.
+    Процесс всё равно перечитывает файл только при перезапуске.
+    Явные path/env кэш обходят — на них живут селфтесты.
 
     Пустой файл и каталог вместо файла (docker создаёт папку под
     несуществующий bind-mount) означают «области не настроены»: одиночная
     установка не должна падать из-за примонтированной пустышки."""
+    global _cached
+    default_call = path is None and env is None
+    if default_call and _cached is not None:
+        return _cached
     env = os.environ if env is None else env
     path = path or env.get('KB_SPACES_FILE', '') or 'spaces.toml'
     if not os.path.isfile(path) or os.path.getsize(path) == 0:
-        return Spaces([_implicit_space(env)])
+        return _remember(Spaces([_implicit_space(env)]), default_call)
     with open(path, 'rb') as f:
         data = tomllib.load(f)
     if not data:
         # файл есть, но в нём одни комментарии — тоже «не настроено»
-        return Spaces([_implicit_space(env)])
+        return _remember(Spaces([_implicit_space(env)]), default_call)
     ignored = superseded_env(env)
     if ignored:
         logger.warning('%s задан — переменные %s из .env ИГНОРИРУЮТСЯ: чаты, '
                        'топики ответа и папки берутся только из файла',
                        path, ', '.join(ignored))
-    return Spaces([_space_from_table(slug, tbl) for slug, tbl in data.items()])
+    return _remember(
+        Spaces([_space_from_table(slug, tbl) for slug, tbl in data.items()]),
+        default_call)
+
+
+def _remember(spaces: Spaces, default_call: bool) -> Spaces:
+    global _cached
+    if default_call:
+        _cached = spaces
+    return spaces
 
 
 def _toml_str(value: str) -> str:

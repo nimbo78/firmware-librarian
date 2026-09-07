@@ -184,6 +184,17 @@ class SqliteVecStore:
                     kind TEXT NOT NULL DEFAULT '',
                     space TEXT NOT NULL DEFAULT ''
                 )''')
+            # Очередь уборки служебных сообщений бота. В базе, а не в памяти:
+            # контейнер перезапускается при каждом передеплое, и запланированные
+            # к удалению простыни иначе висели бы в чате вечно. due_at — epoch
+            # (time.time), а не monotonic: он обязан пережить рестарт.
+            self.db.execute('''
+                CREATE TABLE IF NOT EXISTS cleanup_queue(
+                    chat_id INTEGER NOT NULL,
+                    msg_id INTEGER NOT NULL,
+                    due_at REAL NOT NULL,
+                    PRIMARY KEY(chat_id, msg_id)
+                )''')
             # Листинг содержимого архивов (kb_archive): что лежит внутри
             # zip/rar/7z/tar — для каталога по внутренностям и показа состава
             self.db.execute('''
@@ -463,6 +474,28 @@ class SqliteVecStore:
         return self.db.execute(
             'SELECT space, count(*) FROM chunks GROUP BY space '
             'ORDER BY 2 DESC, 1').fetchall()
+
+    def schedule_cleanup(self, chat_id: int, msg_id: int, due_at: float) -> None:
+        """Поставить сообщение в очередь на удаление (переживает рестарт)."""
+        with self.db:
+            self.db.execute(
+                'INSERT OR REPLACE INTO cleanup_queue(chat_id, msg_id, due_at) '
+                'VALUES(?,?,?)', (chat_id, msg_id, due_at))
+
+    def due_cleanup(self, now: float, limit: int = 50) -> list[tuple[int, int]]:
+        return self.db.execute(
+            'SELECT chat_id, msg_id FROM cleanup_queue WHERE due_at <= ? '
+            'ORDER BY due_at LIMIT ?', (now, limit)).fetchall()
+
+    def drop_cleanup(self, items: list[tuple[int, int]]) -> None:
+        """Снять с очереди — в том числе после НЕудачного удаления: нет прав
+        или сообщение уже удалено вручную, и ретраи ничего не изменят."""
+        with self.db:
+            self.db.executemany(
+                'DELETE FROM cleanup_queue WHERE chat_id=? AND msg_id=?', items)
+
+    def cleanup_pending(self) -> int:
+        return self.db.execute('SELECT count(*) FROM cleanup_queue').fetchone()[0]
 
     def doc_text_hashes(self) -> set[str]:
         """sha1 ТЕЛА (текст без первой строки-заголовка) всех HedEx-чанков —

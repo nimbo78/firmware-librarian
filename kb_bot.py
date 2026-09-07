@@ -66,8 +66,6 @@ GAPS_POST_HOUR = 10
 # файлы уже в чате, простыня со списком больше не нужна (решение владельца)
 MSG_CLICKS_TO_DELETE = 3
 _msg_clicks: dict[tuple[int, int], int] = {}
-# (когда удалять, chat_id, msg_id) — очередь уборки за собой
-_cleanup: list[tuple[float, int, int]] = []
 
 # Закрытые топики форума: {chat_id: (когда протухнет, {закрытые топики})}.
 # Спрашивать статусы на каждое сообщение нельзя — лишний RPC и повод для
@@ -152,14 +150,20 @@ async def _topic_allowed(event) -> bool:
 
 
 def _schedule_cleanup(msg) -> None:
-    """Пометить сообщение к удалению через CLEANUP_MINUTES. Список живёт
-    в памяти: после рестарта хвост не удалится — приемлемо, как и со
-    счётчиками кликов."""
+    """Пометить сообщение к удалению через CLEANUP_MINUTES.
+
+    Очередь лежит в базе, а не в памяти: контейнер перезапускается при каждом
+    передеплое, и запланированные простыни иначе висели бы в чате вечно.
+    Просроченное за время простоя удаляется сразу после старта."""
     # в личке админа чистить нечего — там простыни никому не мешают
     if (CLEANUP_MINUTES > 0 and msg is not None
             and not getattr(msg, 'is_private', False)):
-        _cleanup.append((time.monotonic() + CLEANUP_MINUTES * 60,
-                         msg.chat_id, msg.id))
+        try:
+            store.schedule_cleanup(msg.chat_id, msg.id,
+                                   time.time() + CLEANUP_MINUTES * 60)
+        except Exception as e:      # база занята — уборка не стоит падения
+            logger.warning('cleanup schedule failed for %s/%s: %s',
+                           msg.chat_id, msg.id, e)
 
 
 async def _reply(event, *args, **kwargs):
@@ -193,21 +197,30 @@ async def _reply_temp(event, *args, **kwargs):
 
 
 async def cleanup_loop() -> None:
-    """Удаляет отслужившие служебные сообщения. Тик раз в 30 секунд."""
+    """Удаляет отслужившие служебные сообщения. Тик раз в 30 секунд.
+
+    Очередь в базе, поэтому просроченное за время простоя контейнера
+    удаляется на первом же тике после старта."""
     if CLEANUP_MINUTES <= 0:
         return
     while True:
         await asyncio.sleep(30)
-        now = time.monotonic()
-        due = [x for x in _cleanup if x[0] <= now]
-        if not due or not client.is_connected():
+        if not client.is_connected():
             continue
-        _cleanup[:] = [x for x in _cleanup if x[0] > now]
-        for _, chat_id, msg_id in due:
+        try:
+            due = store.due_cleanup(time.time())
+        except Exception as e:
+            logger.warning('cleanup queue read failed: %s', e)
+            continue
+        for chat_id, msg_id in due:
             try:
                 await client.delete_messages(chat_id, msg_id)
             except Exception as e:  # нет прав или сообщение уже удалено
                 logger.debug('cleanup skipped %s/%s: %s', chat_id, msg_id, e)
+        if due:
+            # снимаем с очереди и неудачные: ретрай ничего не изменит —
+            # прав не прибавится, а удалённого дважды не удалить
+            store.drop_cleanup(due)
 
 
 def _extract_question(text: str) -> str | None:

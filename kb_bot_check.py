@@ -138,13 +138,25 @@ def _selftest() -> None:
     asyncio.run(B.handler(quiet))
     assert not quiet.sent, 'в запрещённом топике бот обязан молчать'
 
-    # служебные ответы встают в очередь уборки, личка — нет
-    assert B._cleanup, 'уборка не запланирована'
-    B._cleanup.clear()
+    # Служебные ответы встают в очередь уборки, личка — нет.
+    # Очередь в базе: она обязана пережить перезапуск контейнера, иначе
+    # запланированные простыни висят в чате вечно
+    assert B.store.cleanup_pending(), 'уборка не запланирована'
+    B.store.drop_cleanup(B.store.due_cleanup(time.time() + 10 ** 9))
     private = _Sent(CHAT, 'x')
     private.is_private = True
     B._schedule_cleanup(private)
-    assert not B._cleanup, 'личку админа чистить не надо'
+    assert not B.store.cleanup_pending(), 'личку админа чистить не надо'
+
+    # просроченное за время простоя контейнера удаляется на первом тике
+    B.store.schedule_cleanup(CHAT, 555, time.time() - 60)
+    due = B.store.due_cleanup(time.time())
+    assert (CHAT, 555) in due, due
+    B.store.drop_cleanup(due)
+    assert not B.store.cleanup_pending()
+    # не наступивший срок ещё не выдаётся
+    B.store.schedule_cleanup(CHAT, 556, time.time() + 3600)
+    assert B.store.due_cleanup(time.time()) == []
 
     B.store.close()
     print('kb_bot_check: OK')
