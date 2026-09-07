@@ -22,6 +22,7 @@ RUN apt-get update \
 COPY librarian.py tg_conn.py kb_store.py kb_ingest.py kb_render.py kb_answer.py kb_pipeline.py kb_firmware.py kb_extract.py kb_pdf.py kb_hedex.py kb_archive.py kb_backfill.py kb_bot.py kb_search.py kb_reembed.py kb_spaces.py kb_spaces_migrate.py kb_chats.py ./
 # Селфтесты: не нужны для работы, но дают прогнать проверку на NAS перед
 # долгим бэкфиллом (docker compose run --rm librarian python kb_backfill_check.py)
+COPY kb_eval.py ./
 COPY kb_bot_check.py kb_spaces_check.py kb_backfill_check.py ./
 COPY bot.session bot.session
 
