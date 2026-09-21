@@ -469,6 +469,17 @@ class SqliteVecStore:
                 out.append(ScoredChunk(score, *row))
         return out
 
+    def space_overview(self) -> dict[str, list[tuple[int, int, str, str]]]:
+        """{space: [(chat_id, чанков, с даты, по дату)]} — что лежит в каждой
+        области. Один запрос на всю базу: отчёт нужен и /sources, и kb_eval,
+        и MCP-инструменту kb_spaces — SQL не должен жить в трёх местах."""
+        out: dict[str, list[tuple[int, int, str, str]]] = {}
+        for space, chat_id, n, d1, d2 in self.db.execute(
+                'SELECT space, chat_id, count(*), min(date_from), max(date_to) '
+                'FROM chunks GROUP BY space, chat_id ORDER BY space, 3 DESC'):
+            out.setdefault(space, []).append((chat_id, n, d1, d2))
+        return out
+
     def count_by_space(self) -> list[tuple[str, int]]:
         """[(space, чанков)] по убыванию — для /status, /sources и миграции."""
         return self.db.execute(

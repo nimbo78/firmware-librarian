@@ -69,16 +69,13 @@ def sample_questions(store, space: str, limit: int, seed: int = 0) -> list[str]:
 def show_stats(store, spaces) -> None:
     """Что легло в базу: по областям, чатам и датам. Ни сети, ни денег."""
     by_space = dict(store.count_by_space())
+    overview = store.space_overview()   # тот же обзор, что у MCP-инструмента kb_spaces
     print(f'Всего фрагментов: {store.count()}\n')
     for sp in spaces.all:
         n = by_space.get(sp.slug, 0)
         mark = '' if n else '   ← ПУСТО: инжест не доехал'
         print(f'#{sp.slug} ({sp.label}): {n} фрагментов{mark}')
-        rows = store.db.execute(
-            'SELECT chat_id, count(*), min(date_from), max(date_to) FROM chunks '
-            'WHERE space = ? GROUP BY chat_id ORDER BY 2 DESC', (sp.slug,)
-        ).fetchall()
-        for chat_id, cnt, d1, d2 in rows:
+        for chat_id, cnt, d1, d2 in overview.get(sp.slug, []):
             kind = 'чат' if chat_id < 0 else 'документы'
             print(f'    {kind} {chat_id}: {cnt} фрагментов, {d1} — {d2}')
         media = store.db.execute(

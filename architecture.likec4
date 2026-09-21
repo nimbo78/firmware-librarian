@@ -26,6 +26,10 @@ model {
     description 'Личка бота: /status, /events, /gaps, /fw, /review, /notify. Получает уведомления о событиях. Деплоит и запускает бэкфилл на NAS.'
   }
 
+  claude = actor 'Claude Code (ПК владельца)' {
+    description 'Спрашивает у базы знаний напрямую по MCP при работе с домашней сетью (B4, Telemt) и при разработке: kb_search, kb_answer, kb_spaces'
+  }
+
   telegram = system 'Telegram' {
     #external
     description 'MTProto API (api.telegram.org), чаты с топиками форума'
@@ -46,6 +50,11 @@ model {
     kbbot = container 'kb-bot' {
       technology 'Python 3.13 · Telethon · bot-токен BotFather'
       description 'RAG-ответы (/ask, @mention) с оценками 👍/👎 и цитатами только на упомянутые источники; каталог прошивок /fw: серии, версия-фильтр в запросе, LLM-fallback по моделям и именам файлов, кнопки 📎 (отправка файла с NAS, MTProto до 2 ГБ); админ-канал (уведомления, /status, /review, /ingest); петля gaps.'
+    }
+
+    kbmcp = container 'kb-mcp' {
+      technology 'Python 3.13 · mcp 2.x · Streamable HTTP (stateless JSON) · uvicorn · :8765'
+      description 'MCP-сервер базы знаний для Claude Code: kb_search (сырые фрагменты с датами и ссылками, область параметром или #slug), kb_answer (ответ как /ask), kb_spaces (инвентарь областей). Ни Telegram, ни сессий — только база (read-only) и ключи API. Bearer-токен KB_MCP_TOKEN, /health открыт.'
     }
 
     kbdb = datastore 'kb.sqlite' {
@@ -71,6 +80,10 @@ model {
   kbbot -> telegram 'MTProto (опц. через MTProxy): ответы в топики, уведомления админам, пост gaps'
   kbbot -> openai 'эмбеддинг вопроса, генерация ответа'
   kbbot -> kbdb 'гибридный поиск (KNN+FTS5, RRF), каталог /fw, события, qa-лог, подтверждения'
+
+  claude -> kbmcp 'MCP по LAN/VPN: Authorization: Bearer KB_MCP_TOKEN'
+  kbmcp -> openai 'эмбеддинг запроса (провайдер EMBED_API_BASE), расширение запроса, ответ для kb_answer'
+  kbmcp -> kbdb 'гибридный поиск по области (partition key vec0 + FTS5), обзор областей — только чтение'
 }
 
 views {
@@ -132,6 +145,16 @@ views {
     kbbot -> telegram 'ответ в топик + источники t.me/c/… + кнопки 👍/👎'
     member -> telegram '👎 (если ответ плохой)'
     telegram -> kbbot 'CallbackQuery: rating=-1 → событие feedback админу'
+  }
+
+  dynamic view flow_mcp {
+    title 'Сценарий: вопрос из Claude Code'
+    claude -> kbmcp 'kb_spaces: какие области есть (бесплатно)'
+    claude -> kbmcp 'kb_search("#b4 стратегия для youtube")'
+    kbmcp -> openai 'эмбеддинг запроса + расширение (expand=true)'
+    kbmcp -> kbdb 'KNN в разделе b4 + FTS5, RRF; пусто → фолбэк по всем областям'
+    kbmcp -> claude 'фрагменты бесед: область, топик, дата, t.me/c/… ссылка, текст'
+    claude -> kbmcp 'kb_answer(...) — когда нужен ответ в виде бота (~$0.01)'
   }
 
   dynamic view flow_gaps {

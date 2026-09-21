@@ -110,7 +110,8 @@ def _merge_search(store, variants: list[str], vectors: list, space) -> list:
 
 
 async def search_expanded(store, question: str, extra: list[str] = (),
-                          scope: Scope = DEFAULT_SCOPE) -> tuple[list, bool]:
+                          scope: Scope = DEFAULT_SCOPE,
+                          expand: bool = True) -> tuple[list, bool]:
     """(фрагменты, искали ли шире запрошенного) — поиск по вопросу и
     расширенным формулировкам в области scope.
 
@@ -118,7 +119,9 @@ async def search_expanded(store, question: str, extra: list[str] = (),
     по себе не несёт сущностей, их держит предыдущий вопрос).
     Фолбэк на все области переиспользует уже посчитанные векторы: повторный
     поиск не стоит ни запроса к эмбеддеру, ни задержки."""
-    variants = [question] + list(extra) + await expand_query(question, scope.hints)
+    variants = [question] + list(extra)
+    if expand:   # выключают, когда нужен точный поиск по терминам (MCP)
+        variants += await expand_query(question, scope.hints)
     if len(variants) > 1:
         logger.info('Query expansion: %s', ' | '.join(variants[1:]))
     try:

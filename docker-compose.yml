@@ -86,6 +86,35 @@ services:
       - /volume1/public/Repository/Hardware/Huawei/fromChat:/app/downloads:ro
       - ./spaces.toml:/app/spaces.toml:ro
     logging: *default-logging
+
+  # MCP-сервер базы знаний: Claude Code на ПК задаёт вопросы к чатам
+  # (b4, telemt, huawei) напрямую. Только база и ключи API — ни Telegram,
+  # ни сессий, поэтому запускается и живёт независимо от двух остальных.
+  #   claude mcp add --transport http librarian http://<nas>:8765/mcp   #       --header "Authorization: Bearer <KB_MCP_TOKEN>"
+  kb-mcp:
+    build: .
+    command: ["python", "kb_mcp.py"]
+    restart: unless-stopped
+    ports:
+      # снаружи — KB_MCP_PORT, внутри контейнера всегда 8765
+      - "${KB_MCP_PORT:-8765}:8765"
+    environment:
+      TZ: ${TZ:-UTC}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      KB_DB_PATH: /app/kb/kb.sqlite
+      KB_SPACES_FILE: /app/spaces.toml
+      EMBED_MODEL: ${EMBED_MODEL:-text-embedding-3-small}
+      EMBED_DIM: ${EMBED_DIM:-512}
+      EMBED_API_BASE: ${EMBED_API_BASE:-}
+      EMBED_API_KEY: ${EMBED_API_KEY:-}
+      ANSWER_MODEL: ${ANSWER_MODEL:-gpt-5-mini}
+      KB_WEB: ${KB_WEB:-0}
+      KB_MCP_TOKEN: ${KB_MCP_TOKEN:-}
+      KB_MCP_ALLOWED_HOSTS: ${KB_MCP_ALLOWED_HOSTS:-}
+    volumes:
+      - /volume1/docker/tg-kb:/app/kb
+      - ./spaces.toml:/app/spaces.toml:ro
+    logging: *default-logging
 # Подсеть закреплена, а не отдана на откуп Docker: тот берёт первый свободный
 # пул из 172.17–172.31/192.168 и на NAS запросто пересекается с домашней
 # сетью или VPN-туннелем — тогда контейнеры теряют доступ наружу, а SSH до
