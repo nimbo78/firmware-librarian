@@ -19,7 +19,8 @@
 
 Защита: bearer-токен KB_MCP_TOKEN (пусто = без авторизации, только для
 доверенной сети — об этом предупреждение на старте) и, по желанию,
-проверка заголовка Host (KB_MCP_ALLOWED_HOSTS) от DNS-rebinding.
+KB_MCP_ALLOWED_HOSTS от DNS-rebinding — список АДРЕСОВ ЭТОГО СЕРВЕРА,
+какими их пишет клиент в URL (заголовок Host), а не адресов клиентов.
 
 Проверка без сети: python kb_mcp_check.py
 """
@@ -273,7 +274,11 @@ def build_app():
 
     Защита от DNS-rebinding включается только с явным списком хостов:
     с пустым списком библиотека отвергала бы КАЖДЫЙ запрос (421), а в
-    домашней сети за bearer-токеном угроза rebinding и так мала."""
+    домашней сети за bearer-токеном угроза rebinding и так мала.
+
+    В списке — адреса, по которым обращаются К НАМ (заголовок Host), а не
+    адреса обращающихся; источник запроса не проверяется. Адрес не из
+    списка получает 421 — включая localhost, если его туда не внесли."""
     if ALLOWED_HOSTS:
         security = TransportSecuritySettings(enable_dns_rebinding_protection=True,
                                              allowed_hosts=ALLOWED_HOSTS)
