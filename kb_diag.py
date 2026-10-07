@@ -48,6 +48,18 @@ def show_config(spaces) -> None:
         print()
 
 
+def space_of_chat(spaces, chat_id: int):
+    """Область, отвечающая за этот чат, — включая чаты, которые ТОЛЬКО
+    качаются. `Spaces.for_chat` их не знает: он про «чей это вопрос»
+    (чаты-источники и чаты ответа), а здесь важно «чьи это файлы»."""
+    if not chat_id:
+        return spaces.default
+    for s in spaces.all:
+        if chat_id in s.download_chats:
+            return s
+    return spaces.for_chat(chat_id)
+
+
 def _verdict(space, row, journal_md5: str | None, on_disk: bool) -> str:
     """Главное в отчёте: не «что видно», а почему файла нет."""
     doc_id, name, md5, chat_id = row
@@ -95,7 +107,7 @@ def show_file(store, spaces, needle: str, limit: int) -> None:
         chat_id = rec[2] if rec else 0
         msg_id, date = (rec[3], rec[4]) if rec else (0, '')
         base = os.path.basename(name)
-        space = spaces.for_chat(chat_id) if chat_id else spaces.default
+        space = space_of_chat(spaces, chat_id)
         folder = space.folder if space else ''
         journal = _load_md5_journal(folder) if folder else {}
         journal_md5 = journal.get(base)
@@ -143,6 +155,18 @@ def _selftest() -> None:
     assert 'НЕ ВИДЕЛА' in _verdict(sp, row, None, False)
     # чат вне областей
     assert 'не привязан' in _verdict(None, (111, row[1], '', -9), None, False)
+
+    # чат, который ТОЛЬКО качается (в CHAT_IDS, но не в KB_CHAT_IDS):
+    # Spaces.for_chat про него не знает, и вердикт был бы ложным
+    class _Spaces:
+        def __init__(self, s): self.all, self.default = (s,), s
+        def for_chat(self, chat_id): return None       # как в проде для такого чата
+
+    only_dl = Space(slug='main', folder='/dl', download_chats=(-1001,),
+                    download_extensions=('cc',))
+    assert space_of_chat(_Spaces(only_dl), -1001) is only_dl
+    assert space_of_chat(_Spaces(only_dl), -7777) is None
+    assert space_of_chat(_Spaces(only_dl), 0) is only_dl   # документы, не чат
     print('kb_diag selftest: OK')
 
 
