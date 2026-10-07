@@ -20,8 +20,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY librarian.py tg_conn.py kb_store.py kb_ingest.py kb_render.py kb_answer.py kb_pipeline.py kb_firmware.py kb_extract.py kb_pdf.py kb_hedex.py kb_archive.py kb_backfill.py kb_bot.py kb_search.py kb_reembed.py kb_spaces.py kb_spaces_migrate.py kb_chats.py ./
-# Проверка качества ответов на реальных вопросах из чатов
-COPY kb_eval.py ./
+# Проверка качества ответов и диагностика «почему файла нет»
+COPY kb_eval.py kb_diag.py ./
 # MCP-сервер базы знаний для Claude Code (сервис kb-mcp)
 COPY kb_mcp.py ./
 # Селфтесты: не нужны для работы, но дают прогнать проверку на NAS перед
