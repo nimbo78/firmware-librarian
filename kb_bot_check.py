@@ -138,6 +138,42 @@ def _selftest() -> None:
     asyncio.run(B.handler(quiet))
     assert not quiet.sent, 'в запрещённом топике бот обязан молчать'
 
+    # Прод-случай 10.2026: образ выложили как «S5735-V2_…», владелец искал
+    # «S5735-S-V2 R025». Подстрока длиннее имени не вкладывается, и бот
+    # отвечал «точных связок нет» при скачанном файле с кнопкой 📎.
+    from kb_firmware import parse_firmware_name
+
+    async def _no_llm(store, query):     # сети в проверке нет
+        return [], []
+
+    B.fw_llm_match = _no_llm
+    name = 'S5735-V2_V600R025C00SPC500.cc'
+    models, version, vkey = parse_firmware_name(name)
+    B.store.upsert_file(doc_id=777, name=name, size=1, md5='c' * 32,
+                        chat_id=CHAT, msg_id=22111, caption='',
+                        topic_name='Закачка', date='2026-10-06')
+    B.store.upsert_firmware(777, models[0], version, vkey)
+
+    ev = FakeEvent('/fw S5735-S-V2 R025')
+    asyncio.run(B._handle_fw(ev, '/fw S5735-S-V2 R025'))
+    assert ev.sent and name in ev.sent[0], ev.sent
+    assert 'ближайшее по модели «S5735»' in ev.sent[0], ev.sent[0]
+
+    # точный запрос по-прежнему отвечает без пометки о послаблении
+    ev = FakeEvent('/fw S5735-V2 R025')
+    asyncio.run(B._handle_fw(ev, '/fw S5735-V2 R025'))
+    assert name in ev.sent[0] and 'Точного совпадения' not in ev.sent[0], ev.sent[0]
+
+    # фильтр версии переживает послабление: R023 у этой модели нет
+    ev = FakeEvent('/fw S5735-S-V2 R023')
+    asyncio.run(B._handle_fw(ev, '/fw S5735-S-V2 R023'))
+    assert name not in ev.sent[0], ev.sent[0]
+
+    # то же послабление в /sw
+    ev = FakeEvent('/sw S5735-S-V2')
+    asyncio.run(B._handle_sw(ev, '/sw S5735-S-V2'))
+    assert name in ev.sent[0] and 'ближайшее по модели' in ev.sent[0], ev.sent[0]
+
     # Служебные ответы встают в очередь уборки, личка — нет.
     # Очередь в базе: она обязана пережить перезапуск контейнера, иначе
     # запланированные простыни висят в чате вечно

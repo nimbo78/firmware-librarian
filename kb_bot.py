@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 from telethon import Button, TelegramClient, errors, events
 
 from kb_answer import answer_question, fw_llm_match
-from kb_firmware import split_query
+from kb_firmware import relax_model, split_query
 from kb_ingest import fetch_topics, message_topic_id, openai_client
 from kb_render import (ADMIN_HELP_EXTRA, fmt_event, msg_link,
                        nav_category_view, nav_files_view, nav_model_view,
@@ -298,16 +298,29 @@ async def _handle_sw(event, text: str) -> None:
                           '/sw S5735-S R024)')
         return
     model_query, version_tokens = split_query(arg)
-    rows = store.find_firmware(model_query, limit=120)
-    if version_tokens:
-        rows = [r for r in rows
+    def _filtered(query: str) -> list:
+        found = store.find_firmware(query, limit=120)
+        if not version_tokens:
+            return found
+        return [r for r in found
                 if all(t in (r[1] or '').upper() for t in version_tokens)]
+
+    rows, note, relaxed = _filtered(model_query), '', ''
+    if not rows:   # имена файлов в чате вольные — см. relax_model
+        for wider in relax_model(model_query):
+            rows = _filtered(wider)
+            if rows:
+                relaxed = wider
+                note = (f'🔎 Точного совпадения по «{model_query}» нет — '
+                        f'показываю ближайшее по модели «{wider}».\n\n')
+                break
     if not rows:
         await _reply_temp(event, f'По «{arg}» в каталоге пусто. Попробуй /fw {arg} '
                           f'(там есть LLM-подбор) или /download <начало имени>.')
         return
-    out, buttons, _ = render_grouped(rows, arg, model_query)
-    await _reply_temp(event, out[:4000], link_preview=False, buttons=buttons or None)
+    out, buttons, _ = render_grouped(rows, arg, relaxed or model_query)
+    await _reply_temp(event, (note + out)[:4000], link_preview=False,
+                      buttons=buttons or None)
 
 
 DOWNLOAD_BATCH_LIMIT = 12
@@ -377,7 +390,19 @@ async def _handle_fw(event, text: str) -> None:
         return all(t in (version or '').upper() for t in version_tokens)
 
     rows = [r for r in store.find_firmware(model_query) if _ver_ok(r[1])]
-    llm_note = ''
+    note = ''
+    # Точного совпадения нет — пробуем более общие варианты модели ДО LLM:
+    # имена в чате вольные, один и тот же образ выкладывают и как
+    # «S5735-V2_…», и как «S5735-S-V2_…», а поиск идёт подстрокой
+    relaxed = ''
+    if not rows:
+        for wider in relax_model(model_query):
+            found = [r for r in store.find_firmware(wider) if _ver_ok(r[1])]
+            if found:
+                rows, relaxed = found, wider
+                note = (f'🔎 Точного совпадения по «{model_query}» нет — '
+                        f'показываю ближайшее по модели «{wider}».\n\n')
+                break
     extra_files: list[tuple] = []
     if not rows:
         try:
@@ -395,14 +420,19 @@ async def _handle_fw(event, text: str) -> None:
                 if rec and doc_id not in fw_docs:
                     extra_files.append((doc_id,) + tuple(rec))
             if rows or extra_files:
-                llm_note = (f'Подобрано LLM по запросу «{arg}» — сверь модель '
-                            'в имени файла.\n\n')
+                note = (f'Подобрано LLM по запросу «{arg}» — сверь модель '
+                        'в имени файла.\n\n')
         except Exception as e:
             logger.warning('fw llm fallback failed: %s', e)
     if rows:
-        text_out, buttons, seen = render_grouped(rows, arg, model_query)
+        text_out, buttons, seen = render_grouped(rows, arg, relaxed or model_query)
     elif extra_files:
+        on_nas = sum(1 for f in extra_files if f[2])   # f[2] — md5
         text_out = f'Точных связок «модель → прошивка» по «{arg}» нет.'
+        if on_nas:
+            # «связок нет» читается как «файла нет» — а файл скачан и лежит
+            # на NAS; владелец уже сделал этот неверный вывод (прод, 10.2026)
+            text_out += f' Но подходящих файлов на NAS: {on_nas} — кнопки 📎 ниже.'
         buttons, seen = [], set()
     else:
         text_out, buttons, seen = render_grouped(rows, arg, model_query)
@@ -419,8 +449,8 @@ async def _handle_fw(event, text: str) -> None:
                 buttons.append(
                     [Button.inline(f'📎 {name[:40]}', f'g:{doc_id}'.encode())])
         text_out += '\n'.join(lines)
-    # пометка LLM — в начале: хвост может обрезаться лимитом 4096
-    await _reply_temp(event, (llm_note + text_out)[:4000],
+    # пометка (послабление модели или LLM) — в начале: хвост обрежет лимит 4096
+    await _reply_temp(event, (note + text_out)[:4000],
                       link_preview=False, buttons=buttons or None)
 
 

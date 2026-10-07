@@ -80,6 +80,52 @@ VERSION_TOKEN_RE = re.compile(
     re.IGNORECASE)
 
 
+def relax_model(model: str) -> list[str]:
+    """Более общие варианты модели — от точного к широкому.
+
+    'S5735-S-V2' -> ['S5735-S', 'S5735'];  'S5735' -> [] (обобщать нечего).
+
+    Зачем: поиск каталога идёт ПОДСТРОКОЙ по нормализованной модели, и
+    более длинный запрос в более короткое имя не вкладывается. Один и тот
+    же образ в чате выкладывают то как «S5735-V2_V600R025…», то как
+    «S5735-S-V2_…»; запрос «S5735-S-V2» давал «точных связок нет» при
+    живом скачанном файле в каталоге (прод, 10.2026) и уходил в LLM-подбор,
+    хотя детерминированного ответа было достаточно.
+
+    Обрубок обязан остаться осмысленным, иначе «AR-G3» выродится в «AR» и
+    притащит половину каталога: либо в нём есть цифра (числовые серии —
+    S5735, CE6881), либо он достаточно длинный сам по себе (продукты-слова
+    вроде iMasterNCE)."""
+    parts = re.split(r'[-_ ]+', model.strip())
+    out: list[str] = []
+    while len(parts) > 1:
+        parts = parts[:-1]
+        stem = '-'.join(parts)
+        norm = re.sub(r'[^A-Z0-9]', '', stem.upper())
+        if len(norm) >= 4 and (any(c.isdigit() for c in norm) or len(norm) >= 7):
+            out.append(stem)
+    return out
+
+
+def _relax_selftest() -> None:
+    """Прод-случай 10.2026: образ выложили как «S5735-V2_V600R025C00SPC500.cc»,
+    владелец искал «S5735-S-V2 R025» — точного совпадения нет, потому что
+    подстрока длиннее имени, и бот ушёл в LLM-подбор при скачанном файле."""
+    assert relax_model('S5735-S-V2') == ['S5735-S', 'S5735']
+    norm = lambda s: re.sub(r'[^A-Z0-9]', '', s.upper())    # noqa: E731
+    assert norm('S5735-S-V2') not in norm('S5735-V2')       # исходная беда
+    assert norm('S5735') in norm('S5735-V2')                # послабление спасает
+    # обобщать нечего
+    assert relax_model('S5735') == [] and relax_model('') == []
+    # вырожденные обрубки не пропускаем: «AR» притащил бы половину каталога
+    assert relax_model('AR-G3') == []
+    # продукты-слова обобщаются по длине, а не по цифре
+    assert relax_model('iMasterNCE-Campus') == ['iMasterNCE']
+    # разделители имени: дефис, подчёркивание, пробел
+    assert relax_model('S5735_S_V2') == ['S5735-S', 'S5735']
+    assert relax_model('AirEngine5760 10') == ['AirEngine5760']
+
+
 def split_query(query: str) -> tuple[str, list[str]]:
     """'S5735-S-V2 R025' -> ('S5735-S-V2', ['R025']).
 
@@ -508,6 +554,7 @@ def _selftest() -> None:
         j = _load_md5_journal(tmp)
         assert j == {'fw1.zip': 'a' * 32, 'old_manual.pdf': 'b' * 32}, j
         assert _load_md5_journal(os.path.join(tmp, 'нет-такой-папки')) == {}
+    _relax_selftest()
     print('kb_firmware selftest: OK')
 
 
